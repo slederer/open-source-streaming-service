@@ -1,0 +1,10 @@
+# ffmpeg concat demuxer playlist for 24/7 live loop
+# Format: file '<path>'
+# These paths are relative to /opt/streaming/media/ on the EC2 instance
+
+file '/opt/streaming/media/big-buck-bunny.mp4'
+file '/opt/streaming/media/sintel.mp4'
+file '/opt/streaming/media/tears-of-steel.mp4'
+file '/opt/streaming/media/elephants-dream.mp4'
+file '/opt/streaming/media/spring.mp4'
+file '/opt/streaming/media/agent-327.mp4'

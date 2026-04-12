@@ -1,0 +1,122 @@
+[
+  {
+    "title": "Big Buck Bunny",
+    "description": "A large and lovable rabbit deals with three tiny bullies in this Blender Foundation animated short film.",
+    "source_url": "https://download.blender.org/demo/movies/BBB/bbb_sunflower_1080p_30fps_normal.mp4",
+    "duration": 596,
+    "year": 2008,
+    "license": "CC-BY 4.0",
+    "attribution": "Blender Foundation | peach.blender.org",
+    "categories": ["animation", "short-film"]
+  },
+  {
+    "title": "Sintel",
+    "description": "A lonely young woman searches for her pet dragon in a fantasy world full of danger. Third Blender Open Movie.",
+    "source_url": "https://download.blender.org/demo/movies/Sintel.2010.1080p.mkv",
+    "duration": 885,
+    "year": 2010,
+    "license": "CC-BY 4.0",
+    "attribution": "Blender Foundation | durian.blender.org",
+    "categories": ["animation", "short-film"]
+  },
+  {
+    "title": "Tears of Steel",
+    "description": "In an apocalyptic future, a group of warriors and scientists must prevent destruction by robots. Blender Foundation's first live-action/VFX open movie.",
+    "source_url": "https://download.blender.org/demo/movies/ToS/tears_of_steel_1080p.mov",
+    "duration": 734,
+    "year": 2012,
+    "license": "CC-BY 4.0",
+    "attribution": "Blender Foundation | mango.blender.org",
+    "categories": ["short-film"]
+  },
+  {
+    "title": "Elephants Dream",
+    "description": "Two figures explore a bizarre mechanical world in this pioneering open-source animated short — the first Blender Open Movie.",
+    "source_url": "https://download.blender.org/demo/movies/ED/elephantsdream-1080-stereo.avi",
+    "duration": 654,
+    "year": 2006,
+    "license": "CC-BY 4.0",
+    "attribution": "Blender Foundation | orange.blender.org",
+    "categories": ["animation", "short-film"]
+  },
+  {
+    "title": "Spring",
+    "description": "A young shepherd girl and her dog discover the power that connects all living things in this poetic Blender animated short.",
+    "source_url": "https://svn.blender.org/svnroot/bf-blender/trunk/lib/tests/ffmpeg/spring.mp4",
+    "duration": 534,
+    "year": 2019,
+    "license": "CC-BY 4.0",
+    "attribution": "Blender Foundation | cloud.blender.org/spring",
+    "categories": ["animation", "short-film"]
+  },
+  {
+    "title": "Sprite Fright",
+    "description": "A group of teens encounter mushroom creatures in the forests of Britain in this spooky Blender animated comedy-horror short.",
+    "source_url": "https://studio.blender.org/download-source/sprite-fright/",
+    "duration": 630,
+    "year": 2021,
+    "license": "CC-BY 4.0",
+    "attribution": "Blender Foundation | studio.blender.org",
+    "categories": ["animation", "short-film"]
+  },
+  {
+    "title": "Agent 327: Operation Barbershop",
+    "description": "Secret agent 327 enters a barbershop where nothing is as it seems, in this animated short produced by Blender Animation Studio.",
+    "source_url": "https://svn.blender.org/svnroot/bf-blender/trunk/lib/tests/ffmpeg/agent327.mp4",
+    "duration": 231,
+    "year": 2017,
+    "license": "CC-BY 4.0",
+    "attribution": "Blender Foundation | agent327.com",
+    "categories": ["animation", "short-film"]
+  },
+  {
+    "title": "Night of the Living Dead",
+    "description": "George A. Romero's groundbreaking 1968 horror film about a group of people trapped in a farmhouse besieged by reanimated corpses.",
+    "source_url": "https://archive.org/download/night_of_the_living_dead/night_of_the_living_dead.mp4",
+    "duration": 5760,
+    "year": 1968,
+    "license": "Public Domain",
+    "attribution": "Image Ten / George A. Romero",
+    "categories": ["feature-film", "classic-cinema"]
+  },
+  {
+    "title": "Metropolis",
+    "description": "Fritz Lang's 1927 expressionist science-fiction masterpiece depicting a futuristic dystopian city with stark class divides.",
+    "source_url": "https://archive.org/download/Metropolis1927/Metropolis.mp4",
+    "duration": 8700,
+    "year": 1927,
+    "license": "Public Domain",
+    "attribution": "UFA / Fritz Lang",
+    "categories": ["feature-film", "classic-cinema"]
+  },
+  {
+    "title": "City Lights",
+    "description": "Charlie Chaplin's 1931 romantic comedy about the Tramp's love for a blind flower girl, widely considered one of the greatest films ever made.",
+    "source_url": "https://archive.org/download/CityLights1931/City+Lights+(1931).mp4",
+    "duration": 5220,
+    "year": 1931,
+    "license": "Public Domain",
+    "attribution": "Charles Chaplin / United Artists",
+    "categories": ["feature-film", "classic-cinema"]
+  },
+  {
+    "title": "The Phantom Carriage",
+    "description": "Victor Sjöström's 1921 Swedish silent masterpiece about a drunkard who encounters the driver of Death's carriage on New Year's Eve.",
+    "source_url": "https://www.loc.gov/item/2021600327/",
+    "duration": 5580,
+    "year": 1921,
+    "license": "Public Domain",
+    "attribution": "Victor Sjöström / Svensk Filmindustri — Library of Congress",
+    "categories": ["feature-film", "classic-cinema"]
+  },
+  {
+    "title": "ISS Earth Time-Lapse 4K",
+    "description": "Breathtaking 4K time-lapse footage of Earth from the International Space Station, showing city lights, auroras, and weather patterns.",
+    "source_url": "https://images.nasa.gov/",
+    "duration": 300,
+    "year": 2020,
+    "license": "Public Domain",
+    "attribution": "NASA",
+    "categories": ["documentary", "science-space"]
+  }
+]

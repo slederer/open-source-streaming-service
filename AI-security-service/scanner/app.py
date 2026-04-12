@@ -2698,6 +2698,134 @@ async def overview(request: Request):
     }
 
 
+@app.get("/api/findings/by-target")
+async def findings_by_target(request: Request):
+    """Aggregated findings grouped by target (most recent state of each target)."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    with get_db() as db:
+        # For each target, find the most recent completed scan and its findings summary
+        targets = db.execute(
+            "SELECT id, host, label, added_at FROM targets WHERE user_id=? ORDER BY added_at DESC",
+            (user["user_id"],),
+        ).fetchall()
+
+        result = []
+        for t in targets:
+            # Latest completed run containing this target
+            latest = db.execute(
+                """
+                SELECT sr.id, sr.started_at, sr.finished_at, sr.status
+                FROM scan_runs sr
+                WHERE sr.user_id=? AND sr.status IN ('completed','aborted') AND sr.targets LIKE ?
+                ORDER BY sr.started_at DESC LIMIT 1
+                """,
+                (user["user_id"], f'%"{t["host"]}"%'),
+            ).fetchone()
+
+            sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+            last_run_id = None
+            last_scan_at = None
+            if latest:
+                last_run_id = latest["id"]
+                last_scan_at = latest["started_at"]
+                # Count findings in this run for this target
+                rows = db.execute(
+                    "SELECT severity, COUNT(*) as cnt FROM findings WHERE run_id=? AND target=? GROUP BY severity",
+                    (latest["id"], t["host"]),
+                ).fetchall()
+                for r in rows:
+                    sev_counts[r["severity"]] = r["cnt"]
+
+            total = sum(sev_counts.values())
+            # Grade
+            grade = "A"
+            if sev_counts["CRITICAL"]:
+                grade = "F"
+            elif sev_counts["HIGH"]:
+                grade = "C"
+            elif sev_counts["MEDIUM"]:
+                grade = "B"
+
+            result.append({
+                "id": t["id"],
+                "host": t["host"],
+                "label": t["label"],
+                "added_at": t["added_at"],
+                "last_run_id": last_run_id,
+                "last_scan_at": last_scan_at,
+                "severity_counts": sev_counts,
+                "total_findings": total,
+                "grade": grade,
+                "scanned": last_run_id is not None,
+            })
+
+        return result
+
+
+@app.get("/api/findings/by-target/{target_host}")
+async def findings_for_target(request: Request, target_host: str):
+    """All findings from the most recent scan for a specific target."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    with get_db() as db:
+        # Verify user owns this target
+        t = db.execute(
+            "SELECT * FROM targets WHERE host=? AND user_id=?", (target_host, user["user_id"])
+        ).fetchone()
+        if not t:
+            return JSONResponse({"error": "Target not found"}, status_code=404)
+
+        latest = db.execute(
+            """
+            SELECT id, started_at, finished_at, status FROM scan_runs
+            WHERE user_id=? AND status IN ('completed','aborted') AND targets LIKE ?
+            ORDER BY started_at DESC LIMIT 1
+            """,
+            (user["user_id"], f'%"{target_host}"%'),
+        ).fetchone()
+
+        findings = []
+        if latest:
+            rows = db.execute(
+                "SELECT * FROM findings WHERE run_id=? AND target=? ORDER BY "
+                "CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END",
+                (latest["id"], target_host),
+            ).fetchall()
+            findings = [dict(r) for r in rows]
+
+        # Previous run for diff
+        prev_run = db.execute(
+            """
+            SELECT id FROM scan_runs WHERE user_id=? AND status IN ('completed','aborted')
+            AND targets LIKE ? AND id != ? ORDER BY started_at DESC LIMIT 1
+            """,
+            (user["user_id"], f'%"{target_host}"%', latest["id"] if latest else ""),
+        ).fetchone()
+
+        # Scan history
+        history = db.execute(
+            """
+            SELECT id, started_at, finished_at, status FROM scan_runs
+            WHERE user_id=? AND status IN ('completed','aborted') AND targets LIKE ?
+            ORDER BY started_at DESC LIMIT 10
+            """,
+            (user["user_id"], f'%"{target_host}"%'),
+        ).fetchall()
+
+        return {
+            "target": dict(t),
+            "latest_run": dict(latest) if latest else None,
+            "findings": findings,
+            "history": [dict(r) for r in history],
+            "prev_run_id": prev_run["id"] if prev_run else None,
+        }
+
+
 @app.get("/api/me")
 async def me(request: Request):
     user = require_auth_any(request)
@@ -2714,9 +2842,37 @@ async def me(request: Request):
 
 # ── API Routes ────────────────────────────────────────────────────────────────
 
+STALE_SCAN_THRESHOLD_MIN = int(os.getenv("STALE_SCAN_THRESHOLD_MIN", "30"))
+
+
+def cleanup_stale_scans():
+    """Mark scans stuck in 'running' for too long as 'aborted'."""
+    try:
+        with get_db() as db:
+            cur = db.execute(
+                "UPDATE scan_runs SET status='aborted', finished_at=? "
+                "WHERE status='running' AND datetime(started_at) < datetime('now', ?)",
+                (datetime.now(timezone.utc).isoformat(), f"-{STALE_SCAN_THRESHOLD_MIN} minutes"),
+            )
+            if cur.rowcount:
+                print(f"[cleanup] Aborted {cur.rowcount} stale running scans", flush=True)
+    except Exception as e:
+        print(f"[cleanup] Failed: {e}", flush=True)
+
+
+def _periodic_cleanup_loop():
+    import time
+    while True:
+        time.sleep(300)
+        cleanup_stale_scans()
+
+
 @app.on_event("startup")
 def startup():
     init_db()
+    cleanup_stale_scans()
+    t = threading.Thread(target=_periodic_cleanup_loop, daemon=True)
+    t.start()
 
 
 # ── Target Management API ────────────────────────────────────────────────────
@@ -3369,6 +3525,262 @@ async def mobile_scan(request: Request):
 
 # ── Public /v1/ API (API-key authenticated) ─────────────────────────────────
 
+@app.get("/docs/api", response_class=HTMLResponse)
+async def api_docs_page(request: Request):
+    """Human-readable API reference."""
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>API Documentation — Security Scanner</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.6; font-size: 15px; }}
+  .container {{ max-width: 900px; margin: 0 auto; padding: 40px 24px 80px; }}
+  nav {{ padding: 16px 24px; border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; max-width: 1200px; margin: 0 auto; align-items: center; }}
+  nav a {{ color: #9ca3af; text-decoration: none; font-size: 0.85rem; }}
+  nav a.logo {{ color: #e5e7eb; font-weight: 700; }}
+  nav a.logo span {{ color: #dc2626; }}
+  nav .links {{ display: flex; gap: 20px; }}
+  h1 {{ font-size: 2.2rem; margin-bottom: 8px; letter-spacing: -0.02em; font-weight: 700; }}
+  .subtitle {{ color: #9ca3af; font-size: 1rem; margin-bottom: 40px; }}
+  h2 {{ font-size: 1.4rem; margin-top: 48px; margin-bottom: 16px; letter-spacing: -0.01em; padding-top: 16px; border-top: 1px solid #1f2937; }}
+  h3 {{ font-size: 1.05rem; margin-top: 28px; margin-bottom: 10px; color: #e5e7eb; }}
+  p {{ color: #d1d5db; margin-bottom: 14px; }}
+  code {{ font-family: 'SF Mono', Menlo, monospace; font-size: 0.85em; background: #111827; border: 1px solid #1f2937; padding: 1px 6px; border-radius: 4px; color: #fde047; }}
+  pre {{ background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 16px; overflow-x: auto; font-family: 'SF Mono', Menlo, monospace; font-size: 0.8rem; color: #d1d5db; margin-bottom: 20px; line-height: 1.5; position: relative; }}
+  pre code {{ background: none; border: none; padding: 0; color: inherit; font-size: inherit; }}
+  .endpoint {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; margin-bottom: 20px; }}
+  .method {{ display: inline-block; padding: 3px 10px; border-radius: 4px; font-family: 'SF Mono', monospace; font-size: 0.75rem; font-weight: 700; margin-right: 10px; }}
+  .method.GET {{ background: #172554; color: #93c5fd; }}
+  .method.POST {{ background: #14532d; color: #86efac; }}
+  .method.DELETE {{ background: #450a0a; color: #fca5a5; }}
+  .method.PATCH {{ background: #422006; color: #fde047; }}
+  .path {{ font-family: 'SF Mono', monospace; font-size: 0.95rem; }}
+  .tag {{ display: inline-block; padding: 2px 8px; background: #1f2937; color: #9ca3af; border-radius: 4px; font-size: 0.7rem; margin-left: 8px; }}
+  ul, ol {{ color: #d1d5db; margin-left: 24px; margin-bottom: 14px; }}
+  li {{ margin-bottom: 4px; }}
+  a {{ color: #dc2626; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .tip {{ background: #0f1a2e; border-left: 3px solid #3b82f6; padding: 12px 16px; margin: 16px 0; border-radius: 4px; color: #bfdbfe; font-size: 0.88rem; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 14px 0; }}
+  th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #1f2937; font-size: 0.85rem; }}
+  th {{ font-weight: 600; color: #9ca3af; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }}
+  .toc {{ background: #0f1420; border: 1px solid #1f2937; border-radius: 8px; padding: 16px 20px; margin-bottom: 32px; }}
+  .toc h4 {{ font-size: 0.8rem; color: #9ca3af; text-transform: uppercase; margin-bottom: 8px; font-weight: 600; letter-spacing: 0.05em; }}
+  .toc ul {{ list-style: none; margin: 0; }}
+  .toc li {{ margin-bottom: 6px; font-size: 0.9rem; }}
+  .toc a {{ color: #e5e7eb; }}
+</style></head>
+<body>
+<nav>
+  <a href="/" class="logo"><span>&#9632;</span> Security Scanner</a>
+  <div class="links">
+    <a href="/">Dashboard</a>
+    <a href="/v1/openapi.json">OpenAPI JSON</a>
+    <a href="/login">Sign in</a>
+  </div>
+</nav>
+
+<div class="container">
+<h1>API Documentation</h1>
+<div class="subtitle">REST API for programmatic scanning. Use the same <code>sk-sec-</code> API key across all clients.</div>
+
+<div class="toc">
+  <h4>Contents</h4>
+  <ul>
+    <li><a href="#auth">Authentication</a></li>
+    <li><a href="#scan">POST /v1/scan — Start a scan</a></li>
+    <li><a href="#get-scan">GET /v1/scan/{{run_id}} — Get scan status + findings</a></li>
+    <li><a href="#fix">GET /v1/scan/{{run_id}}/fix — Download fix file</a></li>
+    <li><a href="#analyze">POST /v1/scan/{{run_id}}/analyze — AI analysis</a></li>
+    <li><a href="#targets">GET/POST /v1/targets — Manage targets</a></li>
+    <li><a href="#runs">GET /v1/runs — List scan history</a></li>
+    <li><a href="#monitors">POST /api/monitors — Schedule recurring scans</a></li>
+    <li><a href="#code">POST /api/github/scan — GitHub repo scan</a></li>
+    <li><a href="#mobile">POST /api/mobile/scan — Mobile app scan</a></li>
+    <li><a href="#errors">Error codes</a></li>
+    <li><a href="#rate">Rate limits &amp; plans</a></li>
+  </ul>
+</div>
+
+<h2 id="auth">Authentication</h2>
+<p>All <code>/v1/</code> and <code>/api/</code> endpoints require a Bearer API key. Generate one at <a href="/keys">/keys</a>.</p>
+<pre><code>Authorization: Bearer sk-sec-your-key-here</code></pre>
+<p>Keys are scoped to your account. Every scan you trigger is billed/counted against your plan.</p>
+<div class="tip">The same API key works for the MCP server, ChatGPT Actions, GitHub Copilot Extension, Vercel Integration, and direct API calls.</div>
+
+<h2 id="scan">Start a scan</h2>
+<div class="endpoint">
+  <span class="method POST">POST</span><span class="path">/v1/scan</span><span class="tag">Async</span>
+  <p style="margin-top:14px;">Scans a single URL or IP. Auto-creates the target if it doesn't exist. Returns a <code>run_id</code> immediately; scan runs in background (2-5 minutes).</p>
+
+  <h3>Request</h3>
+  <pre><code>curl -H "Authorization: Bearer sk-sec-..." \\
+     -H "Content-Type: application/json" \\
+     -X POST https://security.slederer.com/v1/scan \\
+     -d '{{"host": "https://myapp.com", "label": "production"}}'</code></pre>
+
+  <h3>Response</h3>
+  <pre><code>{{
+  "run_id": "abc12345",
+  "status": "started",
+  "target": "myapp.com",
+  "check_status_url": "https://security.slederer.com/v1/scan/abc12345"
+}}</code></pre>
+</div>
+
+<h2 id="get-scan">Get scan status &amp; findings</h2>
+<div class="endpoint">
+  <span class="method GET">GET</span><span class="path">/v1/scan/{{run_id}}</span>
+  <p style="margin-top:14px;">Returns status (<code>running</code>, <code>completed</code>, <code>aborted</code>), summary counts, and all findings once complete.</p>
+
+  <h3>Response (while running)</h3>
+  <pre><code>{{
+  "run_id": "abc12345",
+  "status": "running",
+  "started_at": "2026-04-12T10:00:00+00:00",
+  "summary": {{"total": 5, "critical": 1, "high": 2, "medium": 2}},
+  "findings": [...partial results so far...]
+}}</code></pre>
+
+  <h3>Response (completed)</h3>
+  <pre><code>{{
+  "run_id": "abc12345",
+  "status": "completed",
+  "started_at": "2026-04-12T10:00:00+00:00",
+  "finished_at": "2026-04-12T10:03:42+00:00",
+  "summary": {{"total": 12, "critical": 1, "high": 3, "medium": 5, "low": 3, "info": 0}},
+  "findings": [
+    {{
+      "target": "myapp.com",
+      "severity": "CRITICAL",
+      "category": "secrets",
+      "title": "Anthropic API key exposed at /main.js",
+      "description": "Secret pattern matched. Rotate immediately.",
+      "evidence": "Found: sk-ant-api03-..."",
+      "tool": "secret-scan"
+    }}
+  ],
+  "fix_url": "https://security.slederer.com/v1/scan/abc12345/fix"
+}}</code></pre>
+</div>
+
+<h2 id="fix">Download fix file (Markdown)</h2>
+<div class="endpoint">
+  <span class="method GET">GET</span><span class="path">/v1/scan/{{run_id}}/fix</span>
+  <p style="margin-top:14px;">Returns a <code>SECURITY-FIX.md</code> document with YAML frontmatter and numbered fix instructions, designed to be dropped into a project for Claude Code to execute.</p>
+
+  <h3>Query params</h3>
+  <table>
+    <tr><th>Name</th><th>Type</th><th>Description</th></tr>
+    <tr><td><code>target</code></td><td>string</td><td>Filter to one target's findings</td></tr>
+    <tr><td><code>format</code></td><td>auto | legacy</td><td>Fallback format choice</td></tr>
+  </table>
+
+  <h3>Response format</h3>
+  <pre><code>---
+format: security-fix/v1
+scanner: security.slederer.com
+scan_id: abc12345
+scan_date: "2026-04-12"
+targets:
+  - host: myapp.com
+    risk_grade: F
+    severity_counts: {{critical: 1, high: 3}}
+---
+
+# Security Fixes: myapp.com
+
+## FIX-1: Rotate exposed Anthropic API key [CRITICAL]
+...</code></pre>
+</div>
+
+<h2 id="analyze">AI Analysis (Claude)</h2>
+<div class="endpoint">
+  <span class="method POST">POST</span><span class="path">/v1/scan/{{run_id}}/analyze</span><span class="tag">Requires PAYG+</span>
+  <p style="margin-top:14px;">Triggers Claude Sonnet analysis: executive summary, attack chains, risk score, prioritized remediation. Cached per run.</p>
+
+  <h3>Response</h3>
+  <pre><code>{{
+  "content": "# Security Assessment\\n\\n## Executive Summary\\n...",
+  "model": "claude-sonnet-4-5-20250929",
+  "cached": false
+}}</code></pre>
+</div>
+
+<h2 id="targets">Manage targets</h2>
+<div class="endpoint">
+  <span class="method GET">GET</span><span class="path">/v1/targets</span>
+  <p style="margin-top:14px;">List all configured scan targets.</p>
+</div>
+<div class="endpoint">
+  <span class="method POST">POST</span><span class="path">/v1/targets</span>
+  <p style="margin-top:14px;">Add a new target. Body: <code>{{"host": "...", "label": "..."}}</code></p>
+</div>
+<div class="endpoint">
+  <span class="method DELETE">DELETE</span><span class="path">/api/targets/{{id}}</span>
+</div>
+
+<h2 id="runs">List scan history</h2>
+<div class="endpoint">
+  <span class="method GET">GET</span><span class="path">/v1/runs</span>
+  <p style="margin-top:14px;">Returns last 50 runs, most recent first.</p>
+</div>
+
+<h2 id="monitors">Schedule recurring scans (Monthly+ plan)</h2>
+<div class="endpoint">
+  <span class="method POST">POST</span><span class="path">/api/monitors</span>
+  <pre><code>{{
+  "target": "https://myapp.com",
+  "frequency": "weekly",
+  "alert_email": "you@example.com",
+  "alert_webhook": "https://hooks.slack.com/...",
+  "alert_on_cert_expiry_days": 30
+}}</code></pre>
+</div>
+
+<h2 id="code">GitHub repo scan</h2>
+<div class="endpoint">
+  <span class="method POST">POST</span><span class="path">/api/github/scan</span><span class="tag">Requires paid plan</span>
+  <p style="margin-top:14px;">Clones a GitHub repo (shallow) and scans for secrets + npm-audit + pip-audit + Terraform IaC issues.</p>
+  <pre><code>{{"repo_url": "https://github.com/owner/repo", "github_token": "ghp_..."}}</code></pre>
+</div>
+
+<h2 id="mobile">Mobile app scan</h2>
+<div class="endpoint">
+  <span class="method POST">POST</span><span class="path">/api/mobile/scan</span><span class="tag">Requires paid plan</span>
+  <p style="margin-top:14px;">Upload an IPA or APK (max 200MB, multipart/form-data). Scans for hardcoded secrets, cleartext traffic, ATS bypass.</p>
+  <pre><code>curl -H "Authorization: Bearer sk-sec-..." \\
+     -F "file=@myapp.ipa" \\
+     https://security.slederer.com/api/mobile/scan</code></pre>
+</div>
+
+<h2 id="errors">Error codes</h2>
+<table>
+  <tr><th>Status</th><th>Meaning</th></tr>
+  <tr><td>200</td><td>OK</td></tr>
+  <tr><td>400</td><td>Bad request — invalid input</td></tr>
+  <tr><td>401</td><td>Missing or invalid API key</td></tr>
+  <tr><td>402</td><td>Plan limit reached — upgrade required (check <code>upgrade_url</code> in body)</td></tr>
+  <tr><td>404</td><td>Not found / not your resource</td></tr>
+  <tr><td>409</td><td>Conflict — e.g. target already exists</td></tr>
+  <tr><td>429</td><td>Rate limit</td></tr>
+</table>
+
+<h2 id="rate">Rate limits &amp; plans</h2>
+<table>
+  <tr><th>Plan</th><th>Targets</th><th>Scans</th><th>AI analysis</th></tr>
+  <tr><td>Free</td><td>1</td><td>1 lifetime</td><td>✗</td></tr>
+  <tr><td>PAYG $9/scan</td><td>5</td><td>per credit</td><td>✓</td></tr>
+  <tr><td>Monthly $29</td><td>1</td><td>5/week</td><td>✓</td></tr>
+  <tr><td>Pro $99</td><td>10</td><td>50/day</td><td>✓</td></tr>
+</table>
+
+<div class="tip"><strong>Tip:</strong> For complete interactive documentation, import <code>/v1/openapi.json</code> into Postman, Insomnia, or any OpenAPI viewer.</div>
+
+</div>
+</body></html>""")
+
+
 @app.get("/v1/openapi.json")
 async def v1_openapi():
     """Public OpenAPI spec for /v1/ endpoints — used by ChatGPT Actions."""
@@ -3866,6 +4278,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="nav-item" data-view="keys" onclick="go('keys')"><span class="icon">&#128273;</span> API Keys</div>
     <div class="nav-item" data-view="integrations" onclick="go('integrations')"><span class="icon">&#128279;</span> Integrations</div>
     <div class="nav-item" data-view="billing" onclick="go('billing')"><span class="icon">&#128176;</span> Billing</div>
+    <div class="nav-item" onclick="window.open('/docs/api','_blank')"><span class="icon">&#128220;</span> API Docs</div>
 
     <div class="sidebar-footer">
       <div id="user-box" class="user-box"></div>
@@ -4212,40 +4625,146 @@ async function delTarget(id) {
 }
 
 // ─── Findings explorer ───────────────────────────────────────────────────────
-let findingsFilter = "ALL";
-VIEWS.findings = async () => {
+VIEWS.findings = async (targetHost) => {
   const root = document.getElementById("view-root");
-  const runs = await api("/api/runs");
-  if (!runs) return;
-  // Aggregate latest finding per target+title
-  const all = [];
-  for (const r of runs.slice(0, 20)) {
-    const d = await api(`/api/runs/${r.id}`);
-    if (d && d.findings) {
-      d.findings.forEach(f => all.push({...f, run_id: r.id, run_started: r.started_at}));
-    }
+
+  if (targetHost) {
+    // Target detail view: findings for one target
+    root.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+    const d = await api(`/api/findings/by-target/${encodeURIComponent(targetHost)}`);
+    if (!d || d.error) { root.innerHTML = `<div class="empty"><p>${esc(d ? d.error : 'Not found')}</p></div>`; return; }
+
+    const counts = {CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,INFO:0};
+    d.findings.forEach(f => counts[f.severity]++);
+
+    root.innerHTML = `
+      <div class="page-title">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <a href="#findings" class="btn-ghost" style="padding:0;">&larr; Back to targets</a>
+        </div>
+        <h1 style="margin-top:8px;">${esc(d.target.label || d.target.host)}</h1>
+        <div class="sub mono">${esc(d.target.host)}${d.latest_run ? ' · Last scanned ' + fmtTime(d.latest_run.started_at) : ' · Never scanned'}</div>
+      </div>
+
+      <div class="grid grid-cards" style="margin-bottom:20px;">
+        <div class="stat-card crit"><div class="label">Critical</div><div class="value">${counts.CRITICAL}</div></div>
+        <div class="stat-card high"><div class="label">High</div><div class="value">${counts.HIGH}</div></div>
+        <div class="stat-card med"><div class="label">Medium</div><div class="value">${counts.MEDIUM}</div></div>
+        <div class="stat-card"><div class="label">Low / Info</div><div class="value">${counts.LOW + counts.INFO}</div></div>
+      </div>
+
+      <div class="card" style="margin-bottom:20px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+          <h2>Actions</h2>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="btn" onclick="scanSingle('${esc(d.target.host)}','${esc(d.target.label || '')}')">Scan now</button>
+            ${d.latest_run ? `<a class="btn btn-outline" href="#scan-detail/${d.latest_run.id}">View latest scan</a>` : ''}
+            ${d.latest_run ? `<a class="btn btn-outline" href="/v1/scan/${d.latest_run.id}/fix?target=${encodeURIComponent(d.target.host)}" download>Download fix file</a>` : ''}
+          </div>
+        </div>
+      </div>
+
+      ${d.findings.length ? `
+        <div class="card" style="padding:0;">
+          <table class="table">
+            <thead><tr><th>Severity</th><th>Finding</th><th>Category</th><th>Tool</th></tr></thead>
+            <tbody>
+              ${d.findings.map((f, i) => `
+                <tr class="finding-row-${i}" onclick="document.getElementById('fbody-${i}').style.display=document.getElementById('fbody-${i}').style.display==='table-row'?'none':'table-row';" style="cursor:pointer;">
+                  <td><span class="badge ${f.severity}">${f.severity}</span></td>
+                  <td>${esc(f.title)}</td>
+                  <td class="mono" style="font-size:0.75rem;color:var(--text-muted);">${esc(f.category)}</td>
+                  <td class="mono" style="font-size:0.75rem;color:var(--text-muted);">${esc(f.tool)}</td>
+                </tr>
+                <tr id="fbody-${i}" style="display:none;background:var(--sidebar);">
+                  <td colspan="4" style="padding:14px 20px;font-size:0.82rem;color:var(--text-dim);">
+                    ${f.description ? `<div><strong style="color:var(--text-muted);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Description</strong><div style="margin-top:4px;margin-bottom:10px;">${esc(f.description)}</div></div>` : ''}
+                    ${f.evidence ? `<div><strong style="color:var(--text-muted);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Evidence</strong><div style="margin-top:4px;font-family:'SF Mono',monospace;word-break:break-all;">${esc(f.evidence)}</div></div>` : ''}
+                  </td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : `<div class="empty"><h3>No findings</h3><p>${d.latest_run ? "Clean scan — no issues detected." : "Target hasn't been scanned yet."}</p>${!d.latest_run ? `<button class="btn" onclick="scanSingle('${esc(d.target.host)}','${esc(d.target.label || '')}')">Scan now</button>` : ''}</div>`}
+
+      ${d.history.length > 1 ? `
+        <h2 style="margin-top:28px;font-size:1rem;color:var(--text-dim);">Scan history</h2>
+        <div class="card" style="padding:0;margin-top:10px;">
+          <table class="table">
+            <tbody>
+              ${d.history.map(h => `<tr onclick="go('scan-detail','${h.id}')" style="cursor:pointer;">
+                <td class="mono">#${h.id}</td>
+                <td>${fmtTime(h.started_at)}</td>
+                <td><span class="status-badge ${h.status}">${h.status}</span></td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : ''}
+    `;
+    return;
   }
-  const filtered = findingsFilter === "ALL" ? all : all.filter(f => f.severity === findingsFilter);
+
+  // Overview: list of targets with their findings summary
+  root.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+  const targets = await api("/api/findings/by-target");
+  if (!targets) return;
+  if (targets.error) { root.innerHTML = `<div class="empty"><p>${esc(targets.error)}</p></div>`; return; }
+
+  const totals = {CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0, INFO:0};
+  targets.forEach(t => {
+    Object.keys(totals).forEach(k => totals[k] += (t.severity_counts[k] || 0));
+  });
+
   root.innerHTML = `
-    <div class="page-title"><h1>Findings</h1><div class="sub">Every finding across your 20 most recent scans</div></div>
-    <div class="filter-bar">
-      ${['ALL','CRITICAL','HIGH','MEDIUM','LOW','INFO'].map(s => `<span class="chip ${findingsFilter===s?'active':''}" onclick="findingsFilter='${s}';VIEWS.findings();">${s}${s!=='ALL' ? ' ('+all.filter(f=>f.severity===s).length+')' : ''}</span>`).join('')}
+    <div class="page-title">
+      <h1>Findings</h1>
+      <div class="sub">${targets.length} target${targets.length===1?'':'s'} · click a row to see findings</div>
     </div>
-    <div class="card" style="padding:0;">
-      ${filtered.length ? `<table class="table">
-        <thead><tr><th>Sev</th><th>Title</th><th>Target</th><th>Tool</th><th>Scan</th></tr></thead>
-        <tbody>
-          ${filtered.slice(0, 200).map(f => `<tr onclick="go('scan-detail','${f.run_id}')" style="cursor:pointer;">
-            <td><span class="badge ${f.severity}">${f.severity}</span></td>
-            <td>${esc(f.title)}</td>
-            <td class="mono">${esc(f.target)}</td>
-            <td class="mono">${esc(f.tool)}</td>
-            <td class="mono">#${f.run_id}</td>
-          </tr>`).join('')}
-        </tbody>
-      </table>` : `<div class="empty"><p>No findings match this filter.</p></div>`}
-    </div>`;
+
+    <div class="grid grid-cards" style="margin-bottom:24px;">
+      <div class="stat-card crit"><div class="label">Critical</div><div class="value">${totals.CRITICAL}</div></div>
+      <div class="stat-card high"><div class="label">High</div><div class="value">${totals.HIGH}</div></div>
+      <div class="stat-card med"><div class="label">Medium</div><div class="value">${totals.MEDIUM}</div></div>
+      <div class="stat-card"><div class="label">Low / Info</div><div class="value">${totals.LOW + totals.INFO}</div></div>
+    </div>
+
+    ${targets.length ? `
+      <div class="card" style="padding:0;">
+        <table class="table">
+          <thead><tr><th style="width:50px;">Grade</th><th>Target</th><th>Last scan</th><th>Severity breakdown</th><th style="width:60px;"></th></tr></thead>
+          <tbody>
+            ${targets.map(t => {
+              const s = t.severity_counts;
+              return `<tr onclick="go('findings','${encodeURIComponent(t.host)}')" style="cursor:pointer;">
+                <td><div class="grade grade-${t.grade}" style="width:32px;height:32px;font-size:0.95rem;">${t.grade}</div></td>
+                <td>
+                  <div style="font-weight:600;">${esc(t.label || t.host)}</div>
+                  ${t.label && t.label !== t.host ? `<div class="mono" style="color:var(--text-muted);font-size:0.75rem;">${esc(t.host)}</div>` : ''}
+                </td>
+                <td style="color:var(--text-muted);font-size:0.82rem;">${t.last_scan_at ? fmtTime(t.last_scan_at) : 'never'}</td>
+                <td>
+                  ${t.scanned ? `
+                    ${s.CRITICAL ? `<span class="badge CRITICAL">${s.CRITICAL} CRIT</span>` : ''}
+                    ${s.HIGH ? `<span class="badge HIGH">${s.HIGH} HIGH</span>` : ''}
+                    ${s.MEDIUM ? `<span class="badge MEDIUM">${s.MEDIUM} MED</span>` : ''}
+                    ${s.LOW ? `<span class="badge LOW">${s.LOW}</span>` : ''}
+                    ${s.INFO ? `<span class="badge INFO">${s.INFO}</span>` : ''}
+                    ${!t.total_findings ? '<span style="color:var(--success);font-size:0.8rem;">&#10003; Clean</span>' : ''}
+                  ` : '<span style="color:var(--text-muted);font-size:0.8rem;">Not scanned yet</span>'}
+                </td>
+                <td style="text-align:right;"><span style="color:var(--text-muted);">&#8250;</span></td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>` : `<div class="empty"><h3>No targets yet</h3><p>Add a target to start scanning.</p><button class="btn" onclick="go('targets')">Go to Targets</button></div>`}
+  `;
 };
+
+async function scanSingle(host, label) {
+  const r = await api("/v1/scan", {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({host, label})});
+  if (r && r.error) { alert(r.error); return; }
+  if (r && r.run_id) go("scan-detail", r.run_id);
+}
 
 // ─── Monitors view ───────────────────────────────────────────────────────────
 VIEWS.monitors = async () => {
@@ -4448,10 +4967,11 @@ VIEWS.integrations = async () => {
     <div class="card" style="margin-top:20px;">
       <h3>Direct API</h3>
       <h2 style="margin-bottom:6px;">Use our /v1/ API from anywhere</h2>
-      <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:10px;">OpenAPI spec at <a href="/v1/openapi.json" style="color:var(--brand);">/v1/openapi.json</a></p>
+      <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:10px;">Full reference: <a href="/docs/api" target="_blank" style="color:var(--brand);">/docs/api</a> · OpenAPI JSON: <a href="/v1/openapi.json" target="_blank" style="color:var(--brand);">/v1/openapi.json</a></p>
       <div class="copy-code">curl -H "Authorization: Bearer sk-sec-..." \\
   -X POST https://security.slederer.com/v1/scan \\
   -d '{"host":"https://myapp.com"}'</div>
+      <p style="margin-top:10px;"><a class="btn btn-outline btn-sm" href="/docs/api" target="_blank">Read API docs</a></p>
     </div>`;
 };
 

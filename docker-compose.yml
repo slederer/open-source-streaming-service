@@ -8,6 +8,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./backend/migrations/001_init.up.sql:/docker-entrypoint-initdb.d/001_init.sql
+      - ./backend/migrations/002_auth.up.sql:/docker-entrypoint-initdb.d/002_auth.sql
     ports:
       - "5432:5432"
     healthcheck:
@@ -26,6 +27,9 @@ services:
     environment:
       DATABASE_URL: postgres://streaming:streaming@postgres:5432/streaming?sslmode=disable
       PORT: "8080"
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8080}
       BITMOVIN_API_KEY: ${BITMOVIN_API_KEY:-}
       BITMOVIN_ORG_ID: ${BITMOVIN_ORG_ID:-}
       BITMOVIN_PLAYER_KEY: ${BITMOVIN_PLAYER_KEY:-}

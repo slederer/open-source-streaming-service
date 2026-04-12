@@ -16,6 +16,10 @@ type Config struct {
 	BitmovinPlayerKey   string
 	BitmovinAnalyticsKey string
 
+	// Google OAuth
+	GoogleClientID     string
+	GoogleClientSecret string
+
 	// AWS
 	AWSRegion        string
 	S3InputBucket    string
@@ -44,6 +48,9 @@ func Load() *Config {
 		Port:    getEnv("PORT", "8080"),
 		DBUrl:   getEnv("DATABASE_URL", "postgres://streaming:streaming@localhost:5432/streaming?sslmode=disable"),
 		APIBase: getEnv("API_BASE_URL", "http://localhost:8080"),
+
+		GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+		GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
 
 		BitmovinAPIKey:       os.Getenv("BITMOVIN_API_KEY"),
 		BitmovinOrgID:        os.Getenv("BITMOVIN_ORG_ID"),

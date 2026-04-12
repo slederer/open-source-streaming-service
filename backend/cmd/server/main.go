@@ -47,7 +47,7 @@ func NewRouter(h *handler.Handler) chi.Router {
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
 		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: false,
+		AllowCredentials: true,
 		MaxAge:           300,
 	}))
 
@@ -56,6 +56,12 @@ func NewRouter(h *handler.Handler) chi.Router {
 	})
 
 	r.Route("/api", func(r chi.Router) {
+		// Auth endpoints
+		r.Get("/auth/google", h.GoogleLogin)
+		r.Get("/auth/google/callback", h.GoogleCallback)
+		r.Post("/auth/logout", h.Logout)
+		r.Get("/auth/me", h.GetMe)
+
 		// Public endpoints
 		r.Get("/videos", h.ListVideos)
 		r.Get("/videos/{id}", h.GetVideo)

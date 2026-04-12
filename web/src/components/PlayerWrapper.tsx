@@ -45,7 +45,13 @@ export default function PlayerWrapper({
     async function initPlayer() {
       if (!containerRef.current || destroyed) return;
 
+      // Import Player core
       const { Player } = await import("bitmovin-player");
+      // Import UI separately — Bitmovin Player v8 ships UI as a separate module
+      // @ts-expect-error - no type definitions for the UI module path
+      const uiModule = await import("bitmovin-player/bitmovinplayer-ui.js");
+      // Import CSS for the UI
+      await import("bitmovin-player/bitmovinplayer-ui.css");
       if (destroyed) return;
 
       const playerConfig = {
@@ -56,6 +62,13 @@ export default function PlayerWrapper({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const player = new Player(containerRef.current, playerConfig as any);
       playerRef.current = player;
+
+      // Build the default UI
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const UIFactory = (uiModule as any).UIFactory || (uiModule as any).default?.UIFactory;
+      if (UIFactory && UIFactory.buildDefaultUI) {
+        UIFactory.buildDefaultUI(player);
+      }
 
       const sourceConfig: Record<string, unknown> = { title: title || "Video" };
 

@@ -39,8 +39,7 @@ echo "Codec configs: H264 1080=$H264_1080, 720=$H264_720, 480=$H264_480, 360=$H2
 # Videos: title|s3-filename
 VIDEOS="Big Buck Bunny|big-buck-bunny.mov
 Sintel|sintel.mp4
-Tears of Steel|tears-of-steel.mov
-Elephants Dream|elephants-dream.avi"
+Tears of Steel|tears-of-steel.mov"
 
 > "$ROOT_DIR/content/encoding_jobs.txt"
 

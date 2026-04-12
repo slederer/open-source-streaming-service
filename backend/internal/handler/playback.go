@@ -53,7 +53,7 @@ func (h *Handler) GetVideoPlayback(w http.ResponseWriter, r *http.Request) {
 			h.Config.MediaTailorVODEndpoint, video.EncodingJobID)
 	}
 
-	// Add DRM token if PallyCon is configured
+	// Add DRM token if DoveRunner (formerly PallyCon) is configured
 	if h.Config.PallyConSiteID != "" && video.DRMContentID != "" {
 		resp["drm_token"] = generatePallyConToken(h.Config, video.DRMContentID)
 		resp["drm_widevine_url"] = "https://license.pallycon.com/ri/widevineLicense"
@@ -104,7 +104,7 @@ func (h *Handler) GetLivePlayback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// generatePallyConToken creates a simple PallyCon custom data token.
+// generatePallyConToken creates a DoveRunner (formerly PallyCon) custom data token.
 // In production this would be a proper JWT signed with the site key.
 func generatePallyConToken(cfg *config.Config, contentID string) string {
 	// Placeholder: real implementation signs a JWT with PallyConSiteKey

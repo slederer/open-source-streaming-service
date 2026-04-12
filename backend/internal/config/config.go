@@ -28,7 +28,7 @@ type Config struct {
 	MediaTailorLiveEndpoint string
 	ADDecisionServerURL     string
 
-	// PallyCon
+	// DoveRunner DRM (formerly PallyCon)
 	PallyConSiteID    string
 	PallyConSiteKey   string
 	PallyConAccessKey string

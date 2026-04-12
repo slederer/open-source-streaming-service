@@ -36,7 +36,7 @@ A full-stack demo OTT streaming service built with the **Bitmovin** product suit
 | **Bitmovin Analytics** | Player-side observability across all platforms |
 | **Bitmovin AI Content Analytics** | Auto-generated thumbnails and scene descriptions |
 | **AWS MediaTailor** | Server-side ad insertion (SSAI) for VOD and Live |
-| **PallyCon DRM** | Widevine (Chrome/Vidaa) + FairPlay (iOS/Safari) encryption |
+| **DoveRunner DRM** (formerly PallyCon) | Widevine (Chrome/Vidaa) + FairPlay (iOS/Safari) encryption |
 
 ## Content Catalog
 
@@ -54,7 +54,7 @@ A full-stack demo OTT streaming service built with the **Bitmovin** product suit
 - Docker + Docker Compose
 - Bitmovin account (API key + Player key)
 - AWS account (for S3, CloudFront, MediaTailor)
-- PallyCon account (optional, for DRM)
+- DoveRunner account (optional, for DRM — formerly PallyCon)
 
 ### Local Development
 

@@ -15,13 +15,28 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DB_PATH = Path(os.getenv("SCANNER_DB", "/home/ec2-user/scanner.db"))
+
+def _db_path() -> Path:
+    return Path(os.getenv("SCANNER_DB", "/home/ec2-user/scanner.db"))
+
+
+DB_PATH = _db_path()
 
 
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn = sqlite3.connect(str(_db_path()), timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _import_scanner():
+    try:
+        from scanner.app import run_full_scan, _compute_target_diffs, get_user_by_id
+        return run_full_scan, _compute_target_diffs, get_user_by_id
+    except ImportError:
+        sys.path.insert(0, "/home/ec2-user")
+        from scanner_app import run_full_scan, _compute_target_diffs, get_user_by_id
+        return run_full_scan, _compute_target_diffs, get_user_by_id
 
 
 def send_alert_email(email: str, subject: str, html: str):
@@ -50,12 +65,7 @@ def send_webhook(url: str, data: dict):
 
 def run_monitor(monitor: sqlite3.Row):
     """Execute one monitor's scan + diff + alert flow."""
-    sys.path.insert(0, "/home/ec2-user")
-    try:
-        from scanner_app import run_full_scan, _compute_target_diffs, get_user_by_id
-    except ImportError:
-        from scanner.app import run_full_scan, _compute_target_diffs, get_user_by_id
-
+    run_full_scan, _compute_target_diffs, get_user_by_id = _import_scanner()
     conn = get_db()
     user_id = monitor["user_id"]
     target = monitor["target"]
@@ -146,8 +156,13 @@ def run_monitor(monitor: sqlite3.Row):
 def run_due_monitors():
     conn = get_db()
     now = datetime.now(timezone.utc)
-    # Fetch active monitors
-    monitors = conn.execute("SELECT * FROM monitors WHERE is_active=1").fetchall()
+    # Fetch active monitors (graceful if table doesn't exist yet)
+    try:
+        monitors = conn.execute("SELECT * FROM monitors WHERE is_active=1").fetchall()
+    except sqlite3.OperationalError:
+        print("[monitor] monitors table does not exist yet, nothing to run", flush=True)
+        conn.close()
+        return
     due_count = 0
     for m in monitors:
         freq = m["frequency"]

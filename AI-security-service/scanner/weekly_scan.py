@@ -17,13 +17,31 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(os.getenv("SCANNER_DB", "/home/ec2-user/scanner.db"))
+
+def _db_path() -> Path:
+    """Read DB path at call time so tests can override SCANNER_DB."""
+    return Path(os.getenv("SCANNER_DB", "/home/ec2-user/scanner.db"))
+
+
+# Keep DB_PATH for backward compat; refreshes on import
+DB_PATH = _db_path()
 
 
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn = sqlite3.connect(str(_db_path()), timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _import_scanner():
+    """Import run_full_scan + helpers, works whether on EC2 or in local/test env."""
+    try:
+        from scanner.app import run_full_scan, parse_targets, _compute_target_diffs
+        return run_full_scan, parse_targets, _compute_target_diffs
+    except ImportError:
+        sys.path.insert(0, "/home/ec2-user")
+        from scanner_app import run_full_scan, parse_targets, _compute_target_diffs
+        return run_full_scan, parse_targets, _compute_target_diffs
 
 
 def send_summary_email(email: str, name: str, summaries: list):
@@ -99,16 +117,11 @@ def send_summary_email(email: str, name: str, summaries: list):
 
 def run_weekly_scans():
     """Main entry point."""
-    # Import scan logic from app
-    sys.path.insert(0, "/home/ec2-user")
     try:
-        from scanner_app import run_full_scan, parse_targets, _compute_target_diffs
+        run_full_scan, parse_targets, _compute_target_diffs = _import_scanner()
     except ImportError:
-        try:
-            from scanner.app import run_full_scan, parse_targets, _compute_target_diffs
-        except ImportError:
-            print("[weekly] Cannot import scanner app", flush=True)
-            return
+        print("[weekly] Cannot import scanner app", flush=True)
+        return
 
     conn = get_db()
     now = datetime.now(timezone.utc).isoformat()

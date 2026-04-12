@@ -1,0 +1,88 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: streaming
+      POSTGRES_USER: streaming
+      POSTGRES_PASSWORD: streaming
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/migrations/001_init.up.sql:/docker-entrypoint-initdb.d/001_init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streaming"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://streaming:streaming@postgres:5432/streaming?sslmode=disable
+      PORT: "8080"
+      BITMOVIN_API_KEY: ${BITMOVIN_API_KEY:-}
+      BITMOVIN_ORG_ID: ${BITMOVIN_ORG_ID:-}
+      BITMOVIN_PLAYER_KEY: ${BITMOVIN_PLAYER_KEY:-}
+      BITMOVIN_ANALYTICS_KEY: ${BITMOVIN_ANALYTICS_KEY:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      S3_INPUT_BUCKET: ${S3_INPUT_BUCKET:-oss-streaming-input}
+      S3_OUTPUT_BUCKET: ${S3_OUTPUT_BUCKET:-oss-streaming-output}
+      S3_THUMBNAIL_BUCKET: ${S3_THUMBNAIL_BUCKET:-oss-streaming-thumbnails}
+      CLOUDFRONT_DOMAIN: ${CLOUDFRONT_DOMAIN:-}
+      MEDIATAILOR_VOD_ENDPOINT: ${MEDIATAILOR_VOD_ENDPOINT:-}
+      MEDIATAILOR_LIVE_ENDPOINT: ${MEDIATAILOR_LIVE_ENDPOINT:-}
+      AD_DECISION_SERVER_URL: ${AD_DECISION_SERVER_URL:-}
+      PALLYCON_SITE_ID: ${PALLYCON_SITE_ID:-}
+      PALLYCON_SITE_KEY: ${PALLYCON_SITE_KEY:-}
+      PALLYCON_ACCESS_KEY: ${PALLYCON_ACCESS_KEY:-}
+    ports:
+      - "8080:8080"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8080
+      NEXT_PUBLIC_BITMOVIN_PLAYER_KEY: ${BITMOVIN_PLAYER_KEY:-}
+      NEXT_PUBLIC_BITMOVIN_ANALYTICS_KEY: ${BITMOVIN_ANALYTICS_KEY:-}
+    ports:
+      - "3000:3000"
+
+  nginx:
+    image: nginx:alpine
+    depends_on:
+      - backend
+      - web
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+      - "443:443"
+
+  ffmpeg-live:
+    image: linuxserver/ffmpeg:latest
+    depends_on:
+      - backend
+    volumes:
+      - ./content/playlist.txt:/playlist.txt:ro
+    entrypoint: >
+      ffmpeg -re -stream_loop -1 -f concat -safe 0
+      -i /playlist.txt
+      -c:v libx264 -preset veryfast -b:v 3000k
+      -c:a aac -b:a 128k
+      -f flv rtmp://live.bitmovin.com/live/${BITMOVIN_LIVE_STREAM_KEY:-placeholder}
+    restart: unless-stopped
+    profiles:
+      - live
+
+volumes:
+  pgdata:

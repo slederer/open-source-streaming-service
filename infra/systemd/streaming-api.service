@@ -1,0 +1,15 @@
+[Unit]
+Description=Open Source Streaming API Server
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/streaming/app
+EnvironmentFile=/opt/streaming/.env
+ExecStart=/opt/streaming/app/backend/server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

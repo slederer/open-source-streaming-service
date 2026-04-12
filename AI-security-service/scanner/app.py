@@ -31,7 +31,13 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
 ALLOWED_EMAILS = set(filter(None, os.getenv("ALLOWED_EMAILS", "stefan.a.lederer@gmail.com,stefan.lederer@bitmovin.com").split(",")))
 
 app = FastAPI(title="Security Scanner", docs_url=None, redoc_url=None, openapi_url=None)
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, max_age=86400 * 7)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    max_age=86400 * 7,
+    same_site="lax",
+    https_only=False,  # Behind Cloudflare flexible SSL, origin sees HTTP
+)
 
 # OAuth setup
 oauth = OAuth()

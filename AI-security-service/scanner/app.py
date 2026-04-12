@@ -4898,7 +4898,7 @@ async function scanAll() {
   if (!r) return;
   if (r.error) { alert(r.error); return; }
   let msg = `Started ${r.count} scan${r.count===1?'':'s'}.`;
-  if (r.skipped && r.skipped.length) msg += `\n\nSkipped ${r.skipped.length} due to plan limits:\n` + r.skipped.map(s => `• ${s.target}: ${s.reason}`).join('\n');
+  if (r.skipped && r.skipped.length) msg += `\\n\\nSkipped ${r.skipped.length} due to plan limits:\\n` + r.skipped.map(s => `\u2022 ${s.target}: ${s.reason}`).join('\\n');
   alert(msg);
   go("scans");
 }

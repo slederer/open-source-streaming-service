@@ -54,12 +54,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_URL: ${API_BASE_URL:-http://localhost:8080}
+        NEXT_PUBLIC_BITMOVIN_PLAYER_KEY: ${BITMOVIN_PLAYER_KEY:-}
+        NEXT_PUBLIC_BITMOVIN_ANALYTICS_KEY: ${BITMOVIN_ANALYTICS_KEY:-}
     depends_on:
       - backend
-    environment:
-      NEXT_PUBLIC_API_URL: http://backend:8080
-      NEXT_PUBLIC_BITMOVIN_PLAYER_KEY: ${BITMOVIN_PLAYER_KEY:-}
-      NEXT_PUBLIC_BITMOVIN_ANALYTICS_KEY: ${BITMOVIN_ANALYTICS_KEY:-}
     ports:
       - "3000:3000"
 

@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+// Client-side: use relative URLs so browser goes through nginx
+const API_BASE = "";
 
 interface User {
   id: string;

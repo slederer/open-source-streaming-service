@@ -5,7 +5,7 @@ import { useParams } from "next/navigation";
 import PlayerWrapper from "@/components/PlayerWrapper";
 import type { PlaybackInfo } from "@/lib/api";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+const API_BASE = "";
 const PLAYER_KEY = process.env.NEXT_PUBLIC_BITMOVIN_PLAYER_KEY || "";
 const ANALYTICS_KEY = process.env.NEXT_PUBLIC_BITMOVIN_ANALYTICS_KEY || "";
 

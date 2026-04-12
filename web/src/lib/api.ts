@@ -1,4 +1,9 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+// On server (SSR), call the backend container directly.
+// On client (browser), use relative URLs so nginx proxies to the backend.
+const API_BASE =
+  typeof window === "undefined"
+    ? (process.env.NEXT_PUBLIC_API_URL || "http://backend:8080")
+    : "";
 
 export interface Video {
   id: string;

@@ -1343,14 +1343,29 @@ def _store_findings(run_id: str, findings: list[dict], seen: set, user_id: Optio
                 )
 
 
-def _update_summary(run_id: str, status: str = "running"):
-    """Recalculate and store run summary from current findings."""
+def _update_summary(run_id: str, status: str = "running", current_module: Optional[str] = None,
+                    completed_modules: Optional[list] = None, total_modules: Optional[int] = None):
+    """Recalculate and store run summary + progress."""
     with get_db() as db:
         rows = db.execute("SELECT severity, COUNT(*) as cnt FROM findings WHERE run_id=? GROUP BY severity", (run_id,)).fetchall()
         summary = {"total": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
         for r in rows:
             summary[r["severity"].lower()] = r["cnt"]
             summary["total"] += r["cnt"]
+
+        # Merge with existing progress data (preserve if caller didn't pass)
+        if current_module is not None or completed_modules is not None or total_modules is not None:
+            existing = db.execute("SELECT summary_json FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+            prev = json.loads(existing["summary_json"]) if existing and existing["summary_json"] else {}
+            prev_progress = prev.get("progress", {})
+            progress = {
+                "current": current_module if current_module is not None else prev_progress.get("current"),
+                "completed": completed_modules if completed_modules is not None else prev_progress.get("completed", []),
+                "total": total_modules if total_modules is not None else prev_progress.get("total", 0),
+            }
+            if status == "completed":
+                progress["current"] = None
+            summary["progress"] = progress
 
         finished = datetime.now(timezone.utc).isoformat() if status == "completed" else None
         db.execute(
@@ -1359,42 +1374,56 @@ def _update_summary(run_id: str, status: str = "running"):
         )
 
 
+# Scan modules with human-readable descriptions
+SCAN_MODULES = [
+    ("nmap",            "Port scan & service detection",    "scan_target_nmap"),
+    ("headers",         "HTTP security headers",            "scan_target_headers"),
+    ("tls",             "TLS/SSL configuration & cert",     "scan_target_tls"),
+    ("docs",            "Exposed endpoints (/docs, /.env)", "scan_target_docs"),
+    ("ratelimit",       "Rate limiting probes",             "scan_target_ratelimit"),
+    ("nuclei",          "Nuclei vulnerability templates",   "scan_target_nuclei"),
+    ("secrets",         "Client bundle secret scan",        "scan_target_secrets"),
+    ("cors",            "CORS misconfiguration",            "scan_target_cors"),
+    ("csp",             "Content Security Policy audit",    "scan_target_csp"),
+    ("source_maps",     "Source map exposure",              "scan_target_source_maps"),
+    ("verbose_errors",  "Debug info leakage",               "scan_target_verbose_errors"),
+    ("jwt",             "JWT security",                     "scan_target_jwt"),
+    ("dns_email",       "SPF/DMARC/CAA records",            "scan_target_dns_email"),
+    ("baas",            "Supabase/Firebase/Clerk audit",    "scan_target_baas"),
+    ("subdomain_enum",  "Subdomain enumeration (CT logs)",  "scan_target_subdomain_enum"),
+    ("llm",             "LLM endpoint security (OWASP)",    "scan_target_llm"),
+    ("auth",            "Authentication probes",            "scan_target_auth"),
+    ("s3_cloud",        "Cloud misconfiguration",           "scan_target_s3_cloud"),
+    ("accessibility",   "Privacy & compliance audit",       "scan_target_accessibility"),
+]
+
+
+def get_scan_module_meta():
+    """Public metadata for the UI progress panel."""
+    return [{"name": n, "description": d} for n, d, _ in SCAN_MODULES]
+
+
 def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = None):
     """Execute all scan modules against all targets, storing results incrementally."""
     seen = set()
-    scan_modules = [
-        ("nmap", scan_target_nmap),
-        ("headers", scan_target_headers),
-        ("tls", scan_target_tls),
-        ("docs", scan_target_docs),
-        ("ratelimit", scan_target_ratelimit),
-        ("nuclei", scan_target_nuclei),
-        # Extended modules (items 1-17)
-        ("secrets", scan_target_secrets),
-        ("cors", scan_target_cors),
-        ("csp", scan_target_csp),
-        ("source_maps", scan_target_source_maps),
-        ("verbose_errors", scan_target_verbose_errors),
-        ("jwt", scan_target_jwt),
-        ("dns_email", scan_target_dns_email),
-        ("baas", scan_target_baas),
-        ("subdomain_enum", scan_target_subdomain_enum),
-        ("llm", scan_target_llm),
-        ("auth", scan_target_auth),
-        ("s3_cloud", scan_target_s3_cloud),
-        ("accessibility", scan_target_accessibility),
-    ]
+    scan_modules = [(n, globals()[fname]) for n, _, fname in SCAN_MODULES]
+    total = len(scan_modules)
+    completed = []
+
+    # Initial: mark progress ready
+    _update_summary(run_id, status="running", current_module=None, completed_modules=[], total_modules=total)
 
     for target in targets:
         ip, name = target["ip"], target["name"]
         for mod_name, mod_func in scan_modules:
+            # Announce which module is about to run
+            _update_summary(run_id, status="running", current_module=mod_name, completed_modules=completed, total_modules=total)
             try:
                 if mod_name == "nmap":
                     findings, _ = mod_func(run_id, ip, name)
                 else:
                     findings = mod_func(run_id, ip, name)
                 _store_findings(run_id, findings, seen, user_id=user_id)
-                _update_summary(run_id, status="running")
             except Exception as e:
                 _store_findings(run_id, [{
                     "target": ip, "severity": "INFO", "category": "error",
@@ -1402,8 +1431,11 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
                     "description": str(e),
                     "evidence": "", "tool": mod_name,
                 }], seen, user_id=user_id)
+            # Mark this module done
+            completed.append(mod_name)
+            _update_summary(run_id, status="running", current_module=None, completed_modules=completed, total_modules=total)
 
-    _update_summary(run_id, status="completed")
+    _update_summary(run_id, status="completed", current_module=None, completed_modules=completed, total_modules=total)
 
     # PAYG: consume 1 credit per completed scan
     if user_id:
@@ -2658,6 +2690,12 @@ async def billing_status(request: Request):
 
 
 # ── User Profile ─────────────────────────────────────────────────────────────
+
+@app.get("/api/scan-modules")
+async def scan_modules_meta(request: Request):
+    """Public list of scan modules with descriptions — used by the progress panel."""
+    return get_scan_module_meta()
+
 
 @app.get("/api/overview")
 async def overview(request: Request):
@@ -4433,6 +4471,11 @@ let user = null;
 let currentView = "overview";
 
 function go(view, param) {
+  // Cancel any active scan-detail poll when leaving
+  if (currentView === 'scan-detail' && view !== 'scan-detail' && _scanPollTimer) {
+    clearTimeout(_scanPollTimer);
+    _scanPollTimer = null;
+  }
   currentView = view;
   const url = param ? `#${view}/${param}` : `#${view}`;
   if (location.hash !== url) location.hash = url;
@@ -4590,10 +4633,21 @@ VIEWS.scans = async () => {
 };
 
 // ─── Scan detail view ────────────────────────────────────────────────────────
+let _scanPollTimer = null;
+let _scanModulesMeta = null;
+
+async function _loadModulesMeta() {
+  if (_scanModulesMeta) return _scanModulesMeta;
+  _scanModulesMeta = await api("/api/scan-modules") || [];
+  return _scanModulesMeta;
+}
+
 VIEWS["scan-detail"] = async (runId) => {
   const root = document.getElementById("view-root");
   if (!runId) { go("scans"); return; }
+  if (_scanPollTimer) { clearTimeout(_scanPollTimer); _scanPollTimer = null; }
   root.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+  const modulesMeta = await _loadModulesMeta();
   const d = await api(`/api/runs/${runId}`);
   if (!d || d.error) { root.innerHTML = `<div class="empty"><p>Scan not found</p></div>`; return; }
 
@@ -4601,6 +4655,8 @@ VIEWS["scan-detail"] = async (runId) => {
   (d.findings || []).forEach(f => { (byTarget[f.target] = byTarget[f.target] || []).push(f); });
   const diffs = d.target_diffs || {};
   const sumAll = d.run.summary_json ? JSON.parse(d.run.summary_json) : {};
+  const progress = sumAll.progress || null;
+  const isRunning = d.run.status === 'running';
 
   const gradeFor = (findings) => {
     const crit = findings.filter(f => f.severity === 'CRITICAL').length;
@@ -4612,11 +4668,50 @@ VIEWS["scan-detail"] = async (runId) => {
     return 'A';
   };
 
+  const renderProgress = () => {
+    if (!progress && !isRunning) return '';
+    const completed = new Set((progress && progress.completed) || []);
+    const current = progress && progress.current;
+    const done = completed.size;
+    const totalN = (progress && progress.total) || modulesMeta.length;
+    const pct = Math.round((done / totalN) * 100);
+    return `
+      <div class="card" style="margin-bottom:20px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <h2 style="margin:0;">Scan progress</h2>
+          <div style="font-size:0.85rem;color:var(--text-muted);">${done} / ${totalN} modules · ${pct}%</div>
+        </div>
+        <div style="height:6px;background:var(--border);border-radius:3px;margin-bottom:16px;overflow:hidden;">
+          <div style="height:100%;background:var(--brand);width:${pct}%;transition:width 0.5s;"></div>
+        </div>
+        <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:8px;">
+          ${modulesMeta.map(m => {
+            const isDone = completed.has(m.name);
+            const isCurrent = current === m.name;
+            const icon = isDone ? '<span style="color:var(--success);">&#10003;</span>'
+                       : isCurrent ? '<span class="spinner" style="width:12px;height:12px;border-width:2px;"></span>'
+                       : '<span style="color:var(--text-muted);">&#9675;</span>';
+            const color = isDone ? 'var(--text)' : isCurrent ? 'var(--brand)' : 'var(--text-muted)';
+            const weight = isCurrent ? '600' : '400';
+            return `<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:4px;background:${isCurrent?'rgba(220,38,38,0.08)':'transparent'};">
+              <div style="width:16px;display:flex;align-items:center;justify-content:center;">${icon}</div>
+              <div style="flex:1;min-width:0;">
+                <div style="color:${color};font-weight:${weight};font-size:0.82rem;">${esc(m.name)}</div>
+                <div style="color:var(--text-muted);font-size:0.7rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(m.description)}</div>
+              </div>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>`;
+  };
+
   root.innerHTML = `
     <div class="page-title">
       <div style="display:flex;align-items:center;gap:12px;"><h1>Scan #${runId}</h1><span class="status-badge ${d.run.status}">${d.run.status}</span></div>
-      <div class="sub">${fmtTime(d.run.started_at)} · ${esc(d.run.scan_type || 'full')}</div>
+      <div class="sub">${fmtTime(d.run.started_at)} · ${esc(d.run.scan_type || 'full')}${isRunning ? ' · <span style="color:var(--brand);">live</span>' : ''}</div>
     </div>
+
+    ${renderProgress()}
 
     <div class="grid grid-cards" style="margin-bottom:20px;">
       <div class="stat-card crit"><div class="label">Critical</div><div class="value">${sumAll.critical || 0}</div></div>
@@ -4683,6 +4778,15 @@ VIEWS["scan-detail"] = async (runId) => {
         </div>`;
     }).join('')}
   `;
+
+  // Auto-refresh while running
+  if (isRunning && currentView === 'scan-detail') {
+    _scanPollTimer = setTimeout(() => {
+      if (currentView === 'scan-detail' && location.hash.includes(runId)) {
+        VIEWS['scan-detail'](runId);
+      }
+    }, 2000);
+  }
 };
 
 async function analyze(runId) {

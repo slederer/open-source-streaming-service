@@ -3355,94 +3355,151 @@ async def github_scan_repo(request: Request):
         import tempfile, shutil
         tmp = tempfile.mkdtemp()
         findings = []
+        clone_ok = False
+        files_scanned = 0
+        secrets_seen_in_file = set()  # dedupe: (rel_path, label) per file
         try:
             clone_url = repo_url
             if github_token:
                 clone_url = repo_url.replace("https://", f"https://{github_token}@")
-            run_cmd(["git", "clone", "--depth", "1", clone_url, tmp], timeout=120)
 
-            # Secrets scan via patterns
-            for root, _, files in os.walk(tmp):
-                for fn in files:
-                    if fn.endswith((".log", ".lock")) or ".git/" in root:
-                        continue
-                    path = os.path.join(root, fn)
-                    try:
-                        if os.path.getsize(path) > 2_000_000:
+            # Clone with explicit env to disable interactive prompts
+            clone_env = os.environ.copy()
+            clone_env["GIT_TERMINAL_PROMPT"] = "0"
+            clone_env["GIT_ASKPASS"] = "echo"
+            clone_output = subprocess.run(
+                ["git", "clone", "--depth", "1", clone_url, tmp],
+                capture_output=True, text=True, timeout=180, env=clone_env,
+            )
+            if clone_output.returncode != 0:
+                findings.append({
+                    "target": repo_url, "severity": "INFO", "category": "error",
+                    "title": "Could not clone repository",
+                    "description": f"git clone failed. Check the URL is correct and (for private repos) that the token is valid.",
+                    "evidence": (clone_output.stderr or "")[:500],
+                    "tool": "git",
+                })
+            else:
+                clone_ok = True
+
+                # Secrets scan via patterns — scan ALL patterns per file (no early break)
+                for root, dirs, files in os.walk(tmp):
+                    # Skip .git directory entirely
+                    if ".git" in dirs:
+                        dirs.remove(".git")
+                    for fn in files:
+                        if fn.endswith((".log", ".lock", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".pdf", ".zip", ".gz", ".tar")):
                             continue
-                        with open(path, "r", errors="ignore") as f:
-                            content = f.read()
+                        path = os.path.join(root, fn)
+                        try:
+                            if os.path.getsize(path) > 2_000_000:
+                                continue
+                            with open(path, "r", errors="ignore") as f:
+                                content = f.read()
+                        except Exception:
+                            continue
+                        files_scanned += 1
+                        rel = os.path.relpath(path, tmp)
+                        for pattern, label, sev in SECRET_PATTERNS:
+                            for m in re.finditer(pattern, content):
+                                key = (rel, label)
+                                if key in secrets_seen_in_file:
+                                    break
+                                secrets_seen_in_file.add(key)
+                                findings.append({
+                                    "target": repo_url,
+                                    "severity": sev, "category": "code",
+                                    "title": f"{label} in {rel}",
+                                    "description": "Secret pattern found in committed file. Rotate secret and remove from git history (git-filter-repo or BFG).",
+                                    "evidence": f"{rel}: {m.group(0)[:80]}",
+                                    "tool": "git-secrets",
+                                })
+                                break  # one per (file, label) — but still allows other labels in same file
+
+                # Infrastructure-as-Code: scan Terraform for open SGs
+                tf_count = 0
+                for root, dirs, files in os.walk(tmp):
+                    if ".git" in dirs:
+                        dirs.remove(".git")
+                    for fn in files:
+                        if fn.endswith((".tf", ".tf.json")):
+                            tf_count += 1
+                            try:
+                                with open(os.path.join(root, fn), "r", errors="ignore") as f:
+                                    tf = f.read()
+                            except Exception:
+                                continue
+                            if re.search(r'cidr_blocks\s*=\s*\[["\']0\.0\.0\.0/0["\']\]', tf):
+                                rel = os.path.relpath(os.path.join(root, fn), tmp)
+                                findings.append({
+                                    "target": repo_url, "severity": "MEDIUM", "category": "iac",
+                                    "title": f"Terraform opens security group to world: {rel}",
+                                    "description": "Security group rule allows 0.0.0.0/0. Scope to known IPs.",
+                                    "evidence": rel,
+                                    "tool": "tf-scan",
+                                })
+
+                # npm audit if package-lock.json (and npm is installed)
+                pkg_lock = os.path.join(tmp, "package-lock.json")
+                if os.path.exists(pkg_lock) and shutil.which("npm"):
+                    audit = run_cmd(["npm", "audit", "--json", "--prefix", tmp], timeout=120)
+                    try:
+                        data = json.loads(audit) if audit.startswith("{") else {}
+                        vulns = data.get("vulnerabilities", {})
+                        critical = sum(1 for v in vulns.values() if v.get("severity") == "critical")
+                        high = sum(1 for v in vulns.values() if v.get("severity") == "high")
+                        if critical or high:
+                            findings.append({
+                                "target": repo_url, "severity": "CRITICAL" if critical else "HIGH",
+                                "category": "deps",
+                                "title": f"npm dependencies: {critical} critical + {high} high CVEs",
+                                "description": "Outdated dependencies have known vulnerabilities. Run `npm audit fix`.",
+                                "evidence": f"{critical} critical, {high} high vulnerabilities",
+                                "tool": "npm-audit",
+                            })
                     except Exception:
-                        continue
-                    for pattern, label, sev in SECRET_PATTERNS:
-                        m = re.search(pattern, content)
-                        if m:
-                            rel = os.path.relpath(path, tmp)
+                        pass
+
+                # pip-audit if requirements.txt (and pip-audit is installed)
+                req_txt = os.path.join(tmp, "requirements.txt")
+                if os.path.exists(req_txt) and shutil.which("pip-audit"):
+                    audit = run_cmd(["pip-audit", "-r", req_txt, "-f", "json"], timeout=120)
+                    try:
+                        data = json.loads(audit) if audit.startswith("[") or audit.startswith("{") else {}
+                        deps = data.get("dependencies", []) if isinstance(data, dict) else data
+                        vulns_found = [d for d in deps if d.get("vulns")]
+                        if vulns_found:
                             findings.append({
-                                "target": repo_url,
-                                "severity": sev, "category": "code",
-                                "title": f"{label} in {rel}",
-                                "description": f"Secret pattern found in committed file. Rotate secret and remove from git history.",
-                                "evidence": f"{rel}: {m.group(0)[:80]}",
-                                "tool": "git-secrets",
+                                "target": repo_url, "severity": "HIGH", "category": "deps",
+                                "title": f"Python dependencies: {len(vulns_found)} packages with CVEs",
+                                "description": "Run pip-audit locally and upgrade affected packages.",
+                                "evidence": ", ".join(v["name"] for v in vulns_found[:5]),
+                                "tool": "pip-audit",
                             })
-                            break
+                    except Exception:
+                        pass
 
-            # npm audit if package-lock.json
-            pkg_lock = os.path.join(tmp, "package-lock.json")
-            if os.path.exists(pkg_lock):
-                audit = run_cmd(["npm", "audit", "--json", "--prefix", tmp], timeout=120)
-                try:
-                    data = json.loads(audit) if audit.startswith("{") else {}
-                    vulns = data.get("vulnerabilities", {})
-                    critical = sum(1 for v in vulns.values() if v.get("severity") == "critical")
-                    high = sum(1 for v in vulns.values() if v.get("severity") == "high")
-                    if critical or high:
-                        findings.append({
-                            "target": repo_url, "severity": "HIGH" if high else "CRITICAL",
-                            "category": "deps",
-                            "title": f"npm dependencies: {critical} critical + {high} high CVEs",
-                            "description": "Outdated dependencies have known vulnerabilities. Run `npm audit fix`.",
-                            "evidence": f"{critical} critical, {high} high vulnerabilities",
-                            "tool": "npm-audit",
-                        })
-                except Exception:
-                    pass
-
-            # pip-audit if requirements.txt
-            req_txt = os.path.join(tmp, "requirements.txt")
-            if os.path.exists(req_txt):
-                audit = run_cmd(["pip-audit", "-r", req_txt, "-f", "json"], timeout=120)
-                try:
-                    data = json.loads(audit) if audit.startswith("[") or audit.startswith("{") else {}
-                    deps = data.get("dependencies", []) if isinstance(data, dict) else data
-                    vulns_found = [d for d in deps if d.get("vulns")]
-                    if vulns_found:
-                        findings.append({
-                            "target": repo_url, "severity": "HIGH", "category": "deps",
-                            "title": f"Python dependencies: {len(vulns_found)} packages with CVEs",
-                            "description": "Run pip-audit locally and upgrade affected packages.",
-                            "evidence": ", ".join(v["name"] for v in vulns_found[:5]),
-                            "tool": "pip-audit",
-                        })
-                except Exception:
-                    pass
-
-            # Infrastructure-as-Code: scan Terraform/CDK for open SGs
-            for root, _, files in os.walk(tmp):
-                for fn in files:
-                    if fn.endswith((".tf", ".tf.json")):
-                        with open(os.path.join(root, fn), "r", errors="ignore") as f:
-                            tf = f.read()
-                        if re.search(r'cidr_blocks\s*=\s*\[["\']0\.0\.0\.0/0["\']\]', tf):
-                            rel = os.path.relpath(os.path.join(root, fn), tmp)
-                            findings.append({
-                                "target": repo_url, "severity": "MEDIUM", "category": "iac",
-                                "title": f"Terraform opens security group to world: {rel}",
-                                "description": "Security group rule allows 0.0.0.0/0. Scope to known IPs.",
-                                "evidence": rel,
-                                "tool": "tf-scan",
-                            })
+                # Always emit an INFO summary so users see the scanner ran
+                tools_available = []
+                if shutil.which("npm"):
+                    tools_available.append("npm-audit")
+                if shutil.which("pip-audit"):
+                    tools_available.append("pip-audit")
+                tools_available.extend(["secret-scan", "tf-scan"])
+                findings.append({
+                    "target": repo_url, "severity": "INFO", "category": "code",
+                    "title": f"Code scan complete — {files_scanned} files analyzed",
+                    "description": f"Scanned {files_scanned} files and {tf_count} Terraform files. Tools: {', '.join(tools_available)}. {len(findings)} issues detected.",
+                    "evidence": f"Repo: {repo_url}",
+                    "tool": "git-secrets",
+                })
+        except Exception as e:
+            findings.append({
+                "target": repo_url, "severity": "INFO", "category": "error",
+                "title": "Code scan error",
+                "description": str(e),
+                "evidence": "", "tool": "git",
+            })
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

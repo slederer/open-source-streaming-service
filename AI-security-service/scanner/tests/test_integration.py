@@ -169,6 +169,42 @@ class TestFullScanLifecycle:
         assert summary["total"] >= 0
 
 
+class TestGithubScan:
+    def test_github_scan_includes_summary_finding(self, client, db):
+        """Every GitHub scan must produce at least an INFO 'scan complete' finding
+        so users can distinguish 'clean repo' from 'scan failed'."""
+        import os, tempfile, time
+        from unittest.mock import patch, MagicMock
+
+        # Pre-create fake repo dir with a file containing a real AWS-pattern secret
+        fake_dir = tempfile.mkdtemp()
+        with open(os.path.join(fake_dir, "test.env"), "w") as f:
+            f.write("AWS_KEY=" + "AKI" + "A" + ("Z" * 16))
+
+        with patch("tempfile.mkdtemp", return_value=fake_dir), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="", stdout="")), \
+             patch("shutil.rmtree"):
+            r = client.post("/api/github/scan", json={"repo_url": "https://github.com/test/repo"})
+            assert r.status_code == 200
+            run_id = r.json()["run_id"]
+
+            # Wait for thread completion
+            for _ in range(30):
+                row = db.execute("SELECT status FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+                if row and row["status"] == "completed":
+                    break
+                time.sleep(0.1)
+
+        findings = db.execute("SELECT title, severity FROM findings WHERE run_id=?", (run_id,)).fetchall()
+        titles = [f["title"] for f in findings]
+        assert any("Code scan complete" in t for t in titles), f"No summary finding in {titles}"
+        assert any("AWS" in t for t in titles), f"No AWS finding in {titles}"
+
+        # Cleanup
+        import shutil
+        shutil.rmtree(fake_dir, ignore_errors=True)
+
+
 class TestFindingsFlow:
     def test_scan_populates_target_findings_view(self, client, db):
         """After a scan, /api/findings/by-target reflects the findings."""

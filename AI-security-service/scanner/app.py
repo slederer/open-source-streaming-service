@@ -9,7 +9,7 @@ import sqlite3
 import subprocess
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -91,9 +91,76 @@ def init_db():
                 label TEXT,
                 added_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT,
+                name TEXT,
+                picture TEXT DEFAULT '',
+                email_verified INTEGER NOT NULL DEFAULT 0,
+                verification_token TEXT,
+                verification_expires_at TEXT,
+                auth_provider TEXT NOT NULL DEFAULT 'email',
+                plan TEXT NOT NULL DEFAULT 'free',
+                plan_expires_at TEXT,
+                scan_credits INTEGER NOT NULL DEFAULT 0,
+                stripe_customer_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_login_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                key_hash TEXT UNIQUE NOT NULL,
+                key_prefix TEXT NOT NULL,
+                label TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_used_at TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES scan_runs(id),
+                user_id TEXT NOT NULL REFERENCES users(id),
+                target TEXT,
+                analysis_type TEXT NOT NULL DEFAULT 'fix_plan',
+                content TEXT NOT NULL,
+                model TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
             CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
+            CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+            CREATE INDEX IF NOT EXISTS idx_users_stripe ON users(stripe_customer_id);
+            CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+            CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+            CREATE INDEX IF NOT EXISTS idx_analyses_run ON analyses(run_id);
         """)
+
+        # Add user_id columns to existing tables (idempotent)
+        for table in ("targets", "scan_runs", "findings"):
+            try:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # Migrate legacy data to Stefan's user (idempotent)
+        stefan_email = "stefan.a.lederer@gmail.com"
+        stefan = db.execute("SELECT id FROM users WHERE email=?", (stefan_email,)).fetchone()
+        if not stefan:
+            stefan_id = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO users (id, email, name, email_verified, auth_provider, plan) VALUES (?,?,?,1,'google','pro')",
+                (stefan_id, stefan_email, "Stefan Lederer"),
+            )
+        else:
+            stefan_id = stefan["id"]
+        db.execute("UPDATE targets SET user_id=? WHERE user_id IS NULL", (stefan_id,))
+        db.execute("UPDATE scan_runs SET user_id=? WHERE user_id IS NULL", (stefan_id,))
+        db.execute("UPDATE findings SET user_id=? WHERE user_id IS NULL", (stefan_id,))
+
     # Seed targets from file on first run
     _seed_targets_from_file()
 
@@ -137,11 +204,16 @@ def get_db():
 
 # ── Scanning Logic ────────────────────────────────────────────────────────────
 
-def parse_targets() -> list[dict]:
-    """Read targets from DB, return list of {ip, name}."""
+def parse_targets(user_id: Optional[str] = None) -> list[dict]:
+    """Read targets from DB, return list of {ip, name}. Scoped to user if provided."""
     targets = []
     with get_db() as db:
-        rows = db.execute("SELECT host, label FROM targets ORDER BY id").fetchall()
+        if user_id:
+            rows = db.execute(
+                "SELECT host, label FROM targets WHERE user_id=? ORDER BY id", (user_id,)
+            ).fetchall()
+        else:
+            rows = db.execute("SELECT host, label FROM targets ORDER BY id").fetchall()
         for row in rows:
             targets.append({"ip": row["host"], "name": row["label"] or row["host"]})
     return targets
@@ -408,7 +480,7 @@ def scan_target_ratelimit(run_id: str, ip: str, name: str):
     return findings
 
 
-def _store_findings(run_id: str, findings: list[dict], seen: set):
+def _store_findings(run_id: str, findings: list[dict], seen: set, user_id: Optional[str] = None):
     """Store new findings incrementally, deduplicating against seen set."""
     new_findings = []
     for f in findings:
@@ -421,9 +493,9 @@ def _store_findings(run_id: str, findings: list[dict], seen: set):
         with get_db() as db:
             for f in new_findings:
                 db.execute(
-                    "INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool) VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool, user_id) VALUES (?,?,?,?,?,?,?,?,?)",
                     (run_id, f["target"], f["severity"], f["category"], f["title"],
-                     f.get("description", ""), f.get("evidence", ""), f.get("tool", "")),
+                     f.get("description", ""), f.get("evidence", ""), f.get("tool", ""), user_id),
                 )
 
 
@@ -443,7 +515,7 @@ def _update_summary(run_id: str, status: str = "running"):
         )
 
 
-def run_full_scan(run_id: str, targets: list[dict]):
+def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = None):
     """Execute all scan modules against all targets, storing results incrementally."""
     seen = set()
     scan_modules = [
@@ -463,7 +535,7 @@ def run_full_scan(run_id: str, targets: list[dict]):
                     findings, _ = mod_func(run_id, ip, name)
                 else:
                     findings = mod_func(run_id, ip, name)
-                _store_findings(run_id, findings, seen)
+                _store_findings(run_id, findings, seen, user_id=user_id)
                 _update_summary(run_id, status="running")
             except Exception as e:
                 _store_findings(run_id, [{
@@ -471,9 +543,13 @@ def run_full_scan(run_id: str, targets: list[dict]):
                     "title": f"Scanner error: {mod_name}",
                     "description": str(e),
                     "evidence": "", "tool": mod_name,
-                }], seen)
+                }], seen, user_id=user_id)
 
     _update_summary(run_id, status="completed")
+
+    # PAYG: consume 1 credit per completed scan
+    if user_id:
+        consume_scan_credit(user_id)
 
 
 # ── Remediation Helpers ──────────────────────────────────────────────────────
@@ -580,6 +656,164 @@ def _generate_fix_markdown(run_id: str, target_filter: str = None) -> str:
     return "\n".join(md_parts)
 
 
+# ── User Management Helpers ──────────────────────────────────────────────────
+
+try:
+    from passlib.context import CryptContext
+    _pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+except ImportError:
+    _pwd_context = None
+
+
+def hash_password(password: str) -> str:
+    if _pwd_context is None:
+        raise RuntimeError("passlib not installed — run: pip install passlib[bcrypt]")
+    return _pwd_context.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    if _pwd_context is None or not hashed:
+        return False
+    return _pwd_context.verify(plain, hashed)
+
+
+def _hash_api_key(key: str) -> str:
+    import hashlib
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def generate_api_key() -> tuple[str, str, str]:
+    """Return (full_key, prefix, hash). Store prefix+hash; show full key to user once."""
+    raw = secrets.token_hex(32)
+    full_key = f"sk-sec-{raw}"
+    prefix = full_key[:14]  # "sk-sec-" + 7 chars
+    return full_key, prefix, _hash_api_key(full_key)
+
+
+def get_user_by_id(user_id: str) -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_user_by_email(email: str) -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM users WHERE email=?", (email.lower(),)).fetchone()
+        return dict(row) if row else None
+
+
+def require_auth_any(request: Request) -> Optional[dict]:
+    """Return user dict from either session or Bearer API key, or None."""
+    # 1. Try Bearer API key
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        key = auth[7:].strip()
+        if key.startswith("sk-sec-"):
+            with get_db() as db:
+                row = db.execute(
+                    "SELECT user_id FROM api_keys WHERE key_hash=? AND is_active=1",
+                    (_hash_api_key(key),),
+                ).fetchone()
+                if row:
+                    db.execute(
+                        "UPDATE api_keys SET last_used_at=? WHERE key_hash=?",
+                        (datetime.now(timezone.utc).isoformat(), _hash_api_key(key)),
+                    )
+                    user = get_user_by_id(row["user_id"])
+                    if user:
+                        return {"user_id": user["id"], "email": user["email"], "name": user.get("name"), "plan": user.get("plan", "free")}
+
+    # 2. Fall back to session
+    sess_user = request.session.get("user")
+    if sess_user and sess_user.get("user_id"):
+        return sess_user
+
+    # 3. Legacy session without user_id — look up by email (one-time migration)
+    if sess_user and sess_user.get("email"):
+        user = get_user_by_email(sess_user["email"])
+        if user:
+            sess_user["user_id"] = user["id"]
+            sess_user["plan"] = user.get("plan", "free")
+            request.session["user"] = sess_user
+            return sess_user
+
+    return None
+
+
+# Keep backward-compatible get_user
+_original_get_user = get_user
+def get_user(request: Request) -> Optional[dict]:  # type: ignore
+    return require_auth_any(request)
+
+
+# ── Plan + Billing Helpers ───────────────────────────────────────────────────
+
+# $ prices (cents)
+PLAN_PRICES = {
+    "payg": 900,        # $9 per scan
+    "monthly": 2900,    # $29/mo
+    "pro": 9900,        # $99/mo
+}
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_PAYG = os.getenv("STRIPE_PRICE_PAYG", "")
+STRIPE_PRICE_MONTHLY = os.getenv("STRIPE_PRICE_MONTHLY", "")
+STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "")
+
+PLAN_LIMITS = {
+    "free": {"max_targets": 1, "scans_per_month": 1, "scans_per_day": 1, "ai_analysis": False},
+    "payg": {"max_targets": 5, "scans_per_month": None, "scans_per_day": 10, "ai_analysis": True},  # uses credits
+    "monthly": {"max_targets": 1, "scans_per_week": 5, "scans_per_day": 3, "ai_analysis": True},
+    "pro": {"max_targets": 10, "scans_per_day": 50, "scans_per_month": None, "ai_analysis": True},
+}
+
+
+def can_user_scan(user_id: str) -> tuple[bool, str]:
+    """Return (allowed, reason_if_denied)."""
+    user = get_user_by_id(user_id)
+    if not user:
+        return False, "User not found"
+    plan = user.get("plan", "free")
+    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+
+    with get_db() as db:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Daily limit
+        if "scans_per_day" in limits and limits["scans_per_day"] is not None:
+            today_count = db.execute(
+                "SELECT COUNT(*) FROM scan_runs WHERE user_id=? AND substr(started_at,1,10)=?",
+                (user_id, today),
+            ).fetchone()[0]
+            if today_count >= limits["scans_per_day"]:
+                return False, f"Daily scan limit ({limits['scans_per_day']}) reached for {plan} plan"
+
+        # Monthly limit (free plan: 1 lifetime)
+        if plan == "free":
+            total = db.execute("SELECT COUNT(*) FROM scan_runs WHERE user_id=?", (user_id,)).fetchone()[0]
+            if total >= 1:
+                return False, "Free tier used — upgrade to PAYG ($9/scan) or Monthly ($29/mo)"
+
+        # PAYG: needs credits
+        if plan == "payg" and user.get("scan_credits", 0) <= 0:
+            return False, "No scan credits remaining. Purchase more via /billing"
+
+        # Target limit
+        target_count = db.execute("SELECT COUNT(*) FROM targets WHERE user_id=?", (user_id,)).fetchone()[0]
+        if target_count > limits["max_targets"]:
+            return False, f"Target limit exceeded ({limits['max_targets']} for {plan} plan)"
+
+    return True, ""
+
+
+def consume_scan_credit(user_id: str):
+    """Deduct 1 scan credit for PAYG users."""
+    with get_db() as db:
+        user = db.execute("SELECT plan, scan_credits FROM users WHERE id=?", (user_id,)).fetchone()
+        if user and user["plan"] == "payg":
+            db.execute("UPDATE users SET scan_credits = scan_credits - 1 WHERE id=?", (user_id,))
+
+
 # ── Auth Routes ────────────────────────────────────────────────────────────────
 
 @app.get("/login", response_class=HTMLResponse)
@@ -630,14 +864,34 @@ async def auth_callback(request: Request):
     if not user_info:
         return RedirectResponse("/login?error=Could+not+get+user+info")
 
-    email = user_info.get("email", "")
-    if email not in ALLOWED_EMAILS:
-        return RedirectResponse(f"/login?error=Access+denied+for+{email}")
+    email = user_info.get("email", "").lower()
+    name = user_info.get("name", email)
+    picture = user_info.get("picture", "")
 
+    # Auto-create or fetch user
+    user = get_user_by_email(email)
+    if not user:
+        user_id = str(uuid.uuid4())
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO users (id, email, name, picture, email_verified, auth_provider, plan, last_login_at) VALUES (?,?,?,?,1,'google','free',?)",
+                (user_id, email, name, picture, datetime.now(timezone.utc).isoformat()),
+            )
+    else:
+        user_id = user["id"]
+        with get_db() as db:
+            db.execute(
+                "UPDATE users SET name=?, picture=?, last_login_at=? WHERE id=?",
+                (name, picture, datetime.now(timezone.utc).isoformat(), user_id),
+            )
+
+    user_row = get_user_by_id(user_id)
     request.session["user"] = {
+        "user_id": user_id,
         "email": email,
-        "name": user_info.get("name", email),
-        "picture": user_info.get("picture", ""),
+        "name": name,
+        "picture": picture,
+        "plan": user_row.get("plan", "free"),
     }
     return RedirectResponse("/")
 
@@ -646,6 +900,321 @@ async def auth_callback(request: Request):
 async def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/login")
+
+
+# ── Email/Password Auth ───────────────────────────────────────────────────────
+
+def send_verification_email(email: str, token: str):
+    """Send verification email via Resend."""
+    try:
+        import resend as resend_mod
+        resend_mod.api_key = os.getenv("RESEND_API_KEY", "")
+        verify_url = f"https://security.slederer.com/verify?token={token}"
+        resend_mod.Emails.send({
+            "from": os.getenv("RESEND_FROM", "onboarding@resend.dev"),
+            "to": [email],
+            "subject": "Verify your email — Security Scanner",
+            "html": f'''
+            <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:40px 20px;">
+                <h2 style="color:#111827;">Verify your email</h2>
+                <p style="color:#6b7280;">Click the button below to verify your email and activate your account.</p>
+                <a href="{verify_url}" style="display:inline-block;background:#dc2626;color:white;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0;">Verify Email</a>
+                <p style="color:#9ca3af;font-size:0.8rem;">Or paste this link: <code>{verify_url}</code></p>
+                <p style="color:#9ca3af;font-size:0.8rem;">This link expires in 24 hours. If you didn't sign up, ignore this email.</p>
+            </div>
+            '''
+        })
+    except Exception as e:
+        print(f"[email] Failed to send verification to {email}: {e}", flush=True)
+
+
+@app.post("/api/auth/signup")
+async def signup(request: Request):
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    name = (body.get("name") or "").strip() or email.split("@")[0]
+
+    if not email or "@" not in email:
+        return JSONResponse({"error": "Valid email required"}, status_code=400)
+    if len(password) < 8:
+        return JSONResponse({"error": "Password must be at least 8 characters"}, status_code=400)
+    if get_user_by_email(email):
+        return JSONResponse({"error": "Email already registered. Try logging in."}, status_code=409)
+
+    user_id = str(uuid.uuid4())
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO users (id, email, password_hash, name, verification_token, verification_expires_at, auth_provider, plan) VALUES (?,?,?,?,?,?,'email','free')",
+            (user_id, email, hash_password(password), name, token, expires),
+        )
+
+    send_verification_email(email, token)
+    return {"ok": True, "message": "Account created. Check your email to verify."}
+
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+
+    user = get_user_by_email(email)
+    if not user or not user.get("password_hash") or not verify_password(password, user["password_hash"]):
+        return JSONResponse({"error": "Invalid email or password"}, status_code=401)
+    if not user.get("email_verified"):
+        return JSONResponse({"error": "Please verify your email first. Check your inbox."}, status_code=403)
+
+    with get_db() as db:
+        db.execute("UPDATE users SET last_login_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), user["id"]))
+
+    request.session["user"] = {
+        "user_id": user["id"],
+        "email": user["email"],
+        "name": user.get("name") or user["email"],
+        "picture": user.get("picture", ""),
+        "plan": user.get("plan", "free"),
+    }
+    return {"ok": True}
+
+
+@app.get("/verify", response_class=HTMLResponse)
+async def verify_email(request: Request, token: str = ""):
+    if not token:
+        return HTMLResponse("<h1>Missing verification token</h1>", status_code=400)
+    with get_db() as db:
+        row = db.execute(
+            "SELECT id, verification_expires_at FROM users WHERE verification_token=?", (token,)
+        ).fetchone()
+        if not row:
+            return HTMLResponse('<h1>Invalid or expired token</h1><a href="/login">Back to login</a>', status_code=400)
+        if row["verification_expires_at"] and row["verification_expires_at"] < datetime.now(timezone.utc).isoformat():
+            return HTMLResponse('<h1>Token expired</h1><a href="/login">Back to login</a>', status_code=400)
+        db.execute(
+            "UPDATE users SET email_verified=1, verification_token=NULL, verification_expires_at=NULL WHERE id=?",
+            (row["id"],),
+        )
+    return HTMLResponse(
+        '<div style="font-family:sans-serif;max-width:480px;margin:80px auto;padding:32px;text-align:center;background:#111827;color:#e5e7eb;border-radius:12px;">'
+        '<h1 style="color:#22c55e;">&#10003; Email verified</h1>'
+        '<p>Your account is active. You can now log in.</p>'
+        '<a href="/login" style="display:inline-block;background:#dc2626;color:white;padding:10px 20px;border-radius:8px;text-decoration:none;margin-top:16px;">Log in</a>'
+        '</div>'
+    )
+
+
+# ── API Keys Management ──────────────────────────────────────────────────────
+
+@app.post("/api/keys")
+async def create_api_key(request: Request):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    label = (body.get("label") or "default").strip()[:64]
+
+    full_key, prefix, key_hash = generate_api_key()
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO api_keys (user_id, key_hash, key_prefix, label) VALUES (?,?,?,?)",
+            (user["user_id"], key_hash, prefix, label),
+        )
+    return {"key": full_key, "prefix": prefix, "label": label, "message": "Save this key — it won't be shown again."}
+
+
+@app.get("/api/keys")
+async def list_api_keys(request: Request):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, key_prefix, label, created_at, last_used_at, is_active FROM api_keys WHERE user_id=? ORDER BY created_at DESC",
+            (user["user_id"],),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.delete("/api/keys/{key_id}")
+async def revoke_api_key(request: Request, key_id: int):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    with get_db() as db:
+        db.execute("UPDATE api_keys SET is_active=0 WHERE id=? AND user_id=?", (key_id, user["user_id"]))
+    return {"ok": True}
+
+
+# ── Stripe Billing ───────────────────────────────────────────────────────────
+
+def _get_stripe():
+    try:
+        import stripe as stripe_mod
+        if not STRIPE_SECRET_KEY:
+            return None
+        stripe_mod.api_key = STRIPE_SECRET_KEY
+        return stripe_mod
+    except ImportError:
+        return None
+
+
+@app.post("/api/billing/checkout")
+async def create_checkout(request: Request):
+    """Create a Stripe Checkout session for PAYG or subscription."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    stripe = _get_stripe()
+    if not stripe:
+        return JSONResponse({"error": "Billing not configured. Contact support."}, status_code=503)
+
+    body = await request.json()
+    plan = body.get("plan", "payg")
+
+    price_id_map = {
+        "payg": STRIPE_PRICE_PAYG,
+        "monthly": STRIPE_PRICE_MONTHLY,
+        "pro": STRIPE_PRICE_PRO,
+    }
+    price_id = price_id_map.get(plan)
+    if not price_id:
+        return JSONResponse({"error": f"Invalid plan: {plan}"}, status_code=400)
+
+    full_user = get_user_by_id(user["user_id"])
+
+    # Get or create Stripe customer
+    customer_id = (full_user or {}).get("stripe_customer_id")
+    if not customer_id:
+        customer = stripe.Customer.create(
+            email=full_user["email"],
+            name=full_user.get("name") or full_user["email"],
+            metadata={"user_id": user["user_id"]},
+        )
+        customer_id = customer.id
+        with get_db() as db:
+            db.execute("UPDATE users SET stripe_customer_id=? WHERE id=?", (customer_id, user["user_id"]))
+
+    mode = "payment" if plan == "payg" else "subscription"
+    session = stripe.checkout.Session.create(
+        customer=customer_id,
+        mode=mode,
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url="https://security.slederer.com/billing?success=1",
+        cancel_url="https://security.slederer.com/billing?cancel=1",
+        metadata={"user_id": user["user_id"], "plan": plan},
+    )
+    return {"url": session.url, "session_id": session.id}
+
+
+@app.post("/api/billing/portal")
+async def billing_portal(request: Request):
+    """Open Stripe Customer Portal for subscription management."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    stripe = _get_stripe()
+    if not stripe:
+        return JSONResponse({"error": "Billing not configured."}, status_code=503)
+
+    full_user = get_user_by_id(user["user_id"])
+    customer_id = (full_user or {}).get("stripe_customer_id")
+    if not customer_id:
+        return JSONResponse({"error": "No subscription found"}, status_code=404)
+
+    portal = stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url="https://security.slederer.com/billing",
+    )
+    return {"url": portal.url}
+
+
+@app.post("/api/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """Handle Stripe webhook events."""
+    stripe = _get_stripe()
+    if not stripe:
+        return JSONResponse({"error": "Billing not configured."}, status_code=503)
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    try:
+        if STRIPE_WEBHOOK_SECRET:
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        else:
+            # Dev mode: trust payload directly
+            event = json.loads(payload)
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid webhook: {e}"}, status_code=400)
+
+    event_type = event["type"] if isinstance(event, dict) else event.type
+    data = (event["data"]["object"] if isinstance(event, dict) else event.data.object)
+
+    if event_type == "checkout.session.completed":
+        user_id = (data.get("metadata") or {}).get("user_id")
+        plan = (data.get("metadata") or {}).get("plan", "payg")
+        if user_id:
+            with get_db() as db:
+                if plan == "payg":
+                    db.execute("UPDATE users SET scan_credits = scan_credits + 1, plan='payg' WHERE id=?", (user_id,))
+                else:
+                    # Subscription — set plan + expires_at ~ 31 days out (webhook will update)
+                    expires = (datetime.now(timezone.utc) + timedelta(days=31)).isoformat()
+                    db.execute("UPDATE users SET plan=?, plan_expires_at=? WHERE id=?", (plan, expires, user_id))
+
+    elif event_type == "invoice.paid":
+        # Renewal — extend plan
+        customer_id = data.get("customer")
+        if customer_id:
+            expires = (datetime.now(timezone.utc) + timedelta(days=31)).isoformat()
+            with get_db() as db:
+                db.execute("UPDATE users SET plan_expires_at=? WHERE stripe_customer_id=?", (expires, customer_id))
+
+    elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
+        customer_id = data.get("customer")
+        status = data.get("status")
+        if customer_id:
+            with get_db() as db:
+                if event_type == "customer.subscription.deleted" or status == "canceled":
+                    db.execute("UPDATE users SET plan='free', plan_expires_at=NULL WHERE stripe_customer_id=?", (customer_id,))
+
+    return {"received": True}
+
+
+@app.get("/api/billing/status")
+async def billing_status(request: Request):
+    """Return user's billing info for the dashboard."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    full = get_user_by_id(user["user_id"]) or {}
+    return {
+        "plan": full.get("plan", "free"),
+        "plan_expires_at": full.get("plan_expires_at"),
+        "scan_credits": full.get("scan_credits", 0),
+        "stripe_customer_id": full.get("stripe_customer_id"),
+        "prices": {"payg": 9.00, "monthly": 29.00, "pro": 99.00},
+    }
+
+
+# ── User Profile ─────────────────────────────────────────────────────────────
+
+@app.get("/api/me")
+async def me(request: Request):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    full = get_user_by_id(user["user_id"])
+    if not full:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    # Don't leak password hash
+    full.pop("password_hash", None)
+    full.pop("verification_token", None)
+    return full
 
 
 # ── API Routes ────────────────────────────────────────────────────────────────
@@ -663,7 +1232,9 @@ async def list_targets(request: Request):
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     with get_db() as db:
-        rows = db.execute("SELECT * FROM targets ORDER BY id").fetchall()
+        rows = db.execute(
+            "SELECT * FROM targets WHERE user_id=? ORDER BY id", (user["user_id"],)
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -679,13 +1250,30 @@ async def add_target(request: Request):
         return JSONResponse({"error": "host is required"}, status_code=400)
     # Strip protocol if URL provided
     host = re.sub(r"^https?://", "", host).rstrip("/")
+
+    # Enforce target limit per plan
+    full_user = get_user_by_id(user["user_id"])
+    plan = (full_user or {}).get("plan", "free")
+    max_targets = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["max_targets"]
+    with get_db() as db:
+        cnt = db.execute("SELECT COUNT(*) FROM targets WHERE user_id=?", (user["user_id"],)).fetchone()[0]
+        if cnt >= max_targets:
+            return JSONResponse({"error": f"Target limit reached ({max_targets} for {plan} plan). Upgrade to add more."}, status_code=402)
     try:
         with get_db() as db:
+            # Per-user unique: check if user already has this host
+            existing = db.execute(
+                "SELECT * FROM targets WHERE host=? AND user_id=?", (host, user["user_id"])
+            ).fetchone()
+            if existing:
+                return JSONResponse({"error": "Target already exists"}, status_code=409)
             db.execute(
-                "INSERT INTO targets (host, label, added_at) VALUES (?, ?, ?)",
-                (host, label, datetime.now(timezone.utc).isoformat()),
+                "INSERT INTO targets (host, label, added_at, user_id) VALUES (?, ?, ?, ?)",
+                (host, label, datetime.now(timezone.utc).isoformat(), user["user_id"]),
             )
-            row = db.execute("SELECT * FROM targets WHERE host=?", (host,)).fetchone()
+            row = db.execute(
+                "SELECT * FROM targets WHERE host=? AND user_id=?", (host, user["user_id"])
+            ).fetchone()
             return dict(row)
     except sqlite3.IntegrityError:
         return JSONResponse({"error": "Target already exists"}, status_code=409)
@@ -697,7 +1285,7 @@ async def delete_target(request: Request, target_id: int):
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     with get_db() as db:
-        db.execute("DELETE FROM targets WHERE id=?", (target_id,))
+        db.execute("DELETE FROM targets WHERE id=? AND user_id=?", (target_id, user["user_id"]))
     return {"ok": True}
 
 
@@ -705,24 +1293,29 @@ async def delete_target(request: Request, target_id: int):
 
 @app.post("/api/scan")
 async def start_scan(request: Request, background_tasks: BackgroundTasks, scan_type: str = "full"):
-    """Trigger a new scan run."""
+    """Trigger a new scan run (scans all user's targets)."""
     user = get_user(request)
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    targets = parse_targets()
+
+    allowed, reason = can_user_scan(user["user_id"])
+    if not allowed:
+        return JSONResponse({"error": reason, "upgrade_url": "/billing"}, status_code=402)
+
+    targets = parse_targets(user_id=user["user_id"])
     if not targets:
-        return JSONResponse({"error": "No targets configured"}, status_code=400)
+        return JSONResponse({"error": "No targets configured. Add a target first."}, status_code=400)
 
     run_id = str(uuid.uuid4())[:8]
     now = datetime.now(timezone.utc).isoformat()
 
     with get_db() as db:
         db.execute(
-            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type) VALUES (?,?,?,?,?)",
-            (run_id, now, "running", json.dumps([t["ip"] for t in targets]), scan_type),
+            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
+            (run_id, now, "running", json.dumps([t["ip"] for t in targets]), scan_type, user["user_id"]),
         )
 
-    background_tasks.add_task(run_full_scan, run_id, targets)
+    background_tasks.add_task(run_full_scan, run_id, targets, user["user_id"])
     return {"run_id": run_id, "status": "started", "targets": len(targets)}
 
 
@@ -732,7 +1325,10 @@ async def list_runs(request: Request):
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     with get_db() as db:
-        rows = db.execute("SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 50").fetchall()
+        rows = db.execute(
+            "SELECT * FROM scan_runs WHERE user_id=? ORDER BY started_at DESC LIMIT 50",
+            (user["user_id"],),
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -791,15 +1387,23 @@ def _compute_target_diffs(run_id: str) -> dict:
     return diffs
 
 
+def _verify_run_ownership(run_id: str, user_id: str):
+    """Return run row if it belongs to user, else None."""
+    with get_db() as db:
+        return db.execute(
+            "SELECT * FROM scan_runs WHERE id=? AND user_id=?", (run_id, user_id)
+        ).fetchone()
+
+
 @app.get("/api/runs/{run_id}")
 async def get_run(request: Request, run_id: str):
     user = get_user(request)
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    run = _verify_run_ownership(run_id, user["user_id"])
+    if not run:
+        return JSONResponse({"error": "Not found"}, status_code=404)
     with get_db() as db:
-        run = db.execute("SELECT * FROM scan_runs WHERE id=?", (run_id,)).fetchone()
-        if not run:
-            return JSONResponse({"error": "Not found"}, status_code=404)
         findings = db.execute(
             "SELECT * FROM findings WHERE run_id=? ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END, target",
             (run_id,),
@@ -814,10 +1418,9 @@ async def get_target_diffs(request: Request, run_id: str):
     user = get_user(request)
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    with get_db() as db:
-        run = db.execute("SELECT id FROM scan_runs WHERE id=?", (run_id,)).fetchone()
-        if not run:
-            return JSONResponse({"error": "Not found"}, status_code=404)
+    run = _verify_run_ownership(run_id, user["user_id"])
+    if not run:
+        return JSONResponse({"error": "Not found"}, status_code=404)
     return _compute_target_diffs(run_id)
 
 
@@ -827,6 +1430,8 @@ async def compare_runs(request: Request, run_id: str, other_id: str):
     user = get_user(request)
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    if not _verify_run_ownership(run_id, user["user_id"]) or not _verify_run_ownership(other_id, user["user_id"]):
+        return JSONResponse({"error": "Not found"}, status_code=404)
     with get_db() as db:
         current = db.execute("SELECT target, severity, title FROM findings WHERE run_id=?", (run_id,)).fetchall()
         previous = db.execute("SELECT target, severity, title FROM findings WHERE run_id=?", (other_id,)).fetchall()
@@ -854,6 +1459,8 @@ async def get_fix_for_target(request: Request, run_id: str, target: str):
     user = get_user(request)
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    if not _verify_run_ownership(run_id, user["user_id"]):
+        return JSONResponse({"error": "Not found"}, status_code=404)
     md = _generate_fix_markdown(run_id, target_filter=target)
     if not md:
         return JSONResponse({"error": "No findings"}, status_code=404)
@@ -867,12 +1474,230 @@ async def get_fix_all(request: Request, run_id: str):
     user = get_user(request)
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    if not _verify_run_ownership(run_id, user["user_id"]):
+        return JSONResponse({"error": "Not found"}, status_code=404)
     md = _generate_fix_markdown(run_id)
     if not md:
         return JSONResponse({"error": "No findings"}, status_code=404)
     return PlainTextResponse(md, media_type="text/markdown", headers={
         "Content-Disposition": f'attachment; filename="SECURITY-FIX-{run_id}.md"'
     })
+
+
+# ── Public /v1/ API (API-key authenticated) ─────────────────────────────────
+
+@app.get("/v1/openapi.json")
+async def v1_openapi():
+    """Public OpenAPI spec for /v1/ endpoints — used by ChatGPT Actions."""
+    return {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Security Scanner API",
+            "description": "Scan deployed web apps for security vulnerabilities. Get AI-powered fix instructions.",
+            "version": "1.0.0",
+            "contact": {"name": "Security Scanner", "url": "https://security.slederer.com"},
+        },
+        "servers": [{"url": "https://security.slederer.com"}],
+        "paths": {
+            "/v1/scan": {
+                "post": {
+                    "operationId": "scanTarget",
+                    "summary": "Start a security scan on a URL or IP",
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "properties": {
+                                "host": {"type": "string", "description": "URL, hostname, or IP to scan"},
+                                "label": {"type": "string", "description": "Optional label for this target"},
+                            },
+                            "required": ["host"],
+                        }}},
+                    },
+                    "responses": {"200": {"description": "Scan started", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+            "/v1/scan/{run_id}": {
+                "get": {
+                    "operationId": "getScanStatus",
+                    "summary": "Get scan status and findings",
+                    "parameters": [{"name": "run_id", "in": "path", "required": True, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "Scan status", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                }
+            },
+            "/v1/scan/{run_id}/fix": {
+                "get": {
+                    "operationId": "getFixFile",
+                    "summary": "Get AI-powered fix instructions (Markdown)",
+                    "parameters": [
+                        {"name": "run_id", "in": "path", "required": True, "schema": {"type": "string"}},
+                        {"name": "target", "in": "query", "required": False, "schema": {"type": "string"}},
+                    ],
+                    "responses": {"200": {"description": "Fix markdown", "content": {"text/markdown": {"schema": {"type": "string"}}}}},
+                }
+            },
+            "/v1/targets": {
+                "get": {"operationId": "listTargets", "summary": "List configured targets", "responses": {"200": {"description": "Target list"}}},
+                "post": {
+                    "operationId": "addTarget",
+                    "summary": "Add a new target",
+                    "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object", "properties": {"host": {"type": "string"}, "label": {"type": "string"}}, "required": ["host"]}}}},
+                    "responses": {"200": {"description": "Target created"}},
+                },
+            },
+            "/v1/runs": {
+                "get": {"operationId": "listRuns", "summary": "List scan history", "responses": {"200": {"description": "Run list"}}}
+            },
+        },
+        "components": {
+            "securitySchemes": {
+                "ApiKeyAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "API Key", "description": "API key in format sk-sec-..."}
+            }
+        },
+        "security": [{"ApiKeyAuth": []}],
+    }
+
+
+@app.post("/v1/scan")
+async def v1_scan(request: Request, background_tasks: BackgroundTasks):
+    """Scan a single target. Auto-creates the target if needed."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    allowed, reason = can_user_scan(user["user_id"])
+    if not allowed:
+        return JSONResponse({"error": reason, "upgrade_url": "https://security.slederer.com/billing"}, status_code=402)
+
+    body = await request.json()
+    host = (body.get("host") or "").strip()
+    label = (body.get("label") or "").strip()
+    if not host:
+        return JSONResponse({"error": "host is required"}, status_code=400)
+    host = re.sub(r"^https?://", "", host).rstrip("/")
+    label = label or host
+
+    # Auto-create target if not exists
+    with get_db() as db:
+        existing = db.execute(
+            "SELECT * FROM targets WHERE host=? AND user_id=?", (host, user["user_id"])
+        ).fetchone()
+        if not existing:
+            full_user = get_user_by_id(user["user_id"])
+            plan = (full_user or {}).get("plan", "free")
+            max_targets = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["max_targets"]
+            cnt = db.execute("SELECT COUNT(*) FROM targets WHERE user_id=?", (user["user_id"],)).fetchone()[0]
+            if cnt >= max_targets:
+                return JSONResponse({"error": f"Target limit reached ({max_targets} for {plan} plan)"}, status_code=402)
+            db.execute(
+                "INSERT INTO targets (host, label, added_at, user_id) VALUES (?,?,?,?)",
+                (host, label, datetime.now(timezone.utc).isoformat(), user["user_id"]),
+            )
+
+    run_id = str(uuid.uuid4())[:8]
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
+            (run_id, now, "running", json.dumps([host]), "single", user["user_id"]),
+        )
+
+    single_target = [{"ip": host, "name": label}]
+    background_tasks.add_task(run_full_scan, run_id, single_target, user["user_id"])
+    return {"run_id": run_id, "status": "started", "target": host, "check_status_url": f"https://security.slederer.com/v1/scan/{run_id}"}
+
+
+@app.get("/v1/scan/{run_id}")
+async def v1_get_scan(request: Request, run_id: str):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    run = _verify_run_ownership(run_id, user["user_id"])
+    if not run:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    with get_db() as db:
+        findings = db.execute(
+            "SELECT target, severity, category, title, description, evidence, tool FROM findings WHERE run_id=? ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END",
+            (run_id,),
+        ).fetchall()
+    return {
+        "run_id": run["id"],
+        "status": run["status"],
+        "started_at": run["started_at"],
+        "finished_at": run["finished_at"],
+        "summary": json.loads(run["summary_json"]) if run["summary_json"] else None,
+        "findings": [dict(f) for f in findings],
+        "fix_url": f"https://security.slederer.com/v1/scan/{run_id}/fix",
+    }
+
+
+@app.get("/v1/scan/{run_id}/fix")
+async def v1_get_fix(request: Request, run_id: str, target: str = ""):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    if not _verify_run_ownership(run_id, user["user_id"]):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    md = _generate_fix_markdown(run_id, target_filter=target if target else None)
+    if not md:
+        return JSONResponse({"error": "No findings"}, status_code=404)
+    return PlainTextResponse(md, media_type="text/markdown")
+
+
+@app.get("/v1/targets")
+async def v1_list_targets(request: Request):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, host, label, added_at FROM targets WHERE user_id=? ORDER BY id",
+            (user["user_id"],),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/v1/targets")
+async def v1_add_target(request: Request):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    host = (body.get("host") or "").strip()
+    label = (body.get("label") or "").strip() or host
+    if not host:
+        return JSONResponse({"error": "host is required"}, status_code=400)
+    host = re.sub(r"^https?://", "", host).rstrip("/")
+
+    full_user = get_user_by_id(user["user_id"])
+    plan = (full_user or {}).get("plan", "free")
+    max_targets = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["max_targets"]
+    with get_db() as db:
+        cnt = db.execute("SELECT COUNT(*) FROM targets WHERE user_id=?", (user["user_id"],)).fetchone()[0]
+        if cnt >= max_targets:
+            return JSONResponse({"error": f"Target limit reached ({max_targets} for {plan} plan)"}, status_code=402)
+        existing = db.execute("SELECT * FROM targets WHERE host=? AND user_id=?", (host, user["user_id"])).fetchone()
+        if existing:
+            return JSONResponse({"error": "Target already exists"}, status_code=409)
+        db.execute(
+            "INSERT INTO targets (host, label, added_at, user_id) VALUES (?,?,?,?)",
+            (host, label, datetime.now(timezone.utc).isoformat(), user["user_id"]),
+        )
+        row = db.execute("SELECT * FROM targets WHERE host=? AND user_id=?", (host, user["user_id"])).fetchone()
+    return dict(row)
+
+
+@app.get("/v1/runs")
+async def v1_list_runs(request: Request):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, started_at, finished_at, status, summary_json FROM scan_runs WHERE user_id=? ORDER BY started_at DESC LIMIT 50",
+            (user["user_id"],),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── HTML Dashboard ────────────────────────────────────────────────────────────

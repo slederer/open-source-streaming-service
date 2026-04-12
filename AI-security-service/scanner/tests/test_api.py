@@ -94,9 +94,9 @@ class TestScanRuns:
 class TestFixGeneration:
     def test_fix_all_returns_markdown(self, client, db):
         # Insert a run with findings
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('fix1', '2026-04-12', 'completed', '[]', '{}')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool) VALUES ('fix1', '10.0.0.1', 'HIGH', 'web', 'Unauthenticated access on http://10.0.0.1:8080', 'No auth', 'GET / -> 200', 'curl')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool) VALUES ('fix1', '10.0.0.1', 'MEDIUM', 'web', 'Missing X-Content-Type-Options on port 8080', 'Header absent', 'GET / - absent', 'curl')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('fix1', '2026-04-12', 'completed', '[]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool, user_id) VALUES ('fix1', '10.0.0.1', 'HIGH', 'web', 'Unauthenticated access on http://10.0.0.1:8080', 'No auth', 'GET / -> 200', 'curl', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool, user_id) VALUES ('fix1', '10.0.0.1', 'MEDIUM', 'web', 'Missing X-Content-Type-Options on port 8080', 'Header absent', 'GET / - absent', 'curl', 'test-user-id-12345')")
         db.commit()
 
         r = client.get("/api/runs/fix1/fix-all")
@@ -107,9 +107,9 @@ class TestFixGeneration:
         assert "X-Content-Type-Options" in r.text
 
     def test_fix_per_target(self, client, db):
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('fix2', '2026-04-12', 'completed', '[]', '{}')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool) VALUES ('fix2', '10.0.0.1', 'HIGH', 'web', 'Test finding', '', '', 'test')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool) VALUES ('fix2', '10.0.0.2', 'LOW', 'web', 'Other finding', '', '', 'test')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('fix2', '2026-04-12', 'completed', '[]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool, user_id) VALUES ('fix2', '10.0.0.1', 'HIGH', 'web', 'Test finding', '', '', 'test', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool, user_id) VALUES ('fix2', '10.0.0.2', 'LOW', 'web', 'Other finding', '', '', 'test', 'test-user-id-12345')")
         db.commit()
 
         r = client.get("/api/runs/fix2/fix/10.0.0.1")
@@ -125,12 +125,12 @@ class TestFixGeneration:
 class TestCompareRuns:
     def test_compare_runs(self, client, db):
         # Two runs with overlapping findings
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('cmp1', '2026-04-11', 'completed', '[]', '{}')")
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('cmp2', '2026-04-12', 'completed', '[]', '{}')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('cmp1', '10.0.0.1', 'HIGH', 'web', 'Old finding', 't')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('cmp1', '10.0.0.1', 'HIGH', 'web', 'Persistent', 't')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('cmp2', '10.0.0.1', 'HIGH', 'web', 'Persistent', 't')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('cmp2', '10.0.0.1', 'MEDIUM', 'web', 'New finding', 't')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('cmp1', '2026-04-11', 'completed', '[]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('cmp2', '2026-04-12', 'completed', '[]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('cmp1', '10.0.0.1', 'HIGH', 'web', 'Old finding', 't', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('cmp1', '10.0.0.1', 'HIGH', 'web', 'Persistent', 't', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('cmp2', '10.0.0.1', 'HIGH', 'web', 'Persistent', 't', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('cmp2', '10.0.0.1', 'MEDIUM', 'web', 'New finding', 't', 'test-user-id-12345')")
         db.commit()
 
         r = client.get("/api/runs/cmp2/compare/cmp1")
@@ -144,14 +144,14 @@ class TestCompareRuns:
 class TestTargetDiffs:
     def test_target_diffs_with_previous_run(self, client, db):
         """Two runs scanning the same target — verify per-target diff."""
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td1', '2026-04-11T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td2', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('td1', '2026-04-11T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('td2', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}', 'test-user-id-12345')")
         # Previous run: 2 findings
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td1', '10.0.0.1', 'HIGH', 'web', 'Old vuln', 't')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td1', '10.0.0.1', 'MEDIUM', 'web', 'Still there', 't')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td1', '10.0.0.1', 'HIGH', 'web', 'Old vuln', 't', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td1', '10.0.0.1', 'MEDIUM', 'web', 'Still there', 't', 'test-user-id-12345')")
         # Current run: 1 persistent + 1 new
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td2', '10.0.0.1', 'MEDIUM', 'web', 'Still there', 't')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td2', '10.0.0.1', 'LOW', 'web', 'Brand new', 't')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td2', '10.0.0.1', 'MEDIUM', 'web', 'Still there', 't', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td2', '10.0.0.1', 'LOW', 'web', 'Brand new', 't', 'test-user-id-12345')")
         db.commit()
 
         r = client.get("/api/runs/td2/target-diffs")
@@ -168,8 +168,8 @@ class TestTargetDiffs:
 
     def test_target_diffs_no_previous(self, client, db):
         """First scan for a target — no diff data."""
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td3', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td3', '10.0.0.1', 'HIGH', 'web', 'First finding', 't')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('td3', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td3', '10.0.0.1', 'HIGH', 'web', 'First finding', 't', 'test-user-id-12345')")
         db.commit()
 
         r = client.get("/api/runs/td3/target-diffs")
@@ -180,15 +180,15 @@ class TestTargetDiffs:
     def test_target_diffs_multiple_targets_independent(self, client, db):
         """Each target compared against its own previous scan independently."""
         # Run 1: scans target A only
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td4', '2026-04-11T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td4', '10.0.0.1', 'HIGH', 'web', 'A-old', 't')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('td4', '2026-04-11T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td4', '10.0.0.1', 'HIGH', 'web', 'A-old', 't', 'test-user-id-12345')")
         # Run 2: scans target B only
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td5', '2026-04-11T11:00:00', 'completed', '[\"10.0.0.2\"]', '{}')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td5', '10.0.0.2', 'MEDIUM', 'web', 'B-old', 't')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('td5', '2026-04-11T11:00:00', 'completed', '[\"10.0.0.2\"]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td5', '10.0.0.2', 'MEDIUM', 'web', 'B-old', 't', 'test-user-id-12345')")
         # Run 3: scans both A and B
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td6', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\",\"10.0.0.2\"]', '{}')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td6', '10.0.0.1', 'LOW', 'web', 'A-new', 't')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td6', '10.0.0.2', 'MEDIUM', 'web', 'B-old', 't')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('td6', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\",\"10.0.0.2\"]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td6', '10.0.0.1', 'LOW', 'web', 'A-new', 't', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td6', '10.0.0.2', 'MEDIUM', 'web', 'B-old', 't', 'test-user-id-12345')")
         db.commit()
 
         r = client.get("/api/runs/td6/target-diffs")
@@ -207,10 +207,10 @@ class TestTargetDiffs:
 
     def test_target_diffs_included_in_get_run(self, client, db):
         """GET /api/runs/{id} includes target_diffs in response."""
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td7', '2026-04-11T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td7', '10.0.0.1', 'HIGH', 'web', 'Old', 't')")
-        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td8', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
-        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td8', '10.0.0.1', 'HIGH', 'web', 'Old', 't')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('td7', '2026-04-11T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td7', '10.0.0.1', 'HIGH', 'web', 'Old', 't', 'test-user-id-12345')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json, user_id) VALUES ('td8', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}', 'test-user-id-12345')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool, user_id) VALUES ('td8', '10.0.0.1', 'HIGH', 'web', 'Old', 't', 'test-user-id-12345')")
         db.commit()
 
         r = client.get("/api/runs/td8")

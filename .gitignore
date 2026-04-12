@@ -1,0 +1,55 @@
+# Go
+backend/cmd/server/server
+backend/cmd/ingest/ingest
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Node / Next.js
+web/node_modules/
+web/.next/
+web/out/
+vidaa/node_modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.backup
+infra/terraform/*.tfvars
+infra/terraform/.terraform.lock.hcl
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# iOS
+ios/StreamingApp/build/
+ios/StreamingApp/DerivedData/
+ios/StreamingApp/*.xcworkspace/xcuserdata/
+ios/StreamingApp/*.xcodeproj/xcuserdata/
+
+# Docker
+*.log
+
+# Secrets
+credentials.json
+*.pem
+*.key

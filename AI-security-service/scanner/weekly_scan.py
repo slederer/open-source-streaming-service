@@ -129,50 +129,50 @@ def run_weekly_scans():
         if not targets_rows:
             continue
 
-        targets = [{"ip": t["host"], "name": t["label"] or t["host"]} for t in targets_rows]
-
-        # Run one scan per user (all their targets in one run)
         import uuid
-        run_id = str(uuid.uuid4())[:8]
-        started_at = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
-            (run_id, started_at, "running", json.dumps([t["ip"] for t in targets]), "weekly", user_id),
-        )
-        conn.commit()
-
-        print(f"[weekly] User {user['email']}: starting scan {run_id} on {len(targets)} targets", flush=True)
-        try:
-            run_full_scan(run_id, targets, user_id)
-        except Exception as e:
-            print(f"[weekly] Scan {run_id} failed: {e}", flush=True)
-            continue
-
-        # Build summary + diff data
-        summary_row = conn.execute("SELECT summary_json FROM scan_runs WHERE id=?", (run_id,)).fetchone()
-        summary = json.loads(summary_row["summary_json"]) if summary_row and summary_row["summary_json"] else {}
-        diffs = _compute_target_diffs(run_id)
-
         summaries = []
-        for t in targets:
+
+        # Per-domain model: one scan_run per target
+        for t in targets_rows:
+            target_spec = {"ip": t["host"], "name": t["label"] or t["host"]}
+            run_id = str(uuid.uuid4())[:8]
+            started_at = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO scan_runs (id, started_at, status, targets, target, scan_type, user_id) VALUES (?,?,?,?,?,?,?)",
+                (run_id, started_at, "running", json.dumps([t["host"]]), t["host"], "weekly", user_id),
+            )
+            conn.commit()
+
+            print(f"[weekly] User {user['email']}: starting scan {run_id} on {t['host']}", flush=True)
+            try:
+                run_full_scan(run_id, [target_spec], user_id)
+            except Exception as e:
+                print(f"[weekly] Scan {run_id} failed: {e}", flush=True)
+                continue
+
+            # Collect target-level stats + diff
             target_findings = conn.execute(
-                "SELECT severity, COUNT(*) as cnt FROM findings WHERE run_id=? AND target=? GROUP BY severity",
-                (run_id, t["ip"]),
+                "SELECT severity, COUNT(*) as cnt FROM findings WHERE run_id=? GROUP BY severity",
+                (run_id,),
             ).fetchall()
             counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0, "total": 0}
             for r in target_findings:
                 counts[r["severity"].lower()] = r["cnt"]
                 counts["total"] += r["cnt"]
-            diff = diffs.get(t["ip"], {})
+            diffs = _compute_target_diffs(run_id)
+            diff = diffs.get(t["host"], {})
             summaries.append({
-                "target": t["ip"],
-                "label": t["name"],
+                "target": t["host"],
+                "label": t["label"] or t["host"],
+                "run_id": run_id,
                 **counts,
                 "new": diff.get("new_count", 0),
                 "fixed": diff.get("fixed_count", 0),
             })
 
-        send_summary_email(user["email"], user["name"] or user["email"], summaries)
+        # Single weekly email per user covering all their targets
+        if summaries:
+            send_summary_email(user["email"], user["name"] or user["email"], summaries)
 
     conn.close()
     print(f"[weekly] Done", flush=True)

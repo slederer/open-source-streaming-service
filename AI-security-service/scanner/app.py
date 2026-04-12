@@ -158,6 +158,29 @@ def init_db():
             except sqlite3.OperationalError:
                 pass  # column already exists
 
+        # Add `target` column to scan_runs (single-target model)
+        try:
+            db.execute("ALTER TABLE scan_runs ADD COLUMN target TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        # Backfill target column for legacy runs where it's single-target
+        rows = db.execute(
+            "SELECT id, targets FROM scan_runs WHERE target IS NULL"
+        ).fetchall()
+        for r in rows:
+            try:
+                parsed = json.loads(r["targets"]) if r["targets"] else []
+                if isinstance(parsed, list) and len(parsed) == 1:
+                    db.execute("UPDATE scan_runs SET target=? WHERE id=?", (parsed[0], r["id"]))
+            except Exception:
+                pass
+
+        try:
+            db.execute("CREATE INDEX IF NOT EXISTS idx_scan_runs_user_target ON scan_runs(user_id, target, started_at)")
+        except sqlite3.OperationalError:
+            pass
+
         # Migrate legacy data to Stefan's user (idempotent)
         stefan_email = "stefan.a.lederer@gmail.com"
         stefan = db.execute("SELECT id FROM users WHERE email=?", (stefan_email,)).fetchone()
@@ -2719,10 +2742,11 @@ async def findings_by_target(request: Request):
                 """
                 SELECT sr.id, sr.started_at, sr.finished_at, sr.status
                 FROM scan_runs sr
-                WHERE sr.user_id=? AND sr.status IN ('completed','aborted') AND sr.targets LIKE ?
+                WHERE sr.user_id=? AND sr.status IN ('completed','aborted')
+                  AND (sr.target=? OR sr.targets LIKE ?)
                 ORDER BY sr.started_at DESC LIMIT 1
                 """,
-                (user["user_id"], f'%"{t["host"]}"%'),
+                (user["user_id"], t["host"], f'%"{t["host"]}"%'),
             ).fetchone()
 
             sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
@@ -2780,13 +2804,15 @@ async def findings_for_target(request: Request, target_host: str):
         if not t:
             return JSONResponse({"error": "Target not found"}, status_code=404)
 
+        host_like = f'%"{target_host}"%'
         latest = db.execute(
             """
             SELECT id, started_at, finished_at, status FROM scan_runs
-            WHERE user_id=? AND status IN ('completed','aborted') AND targets LIKE ?
+            WHERE user_id=? AND status IN ('completed','aborted')
+              AND (target=? OR targets LIKE ?)
             ORDER BY started_at DESC LIMIT 1
             """,
-            (user["user_id"], f'%"{target_host}"%'),
+            (user["user_id"], target_host, host_like),
         ).fetchone()
 
         findings = []
@@ -2802,19 +2828,20 @@ async def findings_for_target(request: Request, target_host: str):
         prev_run = db.execute(
             """
             SELECT id FROM scan_runs WHERE user_id=? AND status IN ('completed','aborted')
-            AND targets LIKE ? AND id != ? ORDER BY started_at DESC LIMIT 1
+            AND (target=? OR targets LIKE ?) AND id != ? ORDER BY started_at DESC LIMIT 1
             """,
-            (user["user_id"], f'%"{target_host}"%', latest["id"] if latest else ""),
+            (user["user_id"], target_host, host_like, latest["id"] if latest else ""),
         ).fetchone()
 
         # Scan history
         history = db.execute(
             """
             SELECT id, started_at, finished_at, status FROM scan_runs
-            WHERE user_id=? AND status IN ('completed','aborted') AND targets LIKE ?
+            WHERE user_id=? AND status IN ('completed','aborted')
+              AND (target=? OR targets LIKE ?)
             ORDER BY started_at DESC LIMIT 10
             """,
-            (user["user_id"], f'%"{target_host}"%'),
+            (user["user_id"], target_host, host_like),
         ).fetchall()
 
         return {
@@ -2944,30 +2971,46 @@ async def delete_target(request: Request, target_id: int):
 
 @app.post("/api/scan")
 async def start_scan(request: Request, background_tasks: BackgroundTasks, scan_type: str = "full"):
-    """Trigger a new scan run (scans all user's targets)."""
+    """Scan all of user's targets — fans out into N independent single-target scans.
+
+    Per-domain model: 1 scan = 1 target. This endpoint is a convenience wrapper
+    that spawns one scan_run per target. Each is billed/limited independently.
+    """
     user = get_user(request)
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
-
-    allowed, reason = can_user_scan(user["user_id"])
-    if not allowed:
-        return JSONResponse({"error": reason, "upgrade_url": "/billing"}, status_code=402)
 
     targets = parse_targets(user_id=user["user_id"])
     if not targets:
         return JSONResponse({"error": "No targets configured. Add a target first."}, status_code=400)
 
-    run_id = str(uuid.uuid4())[:8]
+    # Clean up stale scans before we consume more plan quota
+    cleanup_stale_scans()
+
+    run_ids = []
+    skipped = []
     now = datetime.now(timezone.utc).isoformat()
 
-    with get_db() as db:
-        db.execute(
-            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
-            (run_id, now, "running", json.dumps([t["ip"] for t in targets]), scan_type, user["user_id"]),
-        )
+    for t in targets:
+        allowed, reason = can_user_scan(user["user_id"])
+        if not allowed:
+            skipped.append({"target": t["ip"], "reason": reason})
+            continue
 
-    background_tasks.add_task(run_full_scan, run_id, targets, user["user_id"])
-    return {"run_id": run_id, "status": "started", "targets": len(targets)}
+        run_id = str(uuid.uuid4())[:8]
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO scan_runs (id, started_at, status, targets, target, scan_type, user_id) VALUES (?,?,?,?,?,?,?)",
+                (run_id, now, "running", json.dumps([t["ip"]]), t["ip"], scan_type, user["user_id"]),
+            )
+        background_tasks.add_task(run_full_scan, run_id, [t], user["user_id"])
+        run_ids.append({"run_id": run_id, "target": t["ip"]})
+
+    result = {"run_ids": run_ids, "count": len(run_ids), "status": "started"}
+    if skipped:
+        result["skipped"] = skipped
+        result["upgrade_url"] = "/billing"
+    return result
 
 
 @app.get("/api/runs")
@@ -3002,8 +3045,9 @@ def _compute_target_diffs(run_id: str) -> dict:
 
             # Find the most recent completed run (before this one) that scanned this target
             prev_run = db.execute(
-                "SELECT id FROM scan_runs WHERE id != ? AND status IN ('completed','aborted') AND started_at < ? AND targets LIKE ? ORDER BY started_at DESC LIMIT 1",
-                (run_id, run_started, f'%{target}%'),
+                "SELECT id FROM scan_runs WHERE id != ? AND status IN ('completed','aborted') AND started_at < ? "
+                "AND (target=? OR targets LIKE ?) ORDER BY started_at DESC LIMIT 1",
+                (run_id, run_started, target, f'%{target}%'),
             ).fetchone()
 
             if not prev_run:
@@ -3303,8 +3347,8 @@ async def github_scan_repo(request: Request):
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as db:
         db.execute(
-            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
-            (run_id, now, "running", json.dumps([repo_url]), "code", user["user_id"]),
+            "INSERT INTO scan_runs (id, started_at, status, targets, target, scan_type, user_id) VALUES (?,?,?,?,?,?,?)",
+            (run_id, now, "running", json.dumps([repo_url]), repo_url, "code", user["user_id"]),
         )
 
     def _run_code_scan():
@@ -3444,8 +3488,8 @@ async def mobile_scan(request: Request):
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as db:
         db.execute(
-            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
-            (run_id, now, "running", json.dumps([filename]), "mobile", user["user_id"]),
+            "INSERT INTO scan_runs (id, started_at, status, targets, target, scan_type, user_id) VALUES (?,?,?,?,?,?,?)",
+            (run_id, now, "running", json.dumps([filename]), filename, "mobile", user["user_id"]),
         )
 
     def _run_mobile_scan():
@@ -3893,8 +3937,8 @@ async def v1_scan(request: Request, background_tasks: BackgroundTasks):
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as db:
         db.execute(
-            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
-            (run_id, now, "running", json.dumps([host]), "single", user["user_id"]),
+            "INSERT INTO scan_runs (id, started_at, status, targets, target, scan_type, user_id) VALUES (?,?,?,?,?,?,?)",
+            (run_id, now, "running", json.dumps([host]), host, "single", user["user_id"]),
         )
 
     single_target = [{"ip": host, "name": label}]
@@ -4442,17 +4486,27 @@ VIEWS.scans = async () => {
   const root = document.getElementById("view-root");
   const runs = await api("/api/runs");
   if (!runs || runs.error) { root.innerHTML = `<div class="empty"><p>Could not load scans</p></div>`; return; }
+  const targetLabel = (r) => {
+    if (r.target) return r.target;
+    try {
+      const arr = JSON.parse(r.targets || "[]");
+      if (arr.length === 1) return arr[0];
+      if (arr.length > 1) return `${arr.length} targets (legacy)`;
+    } catch {}
+    return "-";
+  };
   root.innerHTML = `
-    <div class="page-title"><h1>Scans</h1><div class="sub">${runs.length} total</div></div>
+    <div class="page-title"><h1>Scans</h1><div class="sub">${runs.length} total · one scan per target</div></div>
     ${runs.length ? `
       <div class="card" style="padding:0;overflow:hidden;">
         <table class="table">
-          <thead><tr><th>ID</th><th>Started</th><th>Type</th><th>Status</th><th>Findings</th><th></th></tr></thead>
+          <thead><tr><th>ID</th><th>Target</th><th>Started</th><th>Type</th><th>Status</th><th>Findings</th><th></th></tr></thead>
           <tbody>
             ${runs.map(r => {
               const s = r.summary_json ? JSON.parse(r.summary_json) : {};
               return `<tr onclick="go('scan-detail','${r.id}')" style="cursor:pointer;">
                 <td class="mono">#${r.id}</td>
+                <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;">${esc(targetLabel(r))}</td>
                 <td>${fmtTime(r.started_at)}</td>
                 <td>${esc(r.scan_type || 'full')}</td>
                 <td><span class="status-badge ${r.status}">${r.status}</span></td>
@@ -4586,7 +4640,13 @@ VIEWS.targets = async () => {
   const targets = await api("/api/targets");
   if (!targets || targets.error) { root.innerHTML = `<div class="empty"><p>Could not load</p></div>`; return; }
   root.innerHTML = `
-    <div class="page-title"><h1>Targets</h1><div class="sub">URLs and IPs you've authorized for scanning</div></div>
+    <div class="page-title" style="display:flex;justify-content:space-between;align-items:flex-end;">
+      <div>
+        <h1>Targets</h1>
+        <div class="sub">URLs and IPs you've authorized for scanning · 1 scan = 1 target</div>
+      </div>
+      ${targets.length ? `<button class="btn btn-outline" onclick="scanAll()">Scan all (${targets.length})</button>` : ''}
+    </div>
 
     <div class="card" style="margin-bottom:20px;">
       <h2>Add a target</h2>
@@ -4605,7 +4665,10 @@ VIEWS.targets = async () => {
             <td class="mono">${esc(t.host)}</td>
             <td>${esc(t.label || '-')}</td>
             <td>${fmtTime(t.added_at)}</td>
-            <td style="text-align:right;"><button class="btn-danger btn-sm" onclick="delTarget(${t.id})">Remove</button></td>
+            <td style="text-align:right;">
+              <button class="btn btn-sm" onclick="scanSingle('${esc(t.host)}','${esc(t.label || '')}')">Scan</button>
+              <button class="btn-danger btn-sm" onclick="delTarget(${t.id})">Remove</button>
+            </td>
           </tr>`).join('')}
         </tbody>
       </table>` : `<div class="empty"><p>No targets yet.</p></div>`}
@@ -4764,6 +4827,17 @@ async function scanSingle(host, label) {
   const r = await api("/v1/scan", {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({host, label})});
   if (r && r.error) { alert(r.error); return; }
   if (r && r.run_id) go("scan-detail", r.run_id);
+}
+
+async function scanAll() {
+  if (!confirm("Start a scan for every target? Each counts against your plan individually.")) return;
+  const r = await api("/api/scan", {method:'POST'});
+  if (!r) return;
+  if (r.error) { alert(r.error); return; }
+  let msg = `Started ${r.count} scan${r.count===1?'':'s'}.`;
+  if (r.skipped && r.skipped.length) msg += `\n\nSkipped ${r.skipped.length} due to plan limits:\n` + r.skipped.map(s => `• ${s.target}: ${s.reason}`).join('\n');
+  alert(msg);
+  go("scans");
 }
 
 // ─── Monitors view ───────────────────────────────────────────────────────────
@@ -5612,8 +5686,8 @@ async def copilot_extension(request: Request):
                         (host, host, now, user_id),
                     )
                 db.execute(
-                    "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
-                    (run_id, now, "running", json.dumps([host]), "copilot", user_id),
+                    "INSERT INTO scan_runs (id, started_at, status, targets, target, scan_type, user_id) VALUES (?,?,?,?,?,?,?)",
+                    (run_id, now, "running", json.dumps([host]), host, "copilot", user_id),
                 )
 
             # Fire off scan in background (thread since we're in async)
@@ -5692,8 +5766,8 @@ async def vercel_webhook(request: Request):
                 (host, f"vercel:{host}", now, user_id),
             )
         db.execute(
-            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
-            (run_id, now, "running", json.dumps([host]), "vercel", user_id),
+            "INSERT INTO scan_runs (id, started_at, status, targets, target, scan_type, user_id) VALUES (?,?,?,?,?,?,?)",
+            (run_id, now, "running", json.dumps([host]), host, "vercel", user_id),
         )
 
     import threading

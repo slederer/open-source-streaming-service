@@ -46,8 +46,9 @@ describe("CategoryRow", () => {
 
   it("renders all video cards", () => {
     render(<CategoryRow title="Test" videos={mockVideos} />);
-    expect(screen.getByText("Video One")).toBeDefined();
-    expect(screen.getByText("Video Two")).toBeDefined();
+    // Titles appear both in placeholder and heading — just check they exist
+    expect(screen.getAllByText("Video One").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Video Two").length).toBeGreaterThan(0);
   });
 
   it("returns null for empty videos", () => {

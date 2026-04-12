@@ -29,7 +29,13 @@ export default async function Home() {
     );
   }
 
-  const featured = videos?.[0];
+  // Prefer a video with an actual poster for the hero
+  const featured = videos?.find((v) => v.poster_url) || videos?.[0];
+  // Show videos with posters first in the gallery
+  const sortedVideos = videos ? [...videos].sort((a, b) => {
+    if (!!a.poster_url === !!b.poster_url) return 0;
+    return a.poster_url ? -1 : 1;
+  }) : [];
   const activeLive = liveChannels?.filter((ch) => ch.is_active) || [];
 
   return (
@@ -57,8 +63,8 @@ export default async function Home() {
         </div>
       )}
 
-      {videos && videos.length > 0 && (
-        <CategoryRow title="All Videos" videos={videos} />
+      {sortedVideos.length > 0 && (
+        <CategoryRow title="All Videos" videos={sortedVideos} />
       )}
     </div>
   );

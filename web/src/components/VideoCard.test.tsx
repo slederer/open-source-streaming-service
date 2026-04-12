@@ -23,7 +23,21 @@ const mockVideo: Video = {
 describe("VideoCard", () => {
   it("renders video title", () => {
     render(<VideoCard video={mockVideo} />);
-    expect(screen.getByText("Big Buck Bunny")).toBeDefined();
+    // Title appears in both the card heading and the placeholder (when no poster)
+    expect(screen.getAllByText("Big Buck Bunny").length).toBeGreaterThan(0);
+  });
+
+  it("renders poster image when poster_url is set", () => {
+    const withPoster = { ...mockVideo, poster_url: "https://example.com/bbb.jpg" };
+    render(<VideoCard video={withPoster} />);
+    const img = screen.getByRole("img");
+    expect(img.getAttribute("src")).toBe("https://example.com/bbb.jpg");
+  });
+
+  it("shows gradient placeholder when no poster_url", () => {
+    render(<VideoCard video={mockVideo} />);
+    // No <img> rendered when poster_url is empty
+    expect(screen.queryByRole("img")).toBeNull();
   });
 
   it("renders duration badge", () => {

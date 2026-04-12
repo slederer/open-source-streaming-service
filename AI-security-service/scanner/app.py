@@ -2630,6 +2630,74 @@ async def billing_status(request: Request):
 
 # ── User Profile ─────────────────────────────────────────────────────────────
 
+@app.get("/api/overview")
+async def overview(request: Request):
+    """Aggregated account stats for the dashboard overview page."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    full = get_user_by_id(user["user_id"]) or {}
+    plan = full.get("plan", "free")
+    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+
+    with get_db() as db:
+        targets = db.execute(
+            "SELECT COUNT(*) FROM targets WHERE user_id=?", (user["user_id"],)
+        ).fetchone()[0]
+
+        total_runs = db.execute(
+            "SELECT COUNT(*) FROM scan_runs WHERE user_id=?", (user["user_id"],)
+        ).fetchone()[0]
+
+        # Monthly scan count
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        month_start = today[:7] + "-01"
+        monthly_scans = db.execute(
+            "SELECT COUNT(*) FROM scan_runs WHERE user_id=? AND substr(started_at,1,10) >= ?",
+            (user["user_id"], month_start),
+        ).fetchone()[0]
+
+        # Findings by severity
+        sev_rows = db.execute(
+            "SELECT severity, COUNT(*) as cnt FROM findings WHERE user_id=? GROUP BY severity",
+            (user["user_id"],),
+        ).fetchall()
+        severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        for r in sev_rows:
+            severity_counts[r["severity"]] = r["cnt"]
+
+        # Recent critical findings
+        critical_rows = db.execute(
+            "SELECT f.target, f.title, f.created_at, f.run_id FROM findings f JOIN scan_runs s ON f.run_id=s.id WHERE f.user_id=? AND f.severity IN ('CRITICAL','HIGH') ORDER BY f.created_at DESC LIMIT 10",
+            (user["user_id"],),
+        ).fetchall()
+        recent_critical = [dict(r) for r in critical_rows]
+
+        # Active monitors
+        _ensure_monitoring_table()
+        monitors = db.execute(
+            "SELECT COUNT(*) FROM monitors WHERE user_id=? AND is_active=1", (user["user_id"],)
+        ).fetchone()[0]
+
+        # Recent scans
+        recent_scans = db.execute(
+            "SELECT id, started_at, status, scan_type, summary_json FROM scan_runs WHERE user_id=? ORDER BY started_at DESC LIMIT 5",
+            (user["user_id"],),
+        ).fetchall()
+
+    return {
+        "user": {"email": full.get("email"), "name": full.get("name"), "plan": plan, "credits": full.get("scan_credits", 0)},
+        "limits": limits,
+        "targets_count": targets,
+        "total_runs": total_runs,
+        "monthly_scans": monthly_scans,
+        "severity_counts": severity_counts,
+        "recent_critical": recent_critical,
+        "monitors_count": monitors,
+        "recent_scans": [dict(r) for r in recent_scans],
+    }
+
+
 @app.get("/api/me")
 async def me(request: Request):
     user = require_auth_any(request)
@@ -3615,537 +3683,849 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <title>Security Scanner</title>
 <style>
   :root {
-    --bg: #0a0e17; --card: #111827; --border: #1f2937;
-    --text: #e5e7eb; --muted: #6b7280;
+    --bg: #0a0e17; --sidebar: #0f1420; --card: #111827; --card-hover: #161d2e;
+    --border: #1f2937; --border-light: #2a3548;
+    --text: #e5e7eb; --text-dim: #9ca3af; --text-muted: #6b7280;
+    --brand: #dc2626; --brand-hover: #b91c1c;
     --critical: #dc2626; --high: #f97316; --medium: #eab308; --low: #3b82f6; --info: #6b7280;
-    --green: #22c55e;
+    --success: #22c55e;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Mono', monospace; background: var(--bg); color: var(--text); }
-  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+  html, body { height: 100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5; }
+  a { color: inherit; text-decoration: none; }
+  button { font-family: inherit; cursor: pointer; }
+  input, select, textarea { font-family: inherit; }
 
-  /* Header */
-  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
-  header h1 { font-size: 1.4rem; font-weight: 600; letter-spacing: -0.02em; }
-  header h1 span { color: var(--critical); }
+  /* Layout */
+  .app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+  .sidebar { background: var(--sidebar); border-right: 1px solid var(--border); padding: 20px 0; display: flex; flex-direction: column; }
+  .sidebar-brand { padding: 0 20px 20px; font-weight: 700; font-size: 1rem; letter-spacing: -0.02em; border-bottom: 1px solid var(--border); }
+  .sidebar-brand span { color: var(--brand); }
+  .nav-section { padding: 16px 12px 8px; font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 16px; margin: 0 8px; color: var(--text-dim); font-size: 0.85rem; border-radius: 6px; cursor: pointer; user-select: none; }
+  .nav-item:hover { background: var(--card); color: var(--text); }
+  .nav-item.active { background: var(--card); color: var(--text); }
+  .nav-item .icon { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; font-size: 1rem; }
+  .nav-item .badge { margin-left: auto; background: var(--brand); color: white; font-size: 0.65rem; padding: 1px 6px; border-radius: 10px; }
+  .sidebar-footer { margin-top: auto; padding: 16px 20px; border-top: 1px solid var(--border); font-size: 0.75rem; color: var(--text-muted); }
+  .user-box { display: flex; align-items: center; gap: 10px; padding: 10px 12px; margin: 0 8px; border-radius: 6px; cursor: pointer; }
+  .user-box:hover { background: var(--card); }
+  .user-box img { width: 28px; height: 28px; border-radius: 50%; }
+  .user-box .name { flex: 1; font-size: 0.8rem; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  /* Navigation tabs */
-  .nav-tabs { display: flex; gap: 0; margin-top: 0; margin-bottom: 32px; border-bottom: 1px solid var(--border); }
-  .nav-tab { padding: 12px 24px; font-size: 0.85rem; font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s; font-family: inherit; background: none; border-top: none; border-left: none; border-right: none; }
-  .nav-tab:hover { color: var(--text); }
-  .nav-tab.active { color: var(--text); border-bottom-color: var(--critical); }
-
-  /* Tab panels */
-  .tab-panel { display: none; }
-  .tab-panel.active { display: block; }
+  /* Main content */
+  .main { padding: 0; overflow-x: hidden; }
+  .topbar { padding: 16px 32px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--bg); position: sticky; top: 0; z-index: 10; }
+  .topbar h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: -0.01em; }
+  .content { padding: 32px; max-width: 1400px; }
 
   /* Buttons */
-  .btn { background: var(--critical); color: #fff; border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600; font-family: inherit; }
-  .btn:hover { opacity: 0.9; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; background: var(--brand); color: white; border: none; border-radius: 6px; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
+  .btn:hover { background: var(--brand-hover); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
-  .btn-outline:hover { border-color: var(--muted); }
-  .btn-sm { padding: 4px 12px; font-size: 0.75rem; }
-  .btn-green { background: var(--green); }
-  .btn-blue { background: var(--low); }
-  .btn-icon { background: transparent; border: 1px solid var(--border); color: var(--muted); width: 28px; height: 28px; border-radius: 6px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; font-size: 1rem; padding: 0; }
-  .btn-icon:hover { border-color: var(--critical); color: var(--critical); }
+  .btn-outline:hover { border-color: var(--text-muted); background: var(--card); }
+  .btn-sm { padding: 5px 10px; font-size: 0.75rem; }
+  .btn-danger { background: transparent; border: 1px solid var(--border); color: var(--text-dim); }
+  .btn-danger:hover { border-color: var(--critical); color: var(--critical); }
+  .btn-ghost { background: transparent; color: var(--text-dim); padding: 6px 10px; font-size: 0.8rem; border: none; }
+  .btn-ghost:hover { color: var(--text); }
 
-  /* Stats bar */
-  .stats { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
-  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 24px; min-width: 140px; }
-  .stat .label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
-  .stat .value { font-size: 1.8rem; font-weight: 700; }
-  .stat.critical .value { color: var(--critical); }
-  .stat.high .value { color: var(--high); }
-  .stat.medium .value { color: var(--medium); }
-  .stat.low .value { color: var(--low); }
-  .stat.info .value { color: var(--info); }
-  .stat.fixed .value { color: var(--green); }
+  /* Inputs */
+  .input { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; color: var(--text); font-size: 0.9rem; }
+  .input:focus { outline: none; border-color: var(--brand); }
+  label { display: block; font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
 
-  /* Target cards */
-  .targets-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-bottom: 24px; }
-  .target-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; display: flex; justify-content: space-between; align-items: center; }
-  .target-host { font-weight: 600; font-size: 0.9rem; }
-  .target-label { color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
-  .target-added { color: var(--muted); font-size: 0.7rem; margin-top: 4px; }
-  .add-target-form { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
-  .add-target-form input { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; color: var(--text); font-family: inherit; font-size: 0.85rem; min-width: 200px; flex: 1; }
-  .add-target-form input:focus { outline: none; border-color: var(--muted); }
-  .add-target-form input::placeholder { color: var(--muted); }
+  /* Cards */
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+  .card-sm { padding: 16px; }
+  .card h2 { font-size: 0.95rem; font-weight: 600; margin-bottom: 16px; }
+  .card h3 { font-size: 0.8rem; font-weight: 600; color: var(--text-dim); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
 
-  /* Runs list */
-  .runs { margin-bottom: 32px; }
-  .runs h2 { font-size: 1rem; margin-bottom: 12px; color: var(--muted); }
-  .run-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 8px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; transition: border-color 0.2s; }
-  .run-card:hover { border-color: var(--muted); }
-  .run-card.active { border-color: var(--critical); }
-  .run-meta { display: flex; gap: 16px; align-items: center; }
-  .run-id { font-weight: 600; color: var(--text); }
-  .run-time { color: var(--muted); font-size: 0.85rem; }
-  .run-status { padding: 2px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
-  .run-status.running { background: #1e3a5f; color: #60a5fa; }
-  .run-status.completed { background: #14532d; color: #4ade80; }
-  .run-badges { display: flex; gap: 6px; }
+  /* Grids */
+  .grid { display: grid; gap: 16px; }
+  .grid-cards { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+  .grid-2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
 
-  /* Severity badges */
-  .badge { padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; }
+  /* Stat cards (overview) */
+  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; }
+  .stat-card .label { font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+  .stat-card .value { font-size: 1.8rem; font-weight: 700; letter-spacing: -0.02em; }
+  .stat-card .sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
+  .stat-card.crit .value { color: var(--critical); }
+  .stat-card.high .value { color: var(--high); }
+  .stat-card.med .value { color: var(--medium); }
+
+  /* Tables */
+  .table { width: 100%; border-collapse: collapse; }
+  .table th { text-align: left; padding: 10px 14px; font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); font-weight: 600; }
+  .table td { padding: 12px 14px; border-bottom: 1px solid var(--border); font-size: 0.85rem; vertical-align: middle; }
+  .table tr:hover { background: var(--card-hover); }
+  .table .mono { font-family: 'SF Mono', Menlo, monospace; font-size: 0.78rem; color: var(--text-dim); }
+
+  /* Badges */
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.68rem; font-weight: 700; letter-spacing: 0.03em; }
   .badge.CRITICAL { background: #450a0a; color: #fca5a5; }
   .badge.HIGH { background: #431407; color: #fdba74; }
   .badge.MEDIUM { background: #422006; color: #fde047; }
   .badge.LOW { background: #172554; color: #93c5fd; }
   .badge.INFO { background: #1f2937; color: #9ca3af; }
+  .status-badge { padding: 3px 10px; border-radius: 12px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; }
+  .status-badge.running { background: #1e3a5f; color: #60a5fa; }
+  .status-badge.completed { background: #14532d; color: #4ade80; }
+  .status-badge.aborted, .status-badge.failed { background: #4b1d1d; color: #fca5a5; }
 
-  /* Health grade */
-  .grade { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 8px; font-weight: 800; font-size: 1.1rem; }
-  .grade-A { background: #14532d; color: #4ade80; }
-  .grade-B { background: #422006; color: #fde047; }
-  .grade-C { background: #431407; color: #fdba74; }
-  .grade-F { background: #450a0a; color: #fca5a5; }
+  /* Severity bar */
+  .sev-row { display: flex; gap: 6px; align-items: center; }
+  .sev-row .badge { font-size: 0.65rem; padding: 1px 6px; }
 
-  /* Results: per-target breakdown */
-  .target-result-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
-  .target-result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-  .target-result-title { display: flex; align-items: center; gap: 12px; }
-  .target-result-host { font-weight: 600; font-size: 1rem; }
-  .target-result-label { color: var(--muted); font-size: 0.8rem; }
-  .severity-counts { display: flex; gap: 8px; }
-
-  /* Collapsible finding */
-  .finding-row { border-bottom: 1px solid var(--border); padding: 10px 0; cursor: pointer; }
-  .finding-row:last-child { border-bottom: none; }
-  .finding-summary { display: flex; align-items: center; gap: 12px; }
-  .finding-title { font-size: 0.85rem; font-weight: 500; flex: 1; }
-  .finding-tool { color: var(--muted); font-size: 0.75rem; min-width: 60px; text-align: right; }
-  .finding-chevron { color: var(--muted); font-size: 0.75rem; transition: transform 0.2s; }
-  .finding-row.open .finding-chevron { transform: rotate(90deg); }
-  .finding-details { display: none; padding: 8px 0 4px 40px; font-size: 0.8rem; color: var(--muted); }
-  .finding-row.open .finding-details { display: block; }
-  .finding-details dt { font-weight: 600; color: var(--text); margin-top: 6px; }
-  .finding-details dd { margin-left: 0; margin-bottom: 4px; word-break: break-all; }
-
-  /* Fix file section */
-  .fix-section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-top: 24px; }
-  .fix-section h3 { font-size: 0.95rem; margin-bottom: 12px; }
-  .fix-actions { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-  .prompt-block { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 0.8rem; color: var(--text); position: relative; word-break: break-all; }
-  .prompt-block code { display: block; white-space: pre-wrap; }
-  .copy-btn { position: absolute; top: 8px; right: 8px; background: var(--border); border: none; color: var(--text); padding: 4px 8px; border-radius: 4px; font-size: 0.7rem; cursor: pointer; font-family: inherit; }
-  .copy-btn:hover { background: var(--muted); }
-
-  /* Compare banner */
-  .target-diff { display: flex; gap: 12px; margin-top: 8px; font-size: 0.75rem; align-items: center; flex-wrap: wrap; }
-  .target-diff .diff-new { color: var(--critical); font-weight: 600; }
-  .target-diff .diff-fixed { color: var(--green); font-weight: 600; }
-  .target-diff .diff-unchanged { color: var(--muted); }
-  .target-diff .diff-prev { color: var(--muted); font-size: 0.7rem; opacity: 0.7; }
-
-  /* Filter buttons in results */
-  .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-  .filter-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 16px; font-size: 0.75rem; cursor: pointer; font-family: inherit; }
-  .filter-btn.active { border-color: var(--text); color: var(--text); }
+  /* Empty states */
+  .empty { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+  .empty h3 { font-size: 1rem; color: var(--text); margin-bottom: 8px; }
+  .empty p { margin-bottom: 20px; font-size: 0.85rem; }
 
   /* Loading */
-  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  .empty { color: var(--muted); text-align: center; padding: 48px; }
+  /* Forms */
+  .form-row { margin-bottom: 14px; }
 
-  /* Responsive */
-  @media (max-width: 768px) {
-    .container { padding: 12px; }
-    .stats { gap: 8px; }
-    .stat { min-width: 100px; padding: 12px 16px; }
-    .stat .value { font-size: 1.4rem; }
-    .targets-grid { grid-template-columns: 1fr; }
-    .add-target-form { flex-direction: column; }
-    .add-target-form input { min-width: 100%; }
-    .run-card { flex-direction: column; align-items: flex-start; gap: 8px; }
-    .nav-tab { padding: 10px 16px; font-size: 0.8rem; }
-    header { flex-direction: column; gap: 12px; align-items: flex-start; }
-  }
+  /* Modal */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 28px; max-width: 520px; width: 100%; }
+  .modal h2 { font-size: 1.1rem; margin-bottom: 16px; }
+  .modal .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+  /* Finding row (expandable) */
+  .finding { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; cursor: pointer; background: var(--card); }
+  .finding-head { display: grid; grid-template-columns: 80px 1fr auto auto; gap: 12px; padding: 12px 16px; align-items: center; }
+  .finding-title { font-size: 0.88rem; }
+  .finding-tool { color: var(--text-muted); font-size: 0.75rem; }
+  .finding-chev { color: var(--text-muted); transition: transform 0.2s; }
+  .finding.open .finding-chev { transform: rotate(90deg); }
+  .finding-body { padding: 0 16px 16px; display: none; font-size: 0.82rem; color: var(--text-dim); border-top: 1px solid var(--border); padding-top: 12px; }
+  .finding.open .finding-body { display: block; }
+  .finding-body dt { color: var(--text-muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 8px; }
+  .finding-body dd { margin-top: 4px; font-family: 'SF Mono', Menlo, monospace; word-break: break-all; }
+
+  /* Target result card */
+  .target-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 16px; overflow: hidden; }
+  .target-card-head { padding: 16px 20px; background: var(--sidebar); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
+  .target-card-head h3 { font-size: 0.95rem; font-weight: 600; }
+  .target-card-head .host { font-family: 'SF Mono', Menlo, monospace; font-size: 0.78rem; color: var(--text-muted); margin-top: 2px; }
+  .target-card-body { padding: 16px 20px; }
+  .grade { display: inline-flex; align-items: center; justify-content: center; width: 38px; height: 38px; border-radius: 8px; font-weight: 800; font-size: 1.1rem; }
+  .grade-A { background: #14532d; color: #4ade80; }
+  .grade-B { background: #172554; color: #93c5fd; }
+  .grade-C { background: #422006; color: #fde047; }
+  .grade-D { background: #431407; color: #fdba74; }
+  .grade-F { background: #450a0a; color: #fca5a5; }
+
+  /* Plan badge */
+  .plan-pill { display: inline-block; padding: 3px 10px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); }
+  .plan-pill.pro { background: #14532d; color: #86efac; border-color: #14532d; }
+  .plan-pill.monthly { background: #1e3a5f; color: #93c5fd; border-color: #1e3a5f; }
+  .plan-pill.payg { background: #422006; color: #fde047; border-color: #422006; }
+
+  /* Copy button */
+  .copy-code { position: relative; background: #0a0e17; border: 1px solid var(--border); border-radius: 6px; padding: 10px 40px 10px 14px; font-family: 'SF Mono', monospace; font-size: 0.78rem; word-break: break-all; color: var(--text-dim); }
+  .copy-code .copy-btn { position: absolute; top: 6px; right: 6px; background: var(--card); border: 1px solid var(--border); color: var(--text-dim); padding: 3px 8px; border-radius: 4px; font-size: 0.7rem; cursor: pointer; }
+  .copy-code .copy-btn:hover { color: var(--text); }
+
+  /* Page titles */
+  .page-title { margin-bottom: 24px; }
+  .page-title h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 4px; }
+  .page-title .sub { color: var(--text-muted); font-size: 0.85rem; }
+
+  /* Filter bar */
+  .filter-bar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .chip { background: var(--card); border: 1px solid var(--border); color: var(--text-dim); padding: 5px 12px; border-radius: 14px; font-size: 0.75rem; cursor: pointer; }
+  .chip.active { border-color: var(--text); color: var(--text); }
 </style>
 </head>
 <body>
-<div class="container">
-  <header>
-    <h1><span>&#9632;</span> Security Scanner</h1>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <!--USER_INFO-->
-      <span id="scan-status" style="font-size:0.8rem;color:var(--muted);"></span>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-brand"><span>&#9632;</span> Security Scanner</div>
+
+    <div class="nav-section">Dashboard</div>
+    <div class="nav-item" data-view="overview" onclick="go('overview')"><span class="icon">&#8962;</span> Overview</div>
+    <div class="nav-item" data-view="scans" onclick="go('scans')"><span class="icon">&#9998;</span> Scans</div>
+    <div class="nav-item" data-view="findings" onclick="go('findings')"><span class="icon">&#9888;</span> Findings</div>
+
+    <div class="nav-section">Scanning</div>
+    <div class="nav-item" data-view="targets" onclick="go('targets')"><span class="icon">&#9678;</span> Targets</div>
+    <div class="nav-item" data-view="monitors" onclick="go('monitors')"><span class="icon">&#9203;</span> Monitors</div>
+    <div class="nav-item" data-view="code" onclick="go('code')"><span class="icon">&#9881;</span> Code Review</div>
+    <div class="nav-item" data-view="mobile" onclick="go('mobile')"><span class="icon">&#9742;</span> Mobile Apps</div>
+
+    <div class="nav-section">Account</div>
+    <div class="nav-item" data-view="keys" onclick="go('keys')"><span class="icon">&#128273;</span> API Keys</div>
+    <div class="nav-item" data-view="integrations" onclick="go('integrations')"><span class="icon">&#128279;</span> Integrations</div>
+    <div class="nav-item" data-view="billing" onclick="go('billing')"><span class="icon">&#128176;</span> Billing</div>
+
+    <div class="sidebar-footer">
+      <div id="user-box" class="user-box"></div>
+      <div style="margin-top:8px;"><a href="/logout" style="color:var(--text-muted);font-size:0.75rem;">Sign out</a></div>
     </div>
-  </header>
+  </aside>
 
-  <div class="nav-tabs">
-    <button class="nav-tab active" onclick="switchTab('targets')" data-tab="targets">Targets</button>
-    <button class="nav-tab" onclick="switchTab('scans')" data-tab="scans">Scans</button>
-    <button class="nav-tab" onclick="switchTab('results')" data-tab="results">Results</button>
-  </div>
-
-  <!-- ═══ TARGETS TAB ═══ -->
-  <div class="tab-panel active" id="panel-targets">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
-      <h2 style="font-size:1rem;color:var(--muted);">Scan Targets</h2>
-      <button class="btn" id="scan-btn" onclick="startScan()">Run Scan</button>
-    </div>
-
-    <div class="add-target-form">
-      <input type="text" id="new-target-host" placeholder="IP, hostname, or URL (e.g. 10.0.1.5)" />
-      <input type="text" id="new-target-label" placeholder="Label (optional)" style="max-width:200px;" />
-      <button class="btn btn-outline" onclick="addTarget()">Add Target</button>
-    </div>
-
-    <div class="targets-grid" id="targets-list">
-      <div class="empty">Loading targets...</div>
-    </div>
-  </div>
-
-  <!-- ═══ SCANS TAB ═══ -->
-  <div class="tab-panel" id="panel-scans">
-    <div class="runs">
-      <h2>Scan Runs</h2>
-      <div id="runs-list"><div class="empty">No scans yet. Go to Targets and click "Run Scan" to start.</div></div>
-    </div>
-  </div>
-
-  <!-- ═══ RESULTS TAB ═══ -->
-  <div class="tab-panel" id="panel-results">
-    <div id="results-empty" class="empty">Select a scan run from the Scans tab to view results.</div>
-
-    <div id="results-content" style="display:none;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-        <h2 id="results-title" style="font-size:1rem;color:var(--muted);">Results</h2>
-      </div>
-
-      <div class="stats" id="stats"></div>
-
-      <!-- per-target diffs shown inline in results cards -->
-
-      <div class="filters" id="filters"></div>
-
-      <div id="target-results"></div>
-
-      <div class="fix-section" id="fix-section">
-        <h3>Generate Fix Instructions</h3>
-        <div class="fix-actions" id="fix-actions"></div>
-        <div class="prompt-block">
-          <button class="copy-btn" onclick="copyPrompt()">Copy</button>
-          <code>Read SECURITY-FIX.md and implement all the fixes described. Start with CRITICAL issues, then HIGH, then MEDIUM. Run tests and deploy after each fix.</code>
-        </div>
+  <main class="main">
+    <div class="topbar">
+      <h1 id="page-title">Overview</h1>
+      <div>
+        <button class="btn" onclick="openScanModal()">+ New Scan</button>
       </div>
     </div>
+    <div class="content" id="view-root">
+      <div class="empty"><div class="spinner"></div></div>
+    </div>
+  </main>
+</div>
+
+<!-- Quick scan modal -->
+<div class="modal-overlay" id="scan-modal">
+  <div class="modal">
+    <h2>Start a new scan</h2>
+    <form id="quick-scan-form">
+      <div class="form-row">
+        <label>URL or IP</label>
+        <input class="input" name="host" placeholder="https://myapp.com or 1.2.3.4" required>
+      </div>
+      <div class="form-row">
+        <label>Label (optional)</label>
+        <input class="input" name="label" placeholder="my-project">
+      </div>
+      <div class="actions">
+        <button type="button" class="btn btn-outline btn-sm" onclick="closeScanModal()">Cancel</button>
+        <button type="submit" class="btn">Scan now</button>
+      </div>
+    </form>
   </div>
 </div>
 
 <script>
-let currentRunId = null;
-let allFindings = [];
-let targetDiffs = {};
-let activeFilter = 'ALL';
-let pollInterval = null;
-let targetsCache = [];
+// ─── Router ──────────────────────────────────────────────────────────────────
+let user = null;
+let currentView = "overview";
 
-function switchTab(tab) {
-  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-  document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
-  document.getElementById(`panel-${tab}`).classList.add('active');
+function go(view, param) {
+  currentView = view;
+  const url = param ? `#${view}/${param}` : `#${view}`;
+  if (location.hash !== url) location.hash = url;
+  document.querySelectorAll(".nav-item").forEach(el => {
+    el.classList.toggle("active", el.dataset.view === view);
+  });
+  const titles = {
+    overview: "Overview", scans: "Scans", findings: "Findings", targets: "Targets",
+    monitors: "Monitors", code: "Code Review", mobile: "Mobile Apps",
+    keys: "API Keys", integrations: "Integrations", billing: "Billing", "scan-detail": "Scan Results"
+  };
+  document.getElementById("page-title").textContent = titles[view] || view;
+  const handler = VIEWS[view] || VIEWS.overview;
+  handler(param);
 }
 
-async function fetchJSON(url, opts) {
-  const r = await fetch(url, opts);
-  return r.json();
+window.addEventListener("hashchange", () => {
+  const [v, p] = location.hash.slice(1).split("/");
+  if (v) go(v, p);
+});
+
+// ─── API helper ──────────────────────────────────────────────────────────────
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (r.status === 401) { location.href = "/login"; return; }
+  const ct = r.headers.get("content-type") || "";
+  return ct.includes("json") ? await r.json() : await r.text();
 }
 
-// ── Targets ──
+function esc(s) { return (s||"").toString().replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function fmtTime(s) { if (!s) return ""; const d = new Date(s); const now = new Date(); const diff = (now - d) / 1000; if (diff < 60) return "just now"; if (diff < 3600) return Math.floor(diff/60) + "m ago"; if (diff < 86400) return Math.floor(diff/3600) + "h ago"; return d.toLocaleDateString(); }
 
-async function loadTargets() {
-  const targets = await fetchJSON('/api/targets');
-  targetsCache = targets;
-  const el = document.getElementById('targets-list');
-  if (!targets.length) {
-    el.innerHTML = '<div class="empty">No targets configured. Add a target above.</div>';
-    return;
-  }
-  el.innerHTML = targets.map(t => `
-    <div class="target-card">
-      <div>
-        <div class="target-host">${escHtml(t.host)}</div>
-        ${t.label && t.label !== t.host ? `<div class="target-label">${escHtml(t.label)}</div>` : ''}
-        <div class="target-added">Added ${new Date(t.added_at).toLocaleDateString()}</div>
-      </div>
-      <button class="btn-icon" onclick="removeTarget(${t.id})" title="Remove target">&times;</button>
+// ─── Overview view ───────────────────────────────────────────────────────────
+const VIEWS = {};
+
+VIEWS.overview = async () => {
+  const root = document.getElementById("view-root");
+  root.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+  const d = await api("/api/overview");
+  if (!d) return;
+  user = d.user;
+  renderUser();
+  const s = d.severity_counts;
+  root.innerHTML = `
+    <div class="page-title">
+      <h1>Hi ${esc(user.name || user.email)}</h1>
+      <div class="sub">You're on <span class="plan-pill ${user.plan}">${esc(user.plan)}</span> plan${user.plan === "payg" ? " · " + user.credits + " scan credits" : ""}</div>
     </div>
-  `).join('');
-}
 
-async function addTarget() {
-  const hostEl = document.getElementById('new-target-host');
-  const labelEl = document.getElementById('new-target-label');
-  const host = hostEl.value.trim();
-  if (!host) { hostEl.focus(); return; }
-  const label = labelEl.value.trim();
-  const res = await fetch('/api/targets', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({host, label})
-  });
-  const data = await res.json();
-  if (res.ok) {
-    hostEl.value = '';
-    labelEl.value = '';
-    await loadTargets();
-  } else {
-    alert(data.error || 'Failed to add target');
-  }
-}
+    <div class="grid grid-cards" style="margin-bottom: 24px;">
+      <div class="stat-card"><div class="label">Targets</div><div class="value">${d.targets_count}</div><div class="sub">of ${d.limits.max_targets} allowed</div></div>
+      <div class="stat-card"><div class="label">Scans this month</div><div class="value">${d.monthly_scans}</div><div class="sub">${d.total_runs} total</div></div>
+      <div class="stat-card"><div class="label">Active monitors</div><div class="value">${d.monitors_count}</div><div class="sub">Daily/weekly auto-scan</div></div>
+      <div class="stat-card crit"><div class="label">Critical + High</div><div class="value">${s.CRITICAL + s.HIGH}</div><div class="sub">${s.CRITICAL} critical, ${s.HIGH} high</div></div>
+    </div>
 
-async function removeTarget(id) {
-  if (!confirm('Remove this target?')) return;
-  await fetch(`/api/targets/${id}`, {method: 'DELETE'});
-  await loadTargets();
-}
+    <div class="grid grid-2" style="margin-bottom: 24px;">
+      <div class="card">
+        <h2>Recent critical findings</h2>
+        ${d.recent_critical.length ? `
+          <table class="table">
+            <tbody>
+              ${d.recent_critical.slice(0, 6).map(f => `
+                <tr onclick="go('scan-detail','${f.run_id}')" style="cursor:pointer;">
+                  <td><span class="badge ${f.severity || 'HIGH'}">${f.severity || 'HIGH'}</span></td>
+                  <td>${esc(f.title)}</td>
+                  <td class="mono">${esc(f.target)}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>` : '<div class="empty" style="padding:32px 10px;"><p>No critical findings. Well done.</p></div>'}
+      </div>
+      <div class="card">
+        <h2>Recent scans</h2>
+        ${d.recent_scans.length ? `
+          <table class="table">
+            <tbody>
+              ${d.recent_scans.map(r => {
+                const sum = r.summary_json ? JSON.parse(r.summary_json) : {};
+                return `<tr onclick="go('scan-detail','${r.id}')" style="cursor:pointer;">
+                  <td class="mono">#${r.id}</td>
+                  <td><span class="status-badge ${r.status}">${r.status}</span></td>
+                  <td>${esc(r.scan_type || 'full')}</td>
+                  <td class="mono" style="text-align:right;">${sum.total || 0} findings</td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>` : '<div class="empty" style="padding:32px 10px;"><p>No scans yet. Click New Scan above.</p></div>'}
+      </div>
+    </div>
 
-// ── Scans ──
-
-async function loadRuns() {
-  const runs = await fetchJSON('/api/runs');
-  const el = document.getElementById('runs-list');
-  if (!runs.length) { el.innerHTML = '<div class="empty">No scans yet.</div>'; return; }
-
-  el.innerHTML = runs.map(r => {
-    const summary = r.summary_json ? JSON.parse(r.summary_json) : null;
-    const badges = summary ? `
-      ${summary.critical ? `<span class="badge CRITICAL">${summary.critical} CRIT</span>` : ''}
-      ${summary.high ? `<span class="badge HIGH">${summary.high} HIGH</span>` : ''}
-      ${summary.medium ? `<span class="badge MEDIUM">${summary.medium} MED</span>` : ''}
-      ${summary.low ? `<span class="badge LOW">${summary.low} LOW</span>` : ''}
-      ${summary.info ? `<span class="badge INFO">${summary.info} INFO</span>` : ''}
-    ` : '';
-    const time = new Date(r.started_at).toLocaleString();
-    const duration = r.finished_at ? Math.round((new Date(r.finished_at) - new Date(r.started_at)) / 1000) + 's' : '';
-    return `
-      <div class="run-card ${r.id === currentRunId ? 'active' : ''}" onclick="viewRun('${r.id}')">
-        <div class="run-meta">
-          <span class="run-id">#${r.id}</span>
-          <span class="run-status ${r.status}">${r.status === 'running' ? '<span class=spinner></span> running' : r.status}</span>
-          <span class="run-time">${time} ${duration ? '(' + duration + ')' : ''}</span>
-        </div>
-        <div class="run-badges">${badges}</div>
-      </div>`;
-  }).join('');
-
-  // Poll for running scans
-  const running = runs.find(r => r.status === 'running');
-  if (running && !pollInterval) {
-    pollInterval = setInterval(async () => {
-      await loadRuns();
-      const updated = (await fetchJSON('/api/runs')).find(r => r.id === running.id);
-      if (updated && updated.status !== 'running') {
-        clearInterval(pollInterval);
-        pollInterval = null;
-        document.getElementById('scan-btn').disabled = false;
-        document.getElementById('scan-status').textContent = '';
-        viewRun(updated.id);
-      }
-    }, 5000);
-  }
-}
-
-async function viewRun(runId) {
-  currentRunId = runId;
-  switchTab('results');
-  await loadRunResults(runId);
-  await loadRuns(); // refresh highlighting
-}
-
-async function loadRunResults(runId) {
-  const data = await fetchJSON(`/api/runs/${runId}`);
-  allFindings = data.findings;
-  targetDiffs = data.target_diffs || {};
-
-  document.getElementById('results-empty').style.display = 'none';
-  document.getElementById('results-content').style.display = 'block';
-  document.getElementById('results-title').textContent = `Results — Run #${runId}`;
-
-  // Stats
-  const summary = data.run.summary_json ? JSON.parse(data.run.summary_json) : null;
-  const statsEl = document.getElementById('stats');
-  if (summary) {
-    statsEl.innerHTML = `
-      <div class="stat"><div class="label">Total</div><div class="value">${summary.total}</div></div>
-      <div class="stat critical"><div class="label">Critical</div><div class="value">${summary.critical}</div></div>
-      <div class="stat high"><div class="label">High</div><div class="value">${summary.high}</div></div>
-      <div class="stat medium"><div class="label">Medium</div><div class="value">${summary.medium}</div></div>
-      <div class="stat low"><div class="label">Low</div><div class="value">${summary.low}</div></div>
-      <div class="stat info"><div class="label">Info</div><div class="value">${summary.info}</div></div>
-    `;
-  }
-
-  // Filters
-  const targets = [...new Set(allFindings.map(f => f.target))];
-  const filtersEl = document.getElementById('filters');
-  filtersEl.innerHTML = `
-    <button class="filter-btn ${activeFilter === 'ALL' ? 'active' : ''}" onclick="setFilter('ALL')">All</button>
-    <button class="filter-btn ${activeFilter === 'CRITICAL' ? 'active' : ''}" onclick="setFilter('CRITICAL')">Critical</button>
-    <button class="filter-btn ${activeFilter === 'HIGH' ? 'active' : ''}" onclick="setFilter('HIGH')">High</button>
-    <button class="filter-btn ${activeFilter === 'MEDIUM' ? 'active' : ''}" onclick="setFilter('MEDIUM')">Medium</button>
-    ${targets.map(t => `<button class="filter-btn ${activeFilter === t ? 'active' : ''}" onclick="setFilter('${t}')">${t}</button>`).join('')}
-  `;
-
-  renderResults();
-
-  // Fix actions
-  const fixEl = document.getElementById('fix-actions');
-  let fixBtns = `<a class="btn btn-sm btn-blue" href="/api/runs/${runId}/fix-all" download>Download Fix File (All Targets)</a>`;
-  targets.forEach(t => {
-    fixBtns += ` <a class="btn btn-sm btn-outline" href="/api/runs/${runId}/fix/${encodeURIComponent(t)}" download>Fix: ${escHtml(t)}</a>`;
-  });
-  fixEl.innerHTML = fixBtns;
-}
-
-function setFilter(f) {
-  activeFilter = f;
-  if (currentRunId) loadRunResults(currentRunId);
-}
-
-function getGrade(findings) {
-  const sevs = new Set(findings.map(f => f.severity));
-  if (sevs.has('CRITICAL')) return 'F';
-  if (sevs.has('HIGH')) return 'C';
-  if (sevs.has('MEDIUM')) return 'B';
-  return 'A';
-}
-
-function getTargetLabel(host) {
-  const t = targetsCache.find(t => t.host === host);
-  return t && t.label && t.label !== t.host ? t.label : '';
-}
-
-function renderResults() {
-  let filtered = allFindings;
-  if (activeFilter === 'CRITICAL') filtered = allFindings.filter(f => f.severity === 'CRITICAL');
-  else if (activeFilter === 'HIGH') filtered = allFindings.filter(f => f.severity === 'HIGH');
-  else if (activeFilter === 'MEDIUM') filtered = allFindings.filter(f => f.severity === 'MEDIUM');
-  else if (activeFilter !== 'ALL') filtered = allFindings.filter(f => f.target === activeFilter);
-
-  // Group by target
-  const byTarget = {};
-  filtered.forEach(f => {
-    if (!byTarget[f.target]) byTarget[f.target] = [];
-    byTarget[f.target].push(f);
-  });
-
-  const resultsEl = document.getElementById('target-results');
-
-  if (!filtered.length) {
-    resultsEl.innerHTML = '<div class="empty">No findings match the current filter.</div>';
-    return;
-  }
-
-  let html = '';
-  Object.entries(byTarget).forEach(([target, findings]) => {
-    const grade = getGrade(findings);
-    const label = getTargetLabel(target);
-    const counts = {CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0};
-    findings.forEach(f => { if (counts[f.severity] !== undefined) counts[f.severity]++; });
-
-    html += `<div class="target-result-card">`;
-    html += `<div class="target-result-header">`;
-    html += `<div class="target-result-title">
-      <span class="grade grade-${grade}">${grade}</span>
-      <div>
-        <div class="target-result-host">${escHtml(target)}</div>
-        ${label ? `<div class="target-result-label">${escHtml(label)}</div>` : ''}
+    <div class="card">
+      <h2>Scanning capabilities</h2>
+      <div class="grid grid-cards" style="gap:12px;">
+        ${[
+          ['&#128065;', 'Network', 'nmap, TLS, DNS'],
+          ['&#9993;', 'Email DNS', 'SPF, DMARC, CAA'],
+          ['&#128275;', 'Secrets', '22 provider patterns'],
+          ['&#128202;', 'Headers', 'CSP, CORS, HSTS'],
+          ['&#128279;', 'Endpoints', '/docs, /.env, /.git'],
+          ['&#129504;', 'LLM security', 'Prompt injection, jailbreak'],
+          ['&#128736;', 'BaaS audit', 'Supabase RLS, Firebase'],
+          ['&#127760;', 'Subdomains', 'CT log enumeration'],
+          ['&#128274;', 'JWT', 'Alg confusion, weak secrets'],
+          ['&#9999;', 'Rate limit', 'Brute force resistance'],
+          ['&#128269;', 'Exploit tests', 'SSRF, traversal, XSS (opt-in)'],
+          ['&#128187;', 'Code review', 'GitHub repo scan'],
+        ].map(([i, n, d]) => `<div class="card-sm" style="background:var(--sidebar);border:1px solid var(--border);border-radius:8px;padding:12px;"><div style="font-size:1.2rem;margin-bottom:4px;">${i}</div><div style="font-weight:600;font-size:0.85rem;">${n}</div><div style="color:var(--text-muted);font-size:0.75rem;margin-top:2px;">${d}</div></div>`).join('')}
       </div>
     </div>`;
-    html += `<div class="severity-counts">
-      ${counts.CRITICAL ? `<span class="badge CRITICAL">${counts.CRITICAL} CRIT</span>` : ''}
-      ${counts.HIGH ? `<span class="badge HIGH">${counts.HIGH} HIGH</span>` : ''}
-      ${counts.MEDIUM ? `<span class="badge MEDIUM">${counts.MEDIUM} MED</span>` : ''}
-      ${counts.LOW ? `<span class="badge LOW">${counts.LOW} LOW</span>` : ''}
-      ${counts.INFO ? `<span class="badge INFO">${counts.INFO} INFO</span>` : ''}
-    </div>`;
-    // Per-target diff vs previous scan
-    const diff = targetDiffs[target];
-    if (diff) {
-      html += `<div class="target-diff">`;
-      if (diff.new_count > 0) html += `<span class="diff-new">+${diff.new_count} new</span>`;
-      if (diff.fixed_count > 0) html += `<span class="diff-fixed">${diff.fixed_count} fixed</span>`;
-      html += `<span class="diff-unchanged">${diff.persistent_count} unchanged</span>`;
-      html += `<span class="diff-prev">vs #${diff.prev_run_id}</span>`;
-      html += `</div>`;
-    }
+};
 
-    html += `</div>`; // header
+// ─── Scans view ──────────────────────────────────────────────────────────────
+VIEWS.scans = async () => {
+  const root = document.getElementById("view-root");
+  const runs = await api("/api/runs");
+  if (!runs || runs.error) { root.innerHTML = `<div class="empty"><p>Could not load scans</p></div>`; return; }
+  root.innerHTML = `
+    <div class="page-title"><h1>Scans</h1><div class="sub">${runs.length} total</div></div>
+    ${runs.length ? `
+      <div class="card" style="padding:0;overflow:hidden;">
+        <table class="table">
+          <thead><tr><th>ID</th><th>Started</th><th>Type</th><th>Status</th><th>Findings</th><th></th></tr></thead>
+          <tbody>
+            ${runs.map(r => {
+              const s = r.summary_json ? JSON.parse(r.summary_json) : {};
+              return `<tr onclick="go('scan-detail','${r.id}')" style="cursor:pointer;">
+                <td class="mono">#${r.id}</td>
+                <td>${fmtTime(r.started_at)}</td>
+                <td>${esc(r.scan_type || 'full')}</td>
+                <td><span class="status-badge ${r.status}">${r.status}</span></td>
+                <td>
+                  ${s.critical ? `<span class="badge CRITICAL">${s.critical} CRIT</span>` : ''}
+                  ${s.high ? `<span class="badge HIGH">${s.high}</span>` : ''}
+                  ${s.medium ? `<span class="badge MEDIUM">${s.medium}</span>` : ''}
+                  ${s.low ? `<span class="badge LOW">${s.low}</span>` : ''}
+                  ${!s.total ? '<span style="color:var(--text-muted);">-</span>' : ''}
+                </td>
+                <td style="text-align:right;"><span style="color:var(--text-muted);">&#8250;</span></td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>` : `<div class="empty"><h3>No scans yet</h3><p>Click "New Scan" to start your first security scan.</p><button class="btn" onclick="openScanModal()">Start first scan</button></div>`}
+  `;
+};
 
-    // Findings grouped by severity
-    const sevOrder = ['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
-    sevOrder.forEach(sev => {
-      const sevFindings = findings.filter(f => f.severity === sev);
-      if (!sevFindings.length) return;
-      sevFindings.forEach(f => {
-        html += `<div class="finding-row" onclick="this.classList.toggle('open')">
-          <div class="finding-summary">
-            <span class="badge ${f.severity}">${f.severity}</span>
-            <span class="finding-title">${escHtml(f.title)}</span>
-            <span class="finding-tool">${escHtml(f.tool)}</span>
-            <span class="finding-chevron">&#9654;</span>
+// ─── Scan detail view ────────────────────────────────────────────────────────
+VIEWS["scan-detail"] = async (runId) => {
+  const root = document.getElementById("view-root");
+  if (!runId) { go("scans"); return; }
+  root.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+  const d = await api(`/api/runs/${runId}`);
+  if (!d || d.error) { root.innerHTML = `<div class="empty"><p>Scan not found</p></div>`; return; }
+
+  const byTarget = {};
+  (d.findings || []).forEach(f => { (byTarget[f.target] = byTarget[f.target] || []).push(f); });
+  const diffs = d.target_diffs || {};
+  const sumAll = d.run.summary_json ? JSON.parse(d.run.summary_json) : {};
+
+  const gradeFor = (findings) => {
+    const crit = findings.filter(f => f.severity === 'CRITICAL').length;
+    const high = findings.filter(f => f.severity === 'HIGH').length;
+    const med = findings.filter(f => f.severity === 'MEDIUM').length;
+    if (crit) return 'F';
+    if (high) return 'C';
+    if (med) return 'B';
+    return 'A';
+  };
+
+  root.innerHTML = `
+    <div class="page-title">
+      <div style="display:flex;align-items:center;gap:12px;"><h1>Scan #${runId}</h1><span class="status-badge ${d.run.status}">${d.run.status}</span></div>
+      <div class="sub">${fmtTime(d.run.started_at)} · ${esc(d.run.scan_type || 'full')}</div>
+    </div>
+
+    <div class="grid grid-cards" style="margin-bottom:20px;">
+      <div class="stat-card crit"><div class="label">Critical</div><div class="value">${sumAll.critical || 0}</div></div>
+      <div class="stat-card high"><div class="label">High</div><div class="value">${sumAll.high || 0}</div></div>
+      <div class="stat-card med"><div class="label">Medium</div><div class="value">${sumAll.medium || 0}</div></div>
+      <div class="stat-card"><div class="label">Low/Info</div><div class="value">${(sumAll.low || 0) + (sumAll.info || 0)}</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+        <div>
+          <h2 style="margin-bottom:4px;">AI Analysis &amp; Fix File</h2>
+          <div style="color:var(--text-muted);font-size:0.8rem;">Claude-powered executive summary + attack chains + Claude Code-ready fix instructions</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-outline btn-sm" onclick="analyze('${runId}')">Run AI Analysis</button>
+          <a class="btn btn-sm" href="/v1/scan/${runId}/fix" download="SECURITY-FIX.md">Download SECURITY-FIX.md</a>
+        </div>
+      </div>
+      <div id="ai-result" style="margin-top:14px;"></div>
+    </div>
+
+    ${Object.entries(byTarget).map(([target, findings]) => {
+      const grade = gradeFor(findings);
+      const counts = {CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,INFO:0};
+      findings.forEach(f => counts[f.severity]++);
+      const diff = diffs[target];
+      return `
+        <div class="target-card">
+          <div class="target-card-head">
+            <div style="display:flex;align-items:center;gap:14px;">
+              <div class="grade grade-${grade}">${grade}</div>
+              <div>
+                <h3>${esc(target)}</h3>
+                ${diff ? `<div class="host">+${diff.new_count} new · ${diff.fixed_count} fixed · ${diff.persistent_count} unchanged · vs #${diff.prev_run_id}</div>` : ''}
+              </div>
+            </div>
+            <div style="display:flex;gap:4px;">
+              ${counts.CRITICAL ? `<span class="badge CRITICAL">${counts.CRITICAL} CRIT</span>` : ''}
+              ${counts.HIGH ? `<span class="badge HIGH">${counts.HIGH} HIGH</span>` : ''}
+              ${counts.MEDIUM ? `<span class="badge MEDIUM">${counts.MEDIUM} MED</span>` : ''}
+              ${counts.LOW ? `<span class="badge LOW">${counts.LOW} LOW</span>` : ''}
+              ${counts.INFO ? `<span class="badge INFO">${counts.INFO} INFO</span>` : ''}
+            </div>
           </div>
-          <div class="finding-details">
-            <dl>
-              ${f.description ? `<dt>Description</dt><dd>${escHtml(f.description)}</dd>` : ''}
-              ${f.evidence ? `<dt>Evidence</dt><dd>${escHtml(f.evidence)}</dd>` : ''}
-              <dt>Category</dt><dd>${escHtml(f.category)}</dd>
-            </dl>
+          <div class="target-card-body">
+            ${['CRITICAL','HIGH','MEDIUM','LOW','INFO'].map(sev =>
+              findings.filter(f => f.severity === sev).map(f => `
+                <div class="finding" onclick="this.classList.toggle('open')">
+                  <div class="finding-head">
+                    <span class="badge ${f.severity}">${f.severity}</span>
+                    <span class="finding-title">${esc(f.title)}</span>
+                    <span class="finding-tool">${esc(f.tool)}</span>
+                    <span class="finding-chev">&#9654;</span>
+                  </div>
+                  <div class="finding-body">
+                    ${f.description ? `<dt>Description</dt><dd>${esc(f.description)}</dd>` : ''}
+                    ${f.evidence ? `<dt>Evidence</dt><dd>${esc(f.evidence)}</dd>` : ''}
+                    <dt>Category</dt><dd>${esc(f.category)}</dd>
+                  </div>
+                </div>`).join('')).join('')}
+            <div style="margin-top:10px;"><a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">Download fix for ${esc(target)}</a></div>
           </div>
         </div>`;
-      });
-    });
+    }).join('')}
+  `;
+};
 
-    html += `</div>`; // card
-  });
-
-  resultsEl.innerHTML = html;
+async function analyze(runId) {
+  const box = document.getElementById("ai-result");
+  box.innerHTML = '<div class="spinner"></div> Asking Claude to analyze...';
+  const d = await api(`/v1/scan/${runId}/analyze`, {method: 'POST'});
+  if (!d) return;
+  if (d.error) { box.innerHTML = `<div style="color:var(--critical);">${esc(d.error)}</div>`; return; }
+  const content = d.content || "";
+  box.innerHTML = `
+    <div style="margin-bottom:8px;color:var(--text-muted);font-size:0.75rem;">Model: ${esc(d.model || "claude")}${d.cached ? " (cached)" : ""}</div>
+    <pre style="background:#0a0e17;border:1px solid var(--border);padding:16px;border-radius:8px;white-space:pre-wrap;font-size:0.78rem;color:var(--text-dim);max-height:500px;overflow:auto;">${esc(content)}</pre>`;
 }
 
-async function startScan() {
-  const btn = document.getElementById('scan-btn');
-  btn.disabled = true;
-  document.getElementById('scan-status').innerHTML = '<span class="spinner"></span> Scanning...';
+// ─── Targets view ────────────────────────────────────────────────────────────
+VIEWS.targets = async () => {
+  const root = document.getElementById("view-root");
+  const targets = await api("/api/targets");
+  if (!targets || targets.error) { root.innerHTML = `<div class="empty"><p>Could not load</p></div>`; return; }
+  root.innerHTML = `
+    <div class="page-title"><h1>Targets</h1><div class="sub">URLs and IPs you've authorized for scanning</div></div>
 
-  const data = await fetchJSON('/api/scan', { method: 'POST' });
-  if (data.error) {
-    alert(data.error);
-    btn.disabled = false;
-    document.getElementById('scan-status').textContent = '';
-    return;
+    <div class="card" style="margin-bottom:20px;">
+      <h2>Add a target</h2>
+      <form id="add-target-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <div style="flex:1;min-width:220px;"><label>Host</label><input class="input" name="host" placeholder="https://myapp.com" required></div>
+        <div style="flex:1;min-width:180px;"><label>Label</label><input class="input" name="label" placeholder="my-project"></div>
+        <button class="btn">Add</button>
+      </form>
+    </div>
+
+    <div class="card" style="padding:0;">
+      ${targets.length ? `<table class="table">
+        <thead><tr><th>Host</th><th>Label</th><th>Added</th><th></th></tr></thead>
+        <tbody>
+          ${targets.map(t => `<tr>
+            <td class="mono">${esc(t.host)}</td>
+            <td>${esc(t.label || '-')}</td>
+            <td>${fmtTime(t.added_at)}</td>
+            <td style="text-align:right;"><button class="btn-danger btn-sm" onclick="delTarget(${t.id})">Remove</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>` : `<div class="empty"><p>No targets yet.</p></div>`}
+    </div>`;
+  document.getElementById("add-target-form").onsubmit = async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const r = await api("/api/targets", {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({host: fd.get('host'), label: fd.get('label')})});
+    if (r && r.error) alert(r.error); else VIEWS.targets();
+  };
+};
+
+async function delTarget(id) {
+  if (!confirm("Remove this target?")) return;
+  await api(`/api/targets/${id}`, {method:'DELETE'});
+  VIEWS.targets();
+}
+
+// ─── Findings explorer ───────────────────────────────────────────────────────
+let findingsFilter = "ALL";
+VIEWS.findings = async () => {
+  const root = document.getElementById("view-root");
+  const runs = await api("/api/runs");
+  if (!runs) return;
+  // Aggregate latest finding per target+title
+  const all = [];
+  for (const r of runs.slice(0, 20)) {
+    const d = await api(`/api/runs/${r.id}`);
+    if (d && d.findings) {
+      d.findings.forEach(f => all.push({...f, run_id: r.id, run_started: r.started_at}));
+    }
   }
-  currentRunId = data.run_id;
-  switchTab('scans');
-  await loadRuns();
+  const filtered = findingsFilter === "ALL" ? all : all.filter(f => f.severity === findingsFilter);
+  root.innerHTML = `
+    <div class="page-title"><h1>Findings</h1><div class="sub">Every finding across your 20 most recent scans</div></div>
+    <div class="filter-bar">
+      ${['ALL','CRITICAL','HIGH','MEDIUM','LOW','INFO'].map(s => `<span class="chip ${findingsFilter===s?'active':''}" onclick="findingsFilter='${s}';VIEWS.findings();">${s}${s!=='ALL' ? ' ('+all.filter(f=>f.severity===s).length+')' : ''}</span>`).join('')}
+    </div>
+    <div class="card" style="padding:0;">
+      ${filtered.length ? `<table class="table">
+        <thead><tr><th>Sev</th><th>Title</th><th>Target</th><th>Tool</th><th>Scan</th></tr></thead>
+        <tbody>
+          ${filtered.slice(0, 200).map(f => `<tr onclick="go('scan-detail','${f.run_id}')" style="cursor:pointer;">
+            <td><span class="badge ${f.severity}">${f.severity}</span></td>
+            <td>${esc(f.title)}</td>
+            <td class="mono">${esc(f.target)}</td>
+            <td class="mono">${esc(f.tool)}</td>
+            <td class="mono">#${f.run_id}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>` : `<div class="empty"><p>No findings match this filter.</p></div>`}
+    </div>`;
+};
+
+// ─── Monitors view ───────────────────────────────────────────────────────────
+VIEWS.monitors = async () => {
+  const root = document.getElementById("view-root");
+  const ms = await api("/api/monitors");
+  const upgradeRequired = ms && ms.error && ms.error.includes("plan");
+  root.innerHTML = `
+    <div class="page-title"><h1>Monitors</h1><div class="sub">Schedule recurring scans with email/webhook alerts on changes</div></div>
+    ${upgradeRequired ? `
+      <div class="card" style="border-color:var(--brand);">
+        <h2>Monitoring requires Monthly or Pro</h2>
+        <p style="color:var(--text-dim);margin-bottom:14px;">Automatic recurring scans, cert expiry alerts, new-finding notifications.</p>
+        <a href="#billing" class="btn">See plans</a>
+      </div>` : `
+      <div class="card" style="margin-bottom:20px;">
+        <h2>Create monitor</h2>
+        <form id="add-monitor-form">
+          <div class="form-row"><label>Target</label><input class="input" name="target" placeholder="https://myapp.com" required></div>
+          <div class="grid grid-2">
+            <div class="form-row"><label>Frequency</label><select class="input" name="frequency"><option value="weekly">Weekly</option><option value="daily">Daily</option></select></div>
+            <div class="form-row"><label>Alert email</label><input class="input" name="alert_email" placeholder="you@example.com"></div>
+          </div>
+          <div class="form-row"><label>Alert webhook (optional, Slack/Discord/custom)</label><input class="input" name="alert_webhook" placeholder="https://hooks.slack.com/..."></div>
+          <div class="form-row"><label>Alert on cert expiry within (days)</label><input class="input" name="alert_on_cert_expiry_days" type="number" value="30"></div>
+          <button class="btn">Create monitor</button>
+        </form>
+      </div>
+      <div class="card" style="padding:0;">
+        ${ms && ms.length ? `<table class="table">
+          <thead><tr><th>Target</th><th>Frequency</th><th>Last run</th><th>Alert</th><th></th></tr></thead>
+          <tbody>
+            ${ms.map(m => `<tr>
+              <td class="mono">${esc(m.target)}</td>
+              <td>${esc(m.frequency)}</td>
+              <td>${m.last_run_at ? fmtTime(m.last_run_at) : '<span style="color:var(--text-muted);">never</span>'}</td>
+              <td class="mono" style="font-size:0.75rem;color:var(--text-muted);">${esc(m.alert_email || m.alert_webhook || '-')}</td>
+              <td style="text-align:right;"><button class="btn-danger btn-sm" onclick="delMonitor(${m.id})">Remove</button></td>
+            </tr>`).join('')}
+          </tbody>
+        </table>` : '<div class="empty"><p>No monitors yet.</p></div>'}
+      </div>`}`;
+
+  const form = document.getElementById("add-monitor-form");
+  if (form) form.onsubmit = async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const r = await api("/api/monitors", {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(Object.fromEntries(fd))});
+    if (r && r.error) alert(r.error); else VIEWS.monitors();
+  };
+};
+
+async function delMonitor(id) {
+  if (!confirm("Delete this monitor?")) return;
+  await api(`/api/monitors/${id}`, {method:'DELETE'});
+  VIEWS.monitors();
 }
 
-function copyPrompt() {
-  const text = 'Read SECURITY-FIX.md and implement all the fixes described. Start with CRITICAL issues, then HIGH, then MEDIUM. Run tests and deploy after each fix.';
-  navigator.clipboard.writeText(text).then(() => {
-    const btn = document.querySelector('.copy-btn');
-    btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
-  });
+// ─── Code Review view ────────────────────────────────────────────────────────
+VIEWS.code = async () => {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="page-title"><h1>Code Review</h1><div class="sub">Scan a GitHub repo's source for secrets, dependency CVEs, and IaC issues</div></div>
+    <div class="card" style="margin-bottom:20px;">
+      <h2>Scan a GitHub repository</h2>
+      <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:14px;">We clone (shallow depth=1), scan for committed secrets, run npm-audit/pip-audit for dependency CVEs, and inspect Terraform files for open security groups.</p>
+      <form id="github-scan-form">
+        <div class="form-row"><label>Repo URL</label><input class="input" name="repo_url" placeholder="https://github.com/owner/repo" required pattern="^https://github\\.com/[\\w\\-]+/[\\w\\-\\.]+/?$"></div>
+        <div class="form-row"><label>GitHub token (for private repos, optional)</label><input class="input" name="github_token" type="password" placeholder="ghp_..."></div>
+        <button class="btn">Scan repo</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Recent code scans</h2>
+      <p style="color:var(--text-muted);font-size:0.85rem;">Code scans appear in your <a href="#scans" style="color:var(--brand);">Scans</a> list with type=code.</p>
+    </div>`;
+
+  document.getElementById("github-scan-form").onsubmit = async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const r = await api("/api/github/scan", {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({repo_url: fd.get("repo_url"), github_token: fd.get("github_token")})});
+    if (r && r.error) { alert(r.error); return; }
+    if (r && r.run_id) go("scan-detail", r.run_id);
+  };
+};
+
+// ─── Mobile view ─────────────────────────────────────────────────────────────
+VIEWS.mobile = async () => {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="page-title"><h1>Mobile Apps</h1><div class="sub">Upload IPA or APK. We scan for hardcoded secrets, cleartext traffic, and ATS bypass.</div></div>
+    <div class="card">
+      <h2>Upload mobile binary</h2>
+      <form id="mobile-form" enctype="multipart/form-data">
+        <div class="form-row"><label>File (.ipa or .apk, max 200MB)</label><input class="input" name="file" type="file" accept=".ipa,.apk" required></div>
+        <button class="btn">Scan mobile app</button>
+      </form>
+      <div id="mobile-status" style="margin-top:14px;"></div>
+    </div>`;
+  document.getElementById("mobile-form").onsubmit = async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    document.getElementById("mobile-status").innerHTML = '<div class="spinner"></div> Uploading...';
+    const r = await fetch("/api/mobile/scan", {method:'POST', body: fd});
+    const d = await r.json();
+    if (d.error) { document.getElementById("mobile-status").innerHTML = `<div style="color:var(--critical);">${esc(d.error)}</div>`; return; }
+    if (d.run_id) go("scan-detail", d.run_id);
+  };
+};
+
+// ─── API Keys view ───────────────────────────────────────────────────────────
+VIEWS.keys = async () => {
+  const root = document.getElementById("view-root");
+  const keys = await api("/api/keys");
+  root.innerHTML = `
+    <div class="page-title"><h1>API Keys</h1><div class="sub">Use these in the MCP server, ChatGPT GPT, or direct API calls</div></div>
+    <div class="card" style="margin-bottom:20px;">
+      <h2>Create new key</h2>
+      <form id="key-form" style="display:flex;gap:8px;align-items:flex-end;">
+        <div style="flex:1;"><label>Label</label><input class="input" name="label" placeholder="claude-code, chatgpt, etc."></div>
+        <button class="btn">Generate</button>
+      </form>
+      <div id="new-key-out"></div>
+    </div>
+    <div class="card" style="padding:0;">
+      ${(keys || []).length ? `<table class="table">
+        <thead><tr><th>Prefix</th><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+        <tbody>
+          ${keys.map(k => `<tr>
+            <td class="mono">${esc(k.key_prefix)}...</td>
+            <td>${esc(k.label || '-')}</td>
+            <td>${fmtTime(k.created_at)}</td>
+            <td>${k.last_used_at ? fmtTime(k.last_used_at) : '<span style="color:var(--text-muted);">never</span>'}</td>
+            <td style="text-align:right;">${k.is_active ? `<button class="btn-danger btn-sm" onclick="revoke(${k.id})">Revoke</button>` : '<span style="color:var(--text-muted);font-size:0.75rem;">revoked</span>'}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>` : '<div class="empty"><p>No keys yet.</p></div>'}
+    </div>`;
+
+  document.getElementById("key-form").onsubmit = async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const r = await api("/api/keys", {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({label: fd.get("label") || "default"})});
+    if (r && r.key) {
+      document.getElementById("new-key-out").innerHTML = `
+        <div style="background:#14532d;border:1px solid #22c55e;border-radius:8px;padding:14px;margin-top:12px;">
+          <div style="color:#86efac;margin-bottom:8px;font-size:0.8rem;">&#10003; Save this — it won't be shown again:</div>
+          <div class="copy-code">${esc(r.key)}<button class="copy-btn" onclick="navigator.clipboard.writeText('${r.key}');this.textContent='Copied';">Copy</button></div>
+        </div>`;
+      VIEWS.keys();
+    }
+  };
+};
+
+async function revoke(id) {
+  if (!confirm("Revoke this key? Clients using it will stop working.")) return;
+  await api(`/api/keys/${id}`, {method:'DELETE'});
+  VIEWS.keys();
 }
 
-function escHtml(s) {
-  if (!s) return '';
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// ─── Integrations view ───────────────────────────────────────────────────────
+VIEWS.integrations = async () => {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="page-title"><h1>Integrations</h1><div class="sub">Connect Security Scanner to your AI coding tools</div></div>
+    <div class="grid grid-2">
+      <div class="card">
+        <h3>MCP Server</h3>
+        <h2 style="margin-bottom:6px;">Claude Code, Cursor, Cline, Windsurf</h2>
+        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">Add to <code>~/.claude/settings.json</code>:</p>
+        <div class="copy-code" id="mcp-config">{
+  "mcpServers": {
+    "security-scanner": {
+      "command": "uvx",
+      "args": ["security-scanner-mcp"],
+      "env": {"SECURITY_SCANNER_API_KEY": "sk-sec-..."}
+    }
+  }
+}<button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('mcp-config').innerText);this.textContent='Copied';">Copy</button></div>
+        <p style="color:var(--text-muted);font-size:0.8rem;margin-top:10px;">Then type <code>/security-scan</code> in Claude Code.</p>
+      </div>
+      <div class="card">
+        <h3>ChatGPT GPT</h3>
+        <h2 style="margin-bottom:6px;">Use via Custom GPT + Actions</h2>
+        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">We provide an OAuth flow so ChatGPT users can one-click connect.</p>
+        <a class="btn btn-outline" href="/chatgpt-setup">Setup guide</a>
+      </div>
+      <div class="card">
+        <h3>GitHub Copilot</h3>
+        <h2 style="margin-bottom:6px;">Scan from Copilot Chat</h2>
+        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">Install our Copilot Extension from the GitHub Marketplace, then use <code>@security-scanner scan https://myapp.com</code>.</p>
+        <a class="btn btn-outline" href="https://github.com/marketplace" target="_blank">GitHub Marketplace</a>
+      </div>
+      <div class="card">
+        <h3>Vercel</h3>
+        <h2 style="margin-bottom:6px;">Auto-scan on deploy</h2>
+        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">Install our Vercel Integration to scan every deployment automatically.</p>
+        <a class="btn btn-outline" href="https://vercel.com/integrations" target="_blank">Vercel Marketplace</a>
+      </div>
+    </div>
+    <div class="card" style="margin-top:20px;">
+      <h3>Direct API</h3>
+      <h2 style="margin-bottom:6px;">Use our /v1/ API from anywhere</h2>
+      <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:10px;">OpenAPI spec at <a href="/v1/openapi.json" style="color:var(--brand);">/v1/openapi.json</a></p>
+      <div class="copy-code">curl -H "Authorization: Bearer sk-sec-..." \\
+  -X POST https://security.slederer.com/v1/scan \\
+  -d '{"host":"https://myapp.com"}'</div>
+    </div>`;
+};
+
+// ─── Billing view ────────────────────────────────────────────────────────────
+VIEWS.billing = async () => {
+  const root = document.getElementById("view-root");
+  const b = await api("/api/billing/status");
+  root.innerHTML = `
+    <div class="page-title"><h1>Billing</h1><div class="sub">Manage plan and subscriptions</div></div>
+    <div class="card" style="margin-bottom:20px;">
+      <h3>Current plan</h3>
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div>
+          <div style="font-size:1.4rem;font-weight:700;">${(b.plan || 'free').toUpperCase()}</div>
+          ${b.plan === 'payg' ? `<div style="color:var(--text-muted);font-size:0.85rem;">${b.scan_credits} scan credits remaining</div>` : ''}
+          ${b.plan_expires_at ? `<div style="color:var(--text-muted);font-size:0.85rem;">Renews ${fmtTime(b.plan_expires_at)}</div>` : ''}
+        </div>
+        ${b.stripe_customer_id ? '<button class="btn btn-outline" onclick="portal()">Manage subscription</button>' : ''}
+      </div>
+    </div>
+    <div class="grid grid-cards">
+      <div class="card"><h3>Pay as you go</h3><div style="font-size:2rem;font-weight:700;">$9<span style="font-size:0.85rem;color:var(--text-muted);font-weight:400;">/scan</span></div><ul style="list-style:none;margin:12px 0;color:var(--text-dim);font-size:0.85rem;"><li>✓ 1 scan with AI analysis</li><li>✓ Up to 5 targets</li><li>✓ Claude fix file</li></ul><button class="btn" onclick="checkout('payg')" style="width:100%;">Buy scan</button></div>
+      <div class="card" style="border-color:var(--brand);"><h3 style="color:var(--brand);">Most popular</h3><div style="font-size:1rem;font-weight:600;">Monthly</div><div style="font-size:2rem;font-weight:700;">$29<span style="font-size:0.85rem;color:var(--text-muted);font-weight:400;">/mo</span></div><ul style="list-style:none;margin:12px 0;color:var(--text-dim);font-size:0.85rem;"><li>✓ Weekly auto-scans</li><li>✓ Email summary</li><li>✓ Monitoring + alerts</li><li>✓ Trend tracking</li></ul><button class="btn" onclick="checkout('monthly')" style="width:100%;">Subscribe</button></div>
+      <div class="card"><h3>Pro</h3><div style="font-size:2rem;font-weight:700;">$99<span style="font-size:0.85rem;color:var(--text-muted);font-weight:400;">/mo</span></div><ul style="list-style:none;margin:12px 0;color:var(--text-dim);font-size:0.85rem;"><li>✓ 10 targets</li><li>✓ Daily scans</li><li>✓ Team members</li><li>✓ Webhooks</li></ul><button class="btn" onclick="checkout('pro')" style="width:100%;">Subscribe</button></div>
+    </div>`;
+};
+
+async function checkout(plan) {
+  const d = await api("/api/billing/checkout", {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({plan})});
+  if (d && d.url) location.href = d.url;
+  else if (d && d.error) alert(d.error);
+}
+async function portal() {
+  const d = await api("/api/billing/portal", {method:'POST'});
+  if (d && d.url) location.href = d.url;
 }
 
-// Initial load
-loadTargets();
-loadRuns();
+// ─── Scan modal ──────────────────────────────────────────────────────────────
+function openScanModal() { document.getElementById("scan-modal").classList.add("open"); }
+function closeScanModal() { document.getElementById("scan-modal").classList.remove("open"); }
+document.getElementById("scan-modal").onclick = e => { if (e.target.id === "scan-modal") closeScanModal(); };
+document.getElementById("quick-scan-form").onsubmit = async e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const btn = e.target.querySelector("button[type=submit]");
+  btn.disabled = true; btn.textContent = "Starting...";
+  const r = await api("/v1/scan", {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({host: fd.get("host"), label: fd.get("label")})});
+  btn.disabled = false; btn.textContent = "Scan now";
+  if (r && r.error) { alert(r.error); return; }
+  if (r && r.run_id) {
+    closeScanModal();
+    go("scan-detail", r.run_id);
+  }
+};
+
+// ─── User box rendering ──────────────────────────────────────────────────────
+function renderUser() {
+  if (!user) return;
+  const el = document.getElementById("user-box");
+  el.innerHTML = `
+    <img src="${user.picture || 'https://api.dicebear.com/7.x/initials/svg?seed=' + encodeURIComponent(user.email)}" referrerpolicy="no-referrer">
+    <div style="overflow:hidden;">
+      <div class="name">${esc(user.name || user.email)}</div>
+      <div style="color:var(--text-muted);font-size:0.7rem;">${esc(user.plan)}</div>
+    </div>`;
+}
+
+// ─── Bootstrap ───────────────────────────────────────────────────────────────
+const [initView, initParam] = (location.hash || "#overview").slice(1).split("/");
+go(initView || "overview", initParam);
 </script>
 </body>
-</html>""";
+</html>"""
+
 
 
 _LANDING_HTML = """<!DOCTYPE html>

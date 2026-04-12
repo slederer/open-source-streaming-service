@@ -41,6 +41,8 @@ services:
       PALLYCON_SITE_ID: ${PALLYCON_SITE_ID:-}
       PALLYCON_SITE_KEY: ${PALLYCON_SITE_KEY:-}
       PALLYCON_ACCESS_KEY: ${PALLYCON_ACCESS_KEY:-}
+    volumes:
+      - ./content:/content:ro
     ports:
       - "8080:8080"
 

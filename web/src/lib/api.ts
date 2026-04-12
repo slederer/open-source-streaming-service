@@ -53,6 +53,7 @@ export interface PlaybackInfo {
   drm_widevine_url?: string;
   drm_fairplay_url?: string;
   drm_fairplay_cert_url?: string;
+  stream_id?: string; // Bitmovin Streams ID
 }
 
 async function fetchAPI<T>(path: string): Promise<T> {

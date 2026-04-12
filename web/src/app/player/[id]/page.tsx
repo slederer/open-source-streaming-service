@@ -14,6 +14,7 @@ export default function PlayerPage() {
   const id = params.id as string;
   const [playbackInfo, setPlaybackInfo] = useState<PlaybackInfo | null>(null);
   const [title, setTitle] = useState("");
+  const [streamId, setStreamId] = useState<string | undefined>(undefined);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -34,6 +35,9 @@ export default function PlayerPage() {
 
         setTitle(video.title);
         setPlaybackInfo(playback);
+        if (playback.stream_id) {
+          setStreamId(playback.stream_id);
+        }
       } catch {
         setError("Failed to connect to API");
       }
@@ -65,6 +69,7 @@ export default function PlayerPage() {
         playerKey={PLAYER_KEY}
         analyticsKey={ANALYTICS_KEY}
         title={title}
+        streamId={streamId}
       />
       <h2 className="text-xl font-bold text-white mt-4">{title}</h2>
     </div>

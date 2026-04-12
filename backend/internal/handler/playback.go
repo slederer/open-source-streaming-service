@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/slederer/open-source-streaming-service/backend/internal/config"
@@ -43,6 +44,12 @@ func (h *Handler) GetVideoPlayback(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]string{
 		"manifest_hls":  video.ManifestHLS,
 		"manifest_dash": video.ManifestDASH,
+	}
+
+	// Pass Bitmovin Streams ID if the manifest URL points to streams.bitmovin.com
+	// (Streams have a specific URL pattern: streams.bitmovin.com/{id}/manifest.m3u8)
+	if video.EncodingJobID != "" && strings.Contains(video.ManifestHLS, "streams.bitmovin.com") {
+		resp["stream_id"] = video.EncodingJobID
 	}
 
 	// Add MediaTailor session URL if configured

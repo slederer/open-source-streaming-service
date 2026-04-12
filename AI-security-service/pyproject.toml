@@ -1,0 +1,37 @@
+[project]
+name = "security-scanner-mcp"
+version = "0.1.0"
+description = "MCP server for Security Scanner — scan deployed apps for vulnerabilities from Claude Code, Claude Desktop, Cursor, Cline, Windsurf"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Stefan Lederer"}]
+keywords = ["security", "vulnerability", "scanner", "mcp", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.24",
+]
+
+[project.urls]
+Homepage = "https://security.slederer.com"
+Repository = "https://github.com/slederer/open-source-streaming-service"
+
+[project.scripts]
+security-scanner-mcp = "scanner.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["scanner"]

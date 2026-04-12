@@ -25,7 +25,8 @@ class TestAuthRequired:
     def test_login_page_accessible(self, anon_client):
         r = anon_client.get("/login")
         assert r.status_code == 200
-        assert "Sign in with Google" in r.text
+        assert "Continue with Google" in r.text
+        assert "Sign up" in r.text  # link to signup page
 
 
 class TestTargets:

@@ -656,6 +656,275 @@ def _generate_fix_markdown(run_id: str, target_filter: str = None) -> str:
     return "\n".join(md_parts)
 
 
+# ── AI Analysis (Claude) ─────────────────────────────────────────────────────
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
+
+
+def _detect_tech_stack(findings: list[dict]) -> dict:
+    """Infer tech stack from server headers and exposed endpoints."""
+    tech = {"framework": None, "server": None, "language": None, "signals": []}
+    for f in findings:
+        ev = (f.get("evidence") or "").lower()
+        title = (f.get("title") or "").lower()
+        desc = (f.get("description") or "").lower()
+        blob = f"{ev} {title} {desc}"
+
+        if "fastapi" in blob or "/docs" in blob or "openapi.json" in blob:
+            tech["framework"] = "fastapi"
+            tech["signals"].append("OpenAPI/Swagger endpoints")
+        if "next.js" in blob or "x-powered-by: next.js" in blob or "next-router" in blob:
+            tech["framework"] = "nextjs"
+            tech["signals"].append("Next.js headers")
+        if "werkzeug" in blob:
+            tech["framework"] = "flask"
+            tech["server"] = "werkzeug"
+        if "uvicorn" in blob:
+            tech["server"] = tech["server"] or "uvicorn"
+        if "gunicorn" in blob:
+            tech["server"] = tech["server"] or "gunicorn"
+        if "nginx" in blob:
+            tech["server"] = tech["server"] or "nginx"
+        if "python" in blob:
+            tech["language"] = "python"
+        if "node" in blob or "express" in blob or "nextjs" == tech.get("framework"):
+            tech["language"] = tech["language"] or "javascript"
+
+    return tech
+
+
+def _build_analysis_prompt(run_id: str, findings: list[dict], targets_info: dict, diffs: dict) -> tuple[str, str]:
+    """Build (system, user) prompts for Claude analysis."""
+    system = """You are a senior penetration tester and security architect analyzing automated scan results. Your job is to:
+
+1. Identify attack chains — how individual findings combine into real exploits
+2. Detect the tech stack from scan evidence (server headers, endpoint patterns, versions)
+3. Produce executable fix instructions optimized for an AI coding assistant (Claude Code) to read and implement
+
+OUTPUT FORMAT: Return a single Markdown document with YAML frontmatter. The document will be saved as SECURITY-FIX.md and given to Claude Code with the prompt: "Read SECURITY-FIX.md and implement all fixes."
+
+REQUIRED STRUCTURE:
+
+```markdown
+---
+format: security-fix/v1
+scanner: security.slederer.com
+scan_id: <run_id>
+scan_date: <YYYY-MM-DD>
+targets:
+  - host: <target>
+    label: <label>
+    tech_stack:
+      framework: <inferred>
+      server: <inferred>
+      language: <inferred>
+    severity_counts: {critical: N, high: N, medium: N, low: N, info: N}
+    risk_grade: <A|B|C|D|F>
+risk_score: <1-100>
+attack_chains:
+  - name: <short name>
+    severity: <CRITICAL|HIGH|MEDIUM>
+    targets: [<host>]
+    findings_used: [<title1>, <title2>]
+    scenario: <3-5 step attacker walkthrough>
+    business_impact: <one sentence>
+---
+
+# Security Assessment
+
+## Executive Summary
+<2-3 paragraphs for a non-technical reader. Lead with business risk.>
+
+## Attack Chains
+<Expand each chain from frontmatter with full detail.>
+
+## Fix Plan
+<For each finding, in severity order: CRITICAL → HIGH → MEDIUM → LOW>
+
+### FIX-N: <Title> [SEVERITY]
+**Target:** <host>
+**Problem:** <what the scan found, citing evidence>
+**File to modify:** <best guess based on detected tech stack>
+**Change:**
+```<language>
+<specific code or config to add>
+```
+**Verify:**
+```bash
+<exact curl/command to verify fix worked>
+```
+```
+
+RULES:
+- Every fix needs a specific file path guess (e.g. `web/app.py` for FastAPI, `next.config.js` for Next.js, `nginx.conf` for nginx)
+- Every fix needs a verification command
+- Order fixes by severity; within severity by impact
+- Skip INFO findings in the Fix Plan — just summarize them
+- Be specific. No generic advice."""
+
+    # Summarize findings per target
+    by_target = {}
+    for f in findings:
+        t = f["target"]
+        by_target.setdefault(t, []).append(f)
+
+    findings_summary = []
+    for host, f_list in by_target.items():
+        label = targets_info.get(host, host)
+        tech = _detect_tech_stack(f_list)
+        sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        for f in f_list:
+            sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
+        findings_summary.append({
+            "target": host,
+            "label": label,
+            "tech_stack": tech,
+            "severity_counts": sev_counts,
+            "findings": [
+                {
+                    "severity": f["severity"],
+                    "category": f["category"],
+                    "title": f["title"],
+                    "description": f.get("description", ""),
+                    "evidence": f.get("evidence", ""),
+                    "tool": f.get("tool", ""),
+                }
+                for f in f_list
+            ],
+        })
+
+    user_msg = f"""Scan run: {run_id}
+Scan date: {datetime.now(timezone.utc).strftime("%Y-%m-%d")}
+
+## Findings (JSON, grouped by target)
+```json
+{json.dumps(findings_summary, indent=2)}
+```
+"""
+    if diffs:
+        user_msg += f"""
+## Changes vs previous scan (per-target diffs)
+```json
+{json.dumps(diffs, indent=2)}
+```
+"""
+
+    user_msg += "\nAnalyze these findings and produce the SECURITY-FIX.md document per the system instructions."
+    return system, user_msg
+
+
+def _fallback_fix_markdown(run_id: str, findings: list[dict], targets_info: dict, target_filter: Optional[str] = None) -> str:
+    """Fallback when no AI is available — regex-based markdown with YAML frontmatter."""
+    if target_filter:
+        findings = [f for f in findings if f["target"] == target_filter]
+    if not findings:
+        return ""
+
+    by_target = {}
+    for f in findings:
+        t = f["target"]
+        by_target.setdefault(t, []).append(f)
+
+    scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    targets_yaml = []
+    for host, f_list in by_target.items():
+        label = targets_info.get(host, host)
+        tech = _detect_tech_stack(f_list)
+        sev_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        for f in f_list:
+            sev_counts[f["severity"].lower()] = sev_counts.get(f["severity"].lower(), 0) + 1
+        crits = sev_counts["critical"]
+        highs = sev_counts["high"]
+        meds = sev_counts["medium"]
+        grade = "F" if crits else "C" if highs else "B" if meds else "A"
+        targets_yaml.append({
+            "host": host, "label": label, "tech_stack": tech,
+            "severity_counts": sev_counts, "risk_grade": grade,
+        })
+
+    md = ["---"]
+    md.append("format: security-fix/v1")
+    md.append(f"scanner: security.slederer.com")
+    md.append(f"scan_id: {run_id}")
+    md.append(f'scan_date: "{scan_date}"')
+    md.append("targets:")
+    for t in targets_yaml:
+        md.append(f"  - host: {t['host']}")
+        md.append(f"    label: {t['label']}")
+        md.append(f"    risk_grade: {t['risk_grade']}")
+        tech = t["tech_stack"]
+        md.append(f"    tech_stack: {{framework: {tech.get('framework')}, server: {tech.get('server')}, language: {tech.get('language')}}}")
+        md.append(f"    severity_counts: {t['severity_counts']}")
+    md.append("---\n")
+
+    for host, f_list in by_target.items():
+        label = targets_info.get(host, host)
+        md.append(f"# Security Fixes: {label} ({host})\n")
+        counter = 0
+        for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+            for f in [x for x in f_list if x["severity"] == sev]:
+                counter += 1
+                remediation = get_remediation(f["title"], f.get("category", ""))
+                if not remediation:
+                    continue
+                md.append(f"## FIX-{counter}: {f['title']} [{sev}]")
+                md.append(f"**Target:** {host}")
+                if f.get("evidence"):
+                    md.append(f"**Evidence:** `{f['evidence']}`")
+                md.append(f"**Remediation:** {remediation}")
+                md.append("")
+        md.append("---\n")
+
+    return "\n".join(md)
+
+
+def run_ai_analysis(run_id: str, user_id: str) -> Optional[dict]:
+    """Run Claude analysis on a completed scan. Returns {content, model, tokens} or None."""
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    try:
+        import anthropic as anthropic_mod
+    except ImportError:
+        return None
+
+    # Gather findings + targets + diffs
+    with get_db() as db:
+        findings_rows = db.execute(
+            "SELECT target, severity, category, title, description, evidence, tool FROM findings WHERE run_id=? AND user_id=? ORDER BY target, CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END",
+            (run_id, user_id),
+        ).fetchall()
+        findings = [dict(r) for r in findings_rows]
+
+        targets_rows = db.execute(
+            "SELECT host, label FROM targets WHERE user_id=?", (user_id,)
+        ).fetchall()
+        targets_info = {t["host"]: t["label"] or t["host"] for t in targets_rows}
+
+    diffs = _compute_target_diffs(run_id)
+    system, user_msg = _build_analysis_prompt(run_id, findings, targets_info, diffs)
+
+    try:
+        client = anthropic_mod.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model=AI_MODEL,
+            max_tokens=8192,
+            system=system,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        content = response.content[0].text if response.content else ""
+        return {
+            "content": content,
+            "model": AI_MODEL,
+            "prompt_tokens": response.usage.input_tokens,
+            "completion_tokens": response.usage.output_tokens,
+        }
+    except Exception as e:
+        print(f"[ai] Analysis failed for run {run_id}: {e}", flush=True)
+        return None
+
+
 # ── User Management Helpers ──────────────────────────────────────────────────
 
 try:
@@ -816,33 +1085,353 @@ def consume_scan_credit(user_id: str):
 
 # ── Auth Routes ────────────────────────────────────────────────────────────────
 
+_AUTH_CSS = """
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Mono', monospace; background: #0a0e17; color: #e5e7eb; display: flex; justify-content: center; align-items: center; min-height: 100vh; padding: 20px; }
+  .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 40px; max-width: 420px; width: 100%; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; letter-spacing: -0.02em; } h1 span { color: #dc2626; }
+  .sub { color: #6b7280; font-size: 0.85rem; margin-bottom: 28px; }
+  .field { margin-bottom: 14px; }
+  label { display: block; color: #9ca3af; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+  input { width: 100%; background: #0a0e17; border: 1px solid #1f2937; border-radius: 8px; padding: 10px 14px; color: #e5e7eb; font-family: inherit; font-size: 0.9rem; }
+  input:focus { outline: none; border-color: #dc2626; }
+  .btn { width: 100%; background: #dc2626; color: white; border: none; padding: 11px 20px; border-radius: 8px; font-size: 0.9rem; font-weight: 600; cursor: pointer; font-family: inherit; margin-top: 4px; }
+  .btn:hover { background: #b91c1c; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-google { background: white; color: #111; display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 10px; text-decoration: none; }
+  .btn-google:hover { background: #e5e7eb; }
+  .btn-google svg { width: 18px; height: 18px; }
+  .divider { text-align: center; color: #4b5563; font-size: 0.75rem; margin: 18px 0; position: relative; }
+  .divider:before { content: ''; position: absolute; top: 50%; left: 0; right: 0; height: 1px; background: #1f2937; z-index: 0; }
+  .divider span { background: #111827; padding: 0 12px; position: relative; z-index: 1; }
+  .alt { text-align: center; font-size: 0.8rem; color: #6b7280; margin-top: 20px; }
+  .alt a { color: #dc2626; text-decoration: none; }
+  .alt a:hover { text-decoration: underline; }
+  .error { background: #450a0a; color: #fca5a5; padding: 10px 14px; border-radius: 8px; font-size: 0.8rem; margin-bottom: 16px; }
+  .success { background: #14532d; color: #86efac; padding: 10px 14px; border-radius: 8px; font-size: 0.8rem; margin-bottom: 16px; }
+"""
+
+_GOOGLE_SVG = '<svg viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>'
+
+
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
     user = get_user(request)
     if user:
         return RedirectResponse("/")
-    return HTMLResponse("""<!DOCTYPE html>
+    error = request.query_params.get("error", "")
+    verified = request.query_params.get("verified", "")
+    alert = ""
+    if error:
+        alert = f'<div class="error">{error}</div>'
+    elif verified:
+        alert = '<div class="success">Email verified. Sign in below.</div>'
+
+    return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Security Scanner — Login</title>
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Mono', monospace; background: #0a0e17; color: #e5e7eb; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-  .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 48px; text-align: center; max-width: 400px; }
-  h1 { font-size: 1.4rem; margin-bottom: 8px; } h1 span { color: #dc2626; }
-  p { color: #6b7280; font-size: 0.85rem; margin-bottom: 32px; }
-  .btn { display: inline-flex; align-items: center; gap: 10px; background: #fff; color: #111; border: none; padding: 12px 28px; border-radius: 8px; font-size: 0.9rem; font-weight: 600; cursor: pointer; text-decoration: none; font-family: inherit; }
-  .btn:hover { background: #e5e7eb; }
-  .btn svg { width: 20px; height: 20px; }
-  .error { background: #450a0a; color: #fca5a5; padding: 8px 16px; border-radius: 6px; font-size: 0.8rem; margin-bottom: 16px; }
-</style></head><body>
+<title>Sign in — Security Scanner</title>
+<style>{_AUTH_CSS}</style></head>
+<body>
 <div class="card">
   <h1><span>&#9632;</span> Security Scanner</h1>
-  <p>Sign in with your Google account to continue.</p>
-  """ + (f'<div class="error">{request.query_params.get("error", "")}</div>' if request.query_params.get("error") else "") + """
-  <a class="btn" href="/auth/google">
-    <svg viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
-    Sign in with Google
-  </a>
-</div></body></html>""")
+  <p class="sub">Sign in to your account</p>
+  {alert}
+  <form id="login-form">
+    <div class="field"><label>Email</label><input type="email" name="email" required autocomplete="email"></div>
+    <div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div>
+    <button type="submit" class="btn">Sign in</button>
+  </form>
+  <div class="divider"><span>or</span></div>
+  <a href="/auth/google" class="btn btn-google">{_GOOGLE_SVG} Continue with Google</a>
+  <div class="alt">Don't have an account? <a href="/signup">Sign up</a></div>
+</div>
+<script>
+document.getElementById('login-form').addEventListener('submit', async e => {{
+  e.preventDefault();
+  const form = e.target;
+  const btn = form.querySelector('button');
+  btn.disabled = true; btn.textContent = 'Signing in...';
+  const r = await fetch('/api/auth/login', {{
+    method: 'POST', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{email: form.email.value, password: form.password.value}})
+  }});
+  const data = await r.json();
+  if (r.ok) {{ window.location = '/'; }}
+  else {{
+    document.querySelector('.error')?.remove();
+    const err = document.createElement('div'); err.className = 'error'; err.textContent = data.error || 'Login failed';
+    form.before(err);
+    btn.disabled = false; btn.textContent = 'Sign in';
+  }}
+}});
+</script></body></html>""")
+
+
+@app.get("/signup", response_class=HTMLResponse)
+async def signup_page(request: Request):
+    user = get_user(request)
+    if user:
+        return RedirectResponse("/")
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign up — Security Scanner</title>
+<style>{_AUTH_CSS}</style></head>
+<body>
+<div class="card">
+  <h1><span>&#9632;</span> Security Scanner</h1>
+  <p class="sub">Create an account — 1 free scan, no credit card</p>
+  <form id="signup-form">
+    <div class="field"><label>Name</label><input type="text" name="name" required></div>
+    <div class="field"><label>Email</label><input type="email" name="email" required autocomplete="email"></div>
+    <div class="field"><label>Password <span style="color:#4b5563;">(min 8 chars)</span></label><input type="password" name="password" required minlength="8" autocomplete="new-password"></div>
+    <button type="submit" class="btn">Create account</button>
+  </form>
+  <div class="divider"><span>or</span></div>
+  <a href="/auth/google" class="btn btn-google">{_GOOGLE_SVG} Continue with Google</a>
+  <div class="alt">Already have an account? <a href="/login">Sign in</a></div>
+</div>
+<script>
+document.getElementById('signup-form').addEventListener('submit', async e => {{
+  e.preventDefault();
+  const form = e.target;
+  const btn = form.querySelector('button');
+  btn.disabled = true; btn.textContent = 'Creating...';
+  const r = await fetch('/api/auth/signup', {{
+    method: 'POST', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{name: form.name.value, email: form.email.value, password: form.password.value}})
+  }});
+  const data = await r.json();
+  document.querySelector('.error, .success')?.remove();
+  if (r.ok) {{
+    const el = document.createElement('div'); el.className = 'success';
+    el.innerHTML = '&#10003; Check your email to verify your account. After verifying, you can <a href="/login" style="color:#86efac;">sign in</a>.';
+    form.before(el);
+    form.style.display = 'none';
+  }} else {{
+    const el = document.createElement('div'); el.className = 'error'; el.textContent = data.error || 'Signup failed';
+    form.before(el);
+    btn.disabled = false; btn.textContent = 'Create account';
+  }}
+}});
+</script></body></html>""")
+
+
+@app.get("/billing", response_class=HTMLResponse)
+async def billing_page(request: Request):
+    user = get_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    full_user = get_user_by_id(user["user_id"]) or {}
+    plan = full_user.get("plan", "free")
+    credits = full_user.get("scan_credits", 0)
+    stripe_configured = bool(STRIPE_SECRET_KEY)
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Billing — Security Scanner</title>
+<style>
+{_AUTH_CSS}
+  body {{ align-items: flex-start; padding-top: 40px; }}
+  .container {{ max-width: 960px; width: 100%; }}
+  .container h1 {{ margin-bottom: 24px; }}
+  .nav {{ display: flex; gap: 16px; margin-bottom: 32px; }}
+  .nav a {{ color: #9ca3af; text-decoration: none; font-size: 0.85rem; padding: 6px 12px; border-radius: 6px; }}
+  .nav a:hover, .nav a.active {{ background: #1f2937; color: #e5e7eb; }}
+  .plan-info {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; margin-bottom: 28px; }}
+  .plan-info .plan-name {{ font-size: 1.1rem; font-weight: 600; }}
+  .plan-info .details {{ color: #9ca3af; font-size: 0.85rem; margin-top: 4px; }}
+  .plans {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }}
+  .plan {{ background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 24px; }}
+  .plan.featured {{ border-color: #dc2626; }}
+  .plan h3 {{ font-size: 1.1rem; margin-bottom: 6px; }}
+  .plan .price {{ font-size: 2rem; font-weight: 700; margin-bottom: 16px; }}
+  .plan .price small {{ font-size: 0.85rem; color: #9ca3af; font-weight: 400; }}
+  .plan ul {{ list-style: none; font-size: 0.85rem; color: #d1d5db; margin-bottom: 20px; }}
+  .plan li {{ padding: 4px 0; }}
+  .plan li:before {{ content: '\\2713'; color: #22c55e; margin-right: 8px; }}
+</style></head>
+<body>
+<div class="container">
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/keys">API Keys</a>
+    <a href="/billing" class="active">Billing</a>
+    <a href="/logout">Sign out</a>
+  </div>
+
+  <h1>Billing</h1>
+
+  <div class="plan-info">
+    <div class="plan-name">Current plan: <span style="color:#dc2626;">{plan.upper()}</span></div>
+    <div class="details">{('Scan credits: ' + str(credits)) if plan == 'payg' else ''}{('Renews monthly' if plan in ('monthly', 'pro') else '')}</div>
+    {('<button class="btn" style="width:auto;margin-top:12px;" onclick="managePortal()">Manage subscription</button>' if full_user.get('stripe_customer_id') else '')}
+  </div>
+
+  {('<div class="error">Stripe not configured yet. Plans below will activate once STRIPE_SECRET_KEY is set on the server.</div>' if not stripe_configured else '')}
+
+  <div class="plans">
+    <div class="plan">
+      <h3>Pay as you go</h3>
+      <div class="price">$9<small> /scan</small></div>
+      <ul>
+        <li>One scan with AI analysis</li>
+        <li>Claude Code fix file</li>
+        <li>Up to 5 targets</li>
+        <li>No subscription</li>
+      </ul>
+      <button class="btn" onclick="checkout('payg')">Buy 1 scan</button>
+    </div>
+    <div class="plan featured">
+      <h3>Monthly</h3>
+      <div class="price">$29<small> /mo</small></div>
+      <ul>
+        <li>Weekly auto-scan</li>
+        <li>Weekly summary email</li>
+        <li>AI analysis included</li>
+        <li>Scan history + trend tracking</li>
+        <li>Security badge</li>
+      </ul>
+      <button class="btn" onclick="checkout('monthly')">Subscribe</button>
+    </div>
+    <div class="plan">
+      <h3>Pro</h3>
+      <div class="price">$99<small> /mo</small></div>
+      <ul>
+        <li>10 targets</li>
+        <li>50 scans/day</li>
+        <li>Daily auto-scan</li>
+        <li>Team members</li>
+        <li>Webhooks</li>
+      </ul>
+      <button class="btn" onclick="checkout('pro')">Subscribe</button>
+    </div>
+  </div>
+</div>
+<script>
+async function checkout(plan) {{
+  const r = await fetch('/api/billing/checkout', {{
+    method: 'POST', headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{plan}})
+  }});
+  const data = await r.json();
+  if (data.url) window.location = data.url;
+  else alert(data.error || 'Checkout failed');
+}}
+async function managePortal() {{
+  const r = await fetch('/api/billing/portal', {{method:'POST'}});
+  const data = await r.json();
+  if (data.url) window.location = data.url;
+  else alert(data.error || 'Portal unavailable');
+}}
+</script></body></html>""")
+
+
+@app.get("/keys", response_class=HTMLResponse)
+async def keys_page(request: Request):
+    user = get_user(request)
+    if not user:
+        return RedirectResponse("/login")
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>API Keys — Security Scanner</title>
+<style>
+{_AUTH_CSS}
+  body {{ align-items: flex-start; padding-top: 40px; }}
+  .container {{ max-width: 960px; width: 100%; }}
+  .nav {{ display: flex; gap: 16px; margin-bottom: 32px; }}
+  .nav a {{ color: #9ca3af; text-decoration: none; font-size: 0.85rem; padding: 6px 12px; border-radius: 6px; }}
+  .nav a:hover, .nav a.active {{ background: #1f2937; color: #e5e7eb; }}
+  .keys {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; margin-bottom: 24px; }}
+  .key-row {{ display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #1f2937; }}
+  .key-row:last-child {{ border-bottom: none; }}
+  .key-prefix {{ font-family: monospace; color: #9ca3af; font-size: 0.85rem; }}
+  .key-label {{ color: #e5e7eb; font-size: 0.85rem; margin-left: 12px; }}
+  .key-meta {{ color: #4b5563; font-size: 0.75rem; }}
+  .btn-sm {{ background: transparent; border: 1px solid #1f2937; color: #9ca3af; padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; cursor: pointer; font-family: inherit; }}
+  .btn-sm:hover {{ border-color: #dc2626; color: #dc2626; }}
+  .new-key-box {{ background: #0a0e17; border: 1px solid #22c55e; border-radius: 10px; padding: 20px; margin-bottom: 24px; display: none; }}
+  .new-key-box.show {{ display: block; }}
+  .new-key-box .copy {{ background: #0a0e17; border: 1px solid #1f2937; border-radius: 6px; padding: 10px 12px; font-family: monospace; font-size: 0.85rem; word-break: break-all; cursor: pointer; }}
+  .mcp-config {{ background: #0a0e17; border: 1px solid #1f2937; border-radius: 8px; padding: 16px; font-family: monospace; font-size: 0.8rem; color: #d1d5db; white-space: pre-wrap; margin-top: 20px; }}
+</style></head>
+<body>
+<div class="container">
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/keys" class="active">API Keys</a>
+    <a href="/billing">Billing</a>
+    <a href="/logout">Sign out</a>
+  </div>
+
+  <h1>API Keys</h1>
+  <p class="sub">Use these in the <a href="#mcp" style="color:#dc2626;">MCP server</a>, ChatGPT GPT, or direct API calls.</p>
+
+  <div class="new-key-box" id="new-key-box">
+    <div style="color:#86efac;margin-bottom:8px;font-size:0.85rem;">&#10003; New API key created — save it now, it won't be shown again:</div>
+    <div class="copy" id="new-key-value" onclick="navigator.clipboard.writeText(this.textContent); this.style.background='#14532d';"></div>
+  </div>
+
+  <div style="margin-bottom: 20px;">
+    <form id="new-key-form" style="display:flex;gap:8px;">
+      <input type="text" name="label" placeholder="Label (e.g. claude-code, chatgpt)" style="flex:1;">
+      <button class="btn" style="width:auto;white-space:nowrap;">Generate key</button>
+    </form>
+  </div>
+
+  <div class="keys" id="keys-list">Loading...</div>
+
+  <h2 id="mcp" style="font-size:1rem;margin-bottom:12px;">MCP Configuration</h2>
+  <p style="color:#9ca3af;font-size:0.85rem;margin-bottom:12px;">Add to <code>~/.claude/settings.json</code> (works in Claude Code, Claude Desktop, Cursor, Cline, Windsurf):</p>
+  <div class="mcp-config" id="mcp-config">{{
+  "mcpServers": {{
+    "security-scanner": {{
+      "command": "uvx",
+      "args": ["security-scanner-mcp"],
+      "env": {{
+        "SECURITY_SCANNER_API_KEY": "sk-sec-...your-key..."
+      }}
+    }}
+  }}
+}}</div>
+</div>
+<script>
+async function loadKeys() {{
+  const r = await fetch('/api/keys');
+  const keys = await r.json();
+  const el = document.getElementById('keys-list');
+  if (!keys.length) {{ el.innerHTML = '<div style="color:#6b7280;text-align:center;padding:20px;">No API keys yet</div>'; return; }}
+  el.innerHTML = keys.map(k => `
+    <div class="key-row">
+      <div>
+        <span class="key-prefix">${{k.key_prefix}}...</span>
+        <span class="key-label">${{k.label || ''}}</span>
+        <span class="key-meta" style="margin-left:12px;">created ${{k.created_at.slice(0,10)}}${{k.last_used_at ? ', last used '+k.last_used_at.slice(0,10) : ', never used'}}</span>
+      </div>
+      ${{k.is_active ? `<button class="btn-sm" onclick="revoke(${{k.id}})">Revoke</button>` : '<span class="key-meta">Revoked</span>'}}
+    </div>`).join('');
+}}
+document.getElementById('new-key-form').addEventListener('submit', async e => {{
+  e.preventDefault();
+  const r = await fetch('/api/keys', {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{label: e.target.label.value || 'default'}})
+  }});
+  const data = await r.json();
+  if (data.key) {{
+    document.getElementById('new-key-value').textContent = data.key;
+    document.getElementById('new-key-box').classList.add('show');
+    e.target.reset();
+    loadKeys();
+  }} else alert(data.error || 'Failed');
+}});
+async function revoke(id) {{
+  if (!confirm('Revoke this key? MCP/API clients using it will stop working.')) return;
+  await fetch('/api/keys/'+id, {{method:'DELETE'}});
+  loadKeys();
+}}
+loadKeys();
+</script></body></html>""")
 
 
 @app.get("/auth/google")
@@ -1632,16 +2221,106 @@ async def v1_get_scan(request: Request, run_id: str):
 
 
 @app.get("/v1/scan/{run_id}/fix")
-async def v1_get_fix(request: Request, run_id: str, target: str = ""):
+async def v1_get_fix(request: Request, run_id: str, target: str = "", format: str = "auto"):
+    """Get fix Markdown. format=auto uses AI analysis if available, else fallback; format=legacy = regex."""
     user = require_auth_any(request)
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     if not _verify_run_ownership(run_id, user["user_id"]):
         return JSONResponse({"error": "Not found"}, status_code=404)
+
+    # Try AI analysis first if format=auto or format=ai
+    if format in ("auto", "ai"):
+        with get_db() as db:
+            row = db.execute(
+                "SELECT content FROM analyses WHERE run_id=? AND user_id=? AND analysis_type='fix_plan' ORDER BY created_at DESC LIMIT 1",
+                (run_id, user["user_id"]),
+            ).fetchone()
+        if row:
+            return PlainTextResponse(row["content"], media_type="text/markdown")
+
+    # Fallback to AI-structured markdown with YAML frontmatter (no actual AI call — just structured)
+    if format in ("auto", "ai", "legacy"):
+        with get_db() as db:
+            findings_rows = db.execute(
+                "SELECT target, severity, category, title, description, evidence, tool FROM findings WHERE run_id=? AND user_id=?",
+                (run_id, user["user_id"]),
+            ).fetchall()
+            targets_rows = db.execute(
+                "SELECT host, label FROM targets WHERE user_id=?", (user["user_id"],)
+            ).fetchall()
+        findings = [dict(r) for r in findings_rows]
+        targets_info = {t["host"]: t["label"] or t["host"] for t in targets_rows}
+        md = _fallback_fix_markdown(run_id, findings, targets_info, target_filter=target if target else None)
+        if md:
+            return PlainTextResponse(md, media_type="text/markdown")
+
+    # Last resort: the old regex generator
     md = _generate_fix_markdown(run_id, target_filter=target if target else None)
     if not md:
         return JSONResponse({"error": "No findings"}, status_code=404)
     return PlainTextResponse(md, media_type="text/markdown")
+
+
+@app.post("/v1/scan/{run_id}/analyze")
+async def v1_analyze(request: Request, run_id: str):
+    """Trigger Claude-powered AI analysis on a completed scan run."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    run = _verify_run_ownership(run_id, user["user_id"])
+    if not run:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    # Check plan allows AI
+    full_user = get_user_by_id(user["user_id"])
+    plan = (full_user or {}).get("plan", "free")
+    if not PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["ai_analysis"]:
+        return JSONResponse({
+            "error": "AI analysis requires PAYG or higher plan. Upgrade at /billing",
+            "upgrade_url": "https://security.slederer.com/billing",
+        }, status_code=402)
+
+    # Return cached analysis if already generated
+    with get_db() as db:
+        existing = db.execute(
+            "SELECT content, model, created_at FROM analyses WHERE run_id=? AND user_id=? AND analysis_type='fix_plan' ORDER BY created_at DESC LIMIT 1",
+            (run_id, user["user_id"]),
+        ).fetchone()
+        if existing:
+            return {"content": existing["content"], "model": existing["model"], "created_at": existing["created_at"], "cached": True}
+
+    # Run fresh analysis
+    result = run_ai_analysis(run_id, user["user_id"])
+    if not result:
+        # Fallback: return structured fix file without AI
+        with get_db() as db:
+            findings_rows = db.execute(
+                "SELECT target, severity, category, title, description, evidence, tool FROM findings WHERE run_id=? AND user_id=?",
+                (run_id, user["user_id"]),
+            ).fetchall()
+            targets_rows = db.execute(
+                "SELECT host, label FROM targets WHERE user_id=?", (user["user_id"],)
+            ).fetchall()
+        findings = [dict(r) for r in findings_rows]
+        targets_info = {t["host"]: t["label"] or t["host"] for t in targets_rows}
+        md = _fallback_fix_markdown(run_id, findings, targets_info)
+        return {
+            "content": md,
+            "model": "fallback",
+            "message": "AI analysis not configured on server. Returning structured fix file.",
+            "cached": False,
+        }
+
+    # Store
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO analyses (run_id, user_id, analysis_type, content, model, prompt_tokens, completion_tokens) VALUES (?,?,?,?,?,?,?)",
+            (run_id, user["user_id"], "fix_plan", result["content"], result["model"],
+             result["prompt_tokens"], result["completion_tokens"]),
+        )
+    return {"content": result["content"], "model": result["model"], "cached": False}
 
 
 @app.get("/v1/targets")

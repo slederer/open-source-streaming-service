@@ -7,7 +7,10 @@ import re
 import secrets
 import sqlite3
 import subprocess
+import threading
 import uuid
+
+import httpx
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -130,6 +133,14 @@ def init_db():
                 completion_tokens INTEGER,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS vercel_installs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL REFERENCES users(id),
+                team_id TEXT,
+                configuration_id TEXT,
+                installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
             CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
             CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
             CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
@@ -137,6 +148,7 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
             CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
             CREATE INDEX IF NOT EXISTS idx_analyses_run ON analyses(run_id);
+            CREATE INDEX IF NOT EXISTS idx_vercel_team ON vercel_installs(team_id);
         """)
 
         # Add user_id columns to existing tables (idempotent)
@@ -1156,7 +1168,7 @@ document.getElementById('login-form').addEventListener('submit', async e => {{
     body: JSON.stringify({{email: form.email.value, password: form.password.value}})
   }});
   const data = await r.json();
-  if (r.ok) {{ window.location = '/'; }}
+  if (r.ok) {{ window.location = data.redirect || '/'; }}
   else {{
     document.querySelector('.error')?.remove();
     const err = document.createElement('div'); err.className = 'error'; err.textContent = data.error || 'Login failed';
@@ -1482,6 +1494,10 @@ async def auth_callback(request: Request):
         "picture": picture,
         "plan": user_row.get("plan", "free"),
     }
+    pending = request.session.pop("pending_oauth", None)
+    if pending:
+        from urllib.parse import urlencode
+        return RedirectResponse(f"/oauth/authorize?{urlencode(pending)}")
     return RedirectResponse("/")
 
 
@@ -1566,6 +1582,11 @@ async def login(request: Request):
         "picture": user.get("picture", ""),
         "plan": user.get("plan", "free"),
     }
+    # If user was in the middle of an OAuth flow, send them back
+    pending = request.session.pop("pending_oauth", None)
+    if pending:
+        from urllib.parse import urlencode
+        return {"ok": True, "redirect": f"/oauth/authorize?{urlencode(pending)}"}
     return {"ok": True}
 
 
@@ -2922,11 +2943,212 @@ loadRuns();
 </html>""";
 
 
+_LANDING_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Security Scanner — AI-native vulnerability scanning</title>
+<meta name="description" content="Scan any deployed web app for vulnerabilities. AI-powered fix instructions for Claude Code, ChatGPT, Cursor, and Copilot. Built for the vibe-coding era.">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.5; }
+  a { color: inherit; text-decoration: none; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+  nav { padding: 20px 0; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1f2937; }
+  nav .logo { font-size: 1.05rem; font-weight: 700; letter-spacing: -0.02em; }
+  nav .logo span { color: #dc2626; }
+  nav .links { display: flex; gap: 20px; font-size: 0.85rem; color: #9ca3af; align-items: center; }
+  nav .links a:hover { color: #e5e7eb; }
+  nav .cta { background: #dc2626; color: white !important; padding: 8px 16px; border-radius: 6px; font-weight: 600; }
+  nav .cta:hover { background: #b91c1c; }
+
+  .hero { padding: 80px 0; text-align: center; background: radial-gradient(circle at 50% 0%, #1f2937 0%, #0a0e17 70%); }
+  .hero h1 { font-size: 3.2rem; font-weight: 800; letter-spacing: -0.03em; line-height: 1.05; margin-bottom: 20px; }
+  .hero h1 span { color: #dc2626; }
+  .hero p { font-size: 1.15rem; color: #9ca3af; max-width: 640px; margin: 0 auto 36px; }
+  .hero .btns { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 24px; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; border: none; font-family: inherit; text-decoration: none; }
+  .btn-primary { background: #dc2626; color: white; }
+  .btn-primary:hover { background: #b91c1c; }
+  .btn-secondary { background: transparent; color: #e5e7eb; border: 1px solid #1f2937; }
+  .btn-secondary:hover { border-color: #4b5563; }
+
+  section { padding: 80px 0; border-bottom: 1px solid #1f2937; }
+  section h2 { font-size: 2rem; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 12px; text-align: center; }
+  section .sub { color: #9ca3af; text-align: center; margin-bottom: 48px; font-size: 1rem; }
+
+  .integrations { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .integration { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; text-align: center; transition: border-color 0.2s; }
+  .integration:hover { border-color: #dc2626; }
+  .integration .name { font-weight: 600; margin-bottom: 4px; }
+  .integration .desc { color: #6b7280; font-size: 0.8rem; }
+
+  .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+  .step { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 24px; }
+  .step .num { font-size: 0.75rem; color: #dc2626; font-weight: 700; letter-spacing: 0.05em; margin-bottom: 6px; }
+  .step h3 { font-size: 1.1rem; margin-bottom: 8px; }
+  .step p { color: #9ca3af; font-size: 0.9rem; }
+  .step code { background: #0a0e17; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; color: #e5e7eb; }
+  .step pre { background: #0a0e17; border: 1px solid #1f2937; padding: 12px; border-radius: 6px; font-size: 0.75rem; overflow-x: auto; margin-top: 10px; color: #d1d5db; }
+
+  .pricing { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; }
+  .plan { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 28px; }
+  .plan.featured { border-color: #dc2626; position: relative; }
+  .plan.featured:before { content: 'Most popular'; position: absolute; top: -10px; left: 50%; transform: translateX(-50%); background: #dc2626; color: white; font-size: 0.7rem; padding: 3px 10px; border-radius: 4px; font-weight: 600; }
+  .plan h3 { font-size: 1.1rem; margin-bottom: 8px; }
+  .plan .price { font-size: 2.2rem; font-weight: 700; margin-bottom: 6px; }
+  .plan .price small { font-size: 0.85rem; color: #9ca3af; font-weight: 400; }
+  .plan .tagline { color: #9ca3af; font-size: 0.85rem; margin-bottom: 20px; }
+  .plan ul { list-style: none; font-size: 0.85rem; color: #d1d5db; margin-bottom: 24px; }
+  .plan li { padding: 6px 0; }
+  .plan li:before { content: '\\2713'; color: #22c55e; margin-right: 8px; }
+
+  footer { padding: 40px 0; text-align: center; color: #6b7280; font-size: 0.85rem; }
+  footer a { color: #9ca3af; margin: 0 12px; }
+  footer a:hover { color: #e5e7eb; }
+</style></head>
+<body>
+<nav class="container">
+  <div class="logo"><span>&#9632;</span> Security Scanner</div>
+  <div class="links">
+    <a href="#how">How it works</a>
+    <a href="#pricing">Pricing</a>
+    <a href="/login">Sign in</a>
+    <a href="/signup" class="cta">Get started</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="container">
+    <h1>Security scans for the<br><span>vibe-coding</span> era.</h1>
+    <p>Scan any deployed app. Get AI-powered fix instructions your coding assistant can execute directly. Works with Claude Code, ChatGPT, Cursor, Cline, and GitHub Copilot.</p>
+    <div class="btns">
+      <a href="/signup" class="btn btn-primary">Start free — 1 scan, no card</a>
+      <a href="#how" class="btn btn-secondary">See how it works</a>
+    </div>
+  </div>
+</section>
+
+<section id="integrations">
+  <div class="container">
+    <h2>Works where you work</h2>
+    <p class="sub">One MCP server, every AI coding tool.</p>
+    <div class="integrations">
+      <div class="integration"><div class="name">Claude Code</div><div class="desc">/security-scan skill + MCP</div></div>
+      <div class="integration"><div class="name">Claude Desktop</div><div class="desc">Native MCP</div></div>
+      <div class="integration"><div class="name">Cursor</div><div class="desc">.cursor/mcp.json</div></div>
+      <div class="integration"><div class="name">Cline</div><div class="desc">VS Code extension</div></div>
+      <div class="integration"><div class="name">Windsurf</div><div class="desc">Native MCP</div></div>
+      <div class="integration"><div class="name">ChatGPT</div><div class="desc">Custom GPT + Actions</div></div>
+      <div class="integration"><div class="name">GitHub Copilot</div><div class="desc">@security-scanner</div></div>
+      <div class="integration"><div class="name">Vercel</div><div class="desc">Post-deploy auto-scan</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="container">
+    <h2>From scan to fix in 3 minutes</h2>
+    <p class="sub">You don't leave your AI assistant.</p>
+    <div class="steps">
+      <div class="step">
+        <div class="num">STEP 1</div>
+        <h3>In Claude Code, type <code>/security-scan</code></h3>
+        <p>The skill detects your deployment URL from CLAUDE.md or .env, then triggers a scan via MCP.</p>
+      </div>
+      <div class="step">
+        <div class="num">STEP 2</div>
+        <h3>We scan with 6 engines</h3>
+        <p>nmap, TLS audit, security headers, exposed endpoints (/docs, /.env, /.git), rate limit probing, and nuclei (8k+ CVE templates).</p>
+      </div>
+      <div class="step">
+        <div class="num">STEP 3</div>
+        <h3>Claude analyzes & fixes</h3>
+        <p>Our AI writes a <code>SECURITY-FIX.md</code> with exact code changes for your tech stack. Claude Code reads it and implements fixes with your approval.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="pricing">
+  <div class="container">
+    <h2>Simple pricing</h2>
+    <p class="sub">Free to try. Pay as you scan.</p>
+    <div class="pricing">
+      <div class="plan">
+        <h3>Free</h3>
+        <div class="price">$0</div>
+        <div class="tagline">Try the product</div>
+        <ul>
+          <li>1 scan to try</li>
+          <li>1 target</li>
+          <li>No credit card</li>
+        </ul>
+        <a href="/signup" class="btn btn-secondary" style="width:100%;display:block;text-align:center;">Start free</a>
+      </div>
+      <div class="plan">
+        <h3>Pay as you go</h3>
+        <div class="price">$9<small> /scan</small></div>
+        <div class="tagline">No subscription</div>
+        <ul>
+          <li>One scan with AI analysis</li>
+          <li>Claude Code fix file</li>
+          <li>Up to 5 targets</li>
+        </ul>
+        <a href="/signup" class="btn btn-secondary" style="width:100%;display:block;text-align:center;">Buy scan</a>
+      </div>
+      <div class="plan featured">
+        <h3>Monthly</h3>
+        <div class="price">$29<small> /mo</small></div>
+        <div class="tagline">Set & forget</div>
+        <ul>
+          <li>Weekly auto-scan</li>
+          <li>Weekly summary email</li>
+          <li>AI analysis included</li>
+          <li>Trend tracking</li>
+          <li>Security badge</li>
+        </ul>
+        <a href="/signup" class="btn btn-primary" style="width:100%;display:block;text-align:center;">Subscribe</a>
+      </div>
+      <div class="plan">
+        <h3>Pro</h3>
+        <div class="price">$99<small> /mo</small></div>
+        <div class="tagline">Small teams</div>
+        <ul>
+          <li>10 targets</li>
+          <li>Daily scans</li>
+          <li>Team members</li>
+          <li>Webhooks</li>
+          <li>Priority queue</li>
+        </ul>
+        <a href="/signup" class="btn btn-secondary" style="width:100%;display:block;text-align:center;">Subscribe</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div>Security Scanner &mdash; Built for the AI-native developer</div>
+    <div style="margin-top:12px;">
+      <a href="/privacy">Privacy</a>
+      <a href="/terms">Terms</a>
+      <a href="/v1/openapi.json">API docs</a>
+      <a href="/login">Sign in</a>
+    </div>
+  </div>
+</footer>
+</body></html>"""
+
+
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def home(request: Request):
     user = get_user(request)
     if not user:
-        return RedirectResponse("/login")
+        return HTMLResponse(_LANDING_HTML)
+    # Authenticated users get the dashboard
+    return await _render_dashboard(request, user)
+
+
+async def _render_dashboard(request: Request, user: dict):
     # Inject user info into template
     html = HTML_TEMPLATE.replace(
         "<!--USER_INFO-->",
@@ -2937,6 +3159,536 @@ async def dashboard(request: Request):
         f'</div>'
     )
     return HTMLResponse(html)
+
+
+_LEGAL_CSS = """
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.6; }
+  .container { max-width: 760px; margin: 0 auto; padding: 60px 24px; }
+  nav { padding: 16px 24px; border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; max-width: 1100px; margin: 0 auto; }
+  nav a { color: #9ca3af; text-decoration: none; font-size: 0.85rem; }
+  nav a.logo { color: #e5e7eb; font-weight: 700; }
+  nav a.logo span { color: #dc2626; }
+  h1 { font-size: 2rem; margin-bottom: 8px; letter-spacing: -0.02em; }
+  .meta { color: #6b7280; font-size: 0.85rem; margin-bottom: 40px; }
+  h2 { font-size: 1.2rem; margin-top: 32px; margin-bottom: 12px; }
+  p { color: #d1d5db; margin-bottom: 12px; font-size: 0.95rem; }
+  ul { color: #d1d5db; margin-left: 24px; margin-bottom: 12px; }
+  li { margin-bottom: 6px; }
+  a { color: #dc2626; }
+"""
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_policy():
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Privacy Policy — Security Scanner</title><style>{_LEGAL_CSS}</style></head>
+<body>
+<nav><a href="/" class="logo"><span>&#9632;</span> Security Scanner</a><a href="/">Back</a></nav>
+<div class="container">
+<h1>Privacy Policy</h1>
+<div class="meta">Last updated: 2026-04-12</div>
+
+<h2>What we collect</h2>
+<p>When you sign up, we collect your email address, name, and (for email accounts) a bcrypt-hashed password. If you sign in with Google, we additionally store your Google profile picture URL.</p>
+<p>When you use the scanner, we store the URLs/IPs you submit as scan targets, the scan results (findings, open ports, exposed endpoints, etc.), and the timestamps of scans.</p>
+<p>If you subscribe to a paid plan, we use Stripe as our payment processor. We store your Stripe customer ID but never your card details — those are handled entirely by Stripe.</p>
+
+<h2>What we do NOT collect</h2>
+<ul>
+<li>We do not track you across the web with cookies or analytics scripts</li>
+<li>We do not sell or share your scan data with third parties</li>
+<li>We do not store the content of your target websites — only the metadata of what we found</li>
+</ul>
+
+<h2>How we use your data</h2>
+<ul>
+<li>To run security scans you request and show results back to you</li>
+<li>To send transactional emails (verification, weekly summaries for subscribers)</li>
+<li>To bill you if you're on a paid plan (via Stripe)</li>
+<li>To send your scan data to Anthropic's Claude API for AI-powered analysis when you request it (scan findings are sent; no other user data)</li>
+</ul>
+
+<h2>Data retention</h2>
+<p>Scan results are kept for as long as your account is active. You can delete your account at any time by emailing us; all your data will be deleted within 30 days.</p>
+
+<h2>Third parties</h2>
+<ul>
+<li><strong>Stripe</strong> — payment processing</li>
+<li><strong>Resend</strong> — transactional email delivery</li>
+<li><strong>Anthropic (Claude)</strong> — AI analysis of scan findings (only when you request it)</li>
+<li><strong>Google</strong> — OAuth sign-in (only if you choose Google login)</li>
+<li><strong>AWS</strong> — where our scanner infrastructure runs</li>
+<li><strong>Cloudflare</strong> — our DNS provider and TLS termination</li>
+</ul>
+
+<h2>Your rights</h2>
+<p>You can export all your data via the API, delete your account, or revoke API keys at any time. Email <a href="mailto:privacy@slederer.com">privacy@slederer.com</a> with any requests.</p>
+
+<h2>Scanning ethics</h2>
+<p>You must only scan targets you own or have explicit permission to test. Unauthorized scanning violates our terms and may be illegal in your jurisdiction. We log all scans against the authenticated user.</p>
+
+<h2>Contact</h2>
+<p>Security Scanner is operated by Stefan Lederer. Questions? <a href="mailto:privacy@slederer.com">privacy@slederer.com</a></p>
+</div>
+</body></html>""")
+
+
+@app.get("/terms", response_class=HTMLResponse)
+async def terms_of_service():
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Terms of Service — Security Scanner</title><style>{_LEGAL_CSS}</style></head>
+<body>
+<nav><a href="/" class="logo"><span>&#9632;</span> Security Scanner</a><a href="/">Back</a></nav>
+<div class="container">
+<h1>Terms of Service</h1>
+<div class="meta">Last updated: 2026-04-12</div>
+
+<h2>Acceptable use</h2>
+<p>You may only scan targets you own, operate, or have explicit written authorization to test. Running unauthorized security scans against systems you don't control is illegal in most jurisdictions and violates these terms.</p>
+<p>We reserve the right to suspend any account we believe is using the service for unauthorized scanning, bulk vulnerability exploitation, or any illegal purpose.</p>
+
+<h2>Scan scope</h2>
+<p>Our scanner performs non-destructive tests: port scanning, HTTP probing, TLS analysis, exposed endpoint checks, rate limit testing, and nuclei template matching. We do not exploit vulnerabilities. We do not attempt to bypass authentication. We do not attempt denial of service.</p>
+
+<h2>Service availability</h2>
+<p>We provide the service on an "as is" basis. We make no guarantees of uptime or scan accuracy. Scans may occasionally fail due to network issues, target firewalls, or our own infrastructure.</p>
+
+<h2>Billing</h2>
+<p>PAYG charges are one-time. Subscriptions auto-renew monthly until cancelled. You can cancel at any time via the billing portal; you keep access until the end of your paid period. No refunds for partial periods.</p>
+
+<h2>Rate limits</h2>
+<p>Each plan has per-day and per-target scan limits. Exceeding these limits will block further scans until the limit resets.</p>
+
+<h2>Liability</h2>
+<p>To the maximum extent permitted by law, we are not liable for damages arising from your use of the service, including but not limited to: scans missing vulnerabilities, false positives, service downtime, or actions taken based on AI-generated fix instructions. Always review AI-generated code changes before deploying.</p>
+
+<h2>Termination</h2>
+<p>You can delete your account at any time. We may terminate accounts that violate these terms with reasonable notice.</p>
+
+<h2>Contact</h2>
+<p><a href="mailto:support@slederer.com">support@slederer.com</a></p>
+</div>
+</body></html>""")
+
+
+# ── OAuth Provider (for ChatGPT GPT Actions) ────────────────────────────────
+
+OAUTH_CLIENTS = {
+    # ChatGPT will use this client_id when registering the GPT's OAuth
+    "chatgpt": {
+        "client_secret": os.getenv("CHATGPT_OAUTH_SECRET", secrets.token_hex(32)),
+        "redirect_uris": [
+            "https://chat.openai.com/aip/g-*/oauth/callback",
+            "https://chatgpt.com/aip/g-*/oauth/callback",
+        ],
+        "name": "ChatGPT",
+    },
+}
+
+# In-memory OAuth state (for MVP; use DB for production scale)
+_oauth_authorization_codes: dict[str, dict] = {}
+
+
+def _match_redirect_uri(allowed: list[str], actual: str) -> bool:
+    """Match allowed URIs with wildcards (for ChatGPT's g-* GPT IDs)."""
+    for pattern in allowed:
+        if "*" in pattern:
+            import re as _re
+            regex = _re.escape(pattern).replace(r"\*", r"[^/]+")
+            if _re.match(regex + "$", actual):
+                return True
+        elif pattern == actual:
+            return True
+    return False
+
+
+@app.get("/oauth/authorize", response_class=HTMLResponse)
+async def oauth_authorize(request: Request, client_id: str = "", redirect_uri: str = "",
+                          state: str = "", response_type: str = "code", scope: str = ""):
+    """OAuth 2.0 authorization endpoint — user authorizes a third-party app to access their scanner account."""
+    if response_type != "code":
+        return HTMLResponse("Unsupported response_type", status_code=400)
+    client = OAUTH_CLIENTS.get(client_id)
+    if not client:
+        return HTMLResponse("Invalid client_id", status_code=400)
+    if not _match_redirect_uri(client["redirect_uris"], redirect_uri):
+        return HTMLResponse(f"Invalid redirect_uri. Must match one of {client['redirect_uris']}", status_code=400)
+
+    user = get_user(request)
+    if not user:
+        # Save OAuth params in session, redirect to login
+        request.session["pending_oauth"] = {
+            "client_id": client_id, "redirect_uri": redirect_uri, "state": state, "scope": scope,
+        }
+        return RedirectResponse(f"/login?oauth=1")
+
+    # Authenticated — show consent page
+    client_name = client["name"]
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Authorize {client_name}</title><style>{_AUTH_CSS}</style></head>
+<body>
+<div class="card">
+    <h1><span>&#9632;</span> Authorize {client_name}</h1>
+    <p class="sub"><strong>{client_name}</strong> is requesting access to your Security Scanner account as <strong>{user['email']}</strong>.</p>
+    <p class="sub">This will allow {client_name} to: scan your targets, read scan results, and generate fix files on your behalf.</p>
+    <form method="POST" action="/oauth/authorize">
+        <input type="hidden" name="client_id" value="{client_id}">
+        <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+        <input type="hidden" name="state" value="{state}">
+        <input type="hidden" name="scope" value="{scope}">
+        <button type="submit" class="btn">Authorize</button>
+    </form>
+    <form method="GET" action="{redirect_uri}" style="margin-top:10px;">
+        <input type="hidden" name="error" value="access_denied">
+        <input type="hidden" name="state" value="{state}">
+        <button type="submit" class="btn" style="background:#1f2937;color:#9ca3af;">Deny</button>
+    </form>
+</div>
+</body></html>""")
+
+
+@app.post("/oauth/authorize")
+async def oauth_authorize_post(request: Request):
+    """User consented — issue authorization code."""
+    user = get_user(request)
+    if not user:
+        return RedirectResponse("/login")
+    form = await request.form()
+    client_id = form.get("client_id")
+    redirect_uri = form.get("redirect_uri")
+    state = form.get("state", "")
+    scope = form.get("scope", "")
+
+    client = OAUTH_CLIENTS.get(client_id)
+    if not client or not _match_redirect_uri(client["redirect_uris"], redirect_uri):
+        return JSONResponse({"error": "invalid_client"}, status_code=400)
+
+    code = secrets.token_urlsafe(32)
+    _oauth_authorization_codes[code] = {
+        "user_id": user["user_id"],
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
+    }
+    sep = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(f"{redirect_uri}{sep}code={code}&state={state}")
+
+
+@app.post("/oauth/token")
+async def oauth_token(request: Request):
+    """Exchange authorization code for API key (acts as access token)."""
+    form = await request.form()
+    grant_type = form.get("grant_type")
+    code = form.get("code")
+    client_id = form.get("client_id")
+    client_secret = form.get("client_secret")
+    redirect_uri = form.get("redirect_uri")
+
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    client = OAUTH_CLIENTS.get(client_id)
+    if not client or client["client_secret"] != client_secret:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+    code_data = _oauth_authorization_codes.pop(code, None)
+    if not code_data:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    if code_data["expires_at"] < datetime.now(timezone.utc):
+        return JSONResponse({"error": "invalid_grant", "error_description": "Code expired"}, status_code=400)
+    if code_data["redirect_uri"] != redirect_uri:
+        return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
+
+    # Issue an API key as the access token
+    full_key, prefix, key_hash = generate_api_key()
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO api_keys (user_id, key_hash, key_prefix, label) VALUES (?,?,?,?)",
+            (code_data["user_id"], key_hash, prefix, f"oauth:{client_id}"),
+        )
+
+    return {
+        "access_token": full_key,
+        "token_type": "Bearer",
+        "scope": code_data["scope"],
+    }
+
+
+# ── GitHub Copilot Extension ─────────────────────────────────────────────────
+# Copilot Extensions receive POST messages and return NDJSON SSE-like responses
+# using Copilot's extension API format. The extension is registered as a GitHub App.
+
+@app.post("/copilot")
+async def copilot_extension(request: Request):
+    """Receive a message from GitHub Copilot Chat, respond with scan actions.
+
+    Users invoke: @security-scanner scan https://myapp.com
+
+    GitHub sends: { messages: [{ role, content }], copilot_thread_id, ... }
+    We respond with NDJSON events per Copilot's extension protocol.
+    """
+    from fastapi.responses import StreamingResponse
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    messages = body.get("messages", [])
+    user_message = ""
+    if messages:
+        last = messages[-1]
+        user_message = last.get("content", "") if isinstance(last, dict) else ""
+
+    # Identify the GitHub user — Copilot includes the user via X-GitHub-Token or similar
+    # For MVP, map to email via GitHub token if present; else ask for API key
+    gh_token = request.headers.get("x-github-token", "")
+    gh_email = None
+    if gh_token:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://api.github.com/user/emails",
+                    headers={"Authorization": f"token {gh_token}"},
+                )
+                if resp.status_code == 200:
+                    emails = resp.json()
+                    primary = next((e for e in emails if e.get("primary")), None)
+                    gh_email = primary["email"] if primary else (emails[0]["email"] if emails else None)
+        except Exception:
+            pass
+
+    # Parse intent from the user message
+    import re as _re
+    url_match = _re.search(r"https?://[^\s]+|\b\d+\.\d+\.\d+\.\d+\b", user_message)
+
+    async def stream_response():
+        import json as _json
+        if not gh_email:
+            yield f'data: {_json.dumps({"choices": [{"delta": {"content": "To use Security Scanner, first create an account at https://security.slederer.com and link your GitHub email. Then run your command again."}}]})}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+
+        user = get_user_by_email(gh_email)
+        if not user:
+            yield f'data: {_json.dumps({"choices": [{"delta": {"content": f"No Security Scanner account found for {gh_email}. Sign up at https://security.slederer.com/signup — it takes 30 seconds."}}]})}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+
+        if not url_match:
+            yield f'data: {_json.dumps({"choices": [{"delta": {"content": "Usage: `@security-scanner scan https://myapp.com`. I can also list your targets, show recent scans, or analyze a specific run."}}]})}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+
+        url = url_match.group(0)
+        # Check if intent is scan
+        if "scan" in user_message.lower():
+            # Start a scan via internal API
+            user_id = user["id"]
+            allowed, reason = can_user_scan(user_id)
+            if not allowed:
+                yield f'data: {_json.dumps({"choices": [{"delta": {"content": f"Cannot scan: {reason}. Upgrade at https://security.slederer.com/billing"}}]})}\n\n'
+                yield "data: [DONE]\n\n"
+                return
+
+            host = _re.sub(r"^https?://", "", url).rstrip("/")
+            run_id = str(uuid.uuid4())[:8]
+            now = datetime.now(timezone.utc).isoformat()
+            with get_db() as db:
+                # Auto-create target
+                existing = db.execute(
+                    "SELECT * FROM targets WHERE host=? AND user_id=?", (host, user_id)
+                ).fetchone()
+                if not existing:
+                    db.execute(
+                        "INSERT INTO targets (host, label, added_at, user_id) VALUES (?,?,?,?)",
+                        (host, host, now, user_id),
+                    )
+                db.execute(
+                    "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
+                    (run_id, now, "running", json.dumps([host]), "copilot", user_id),
+                )
+
+            # Fire off scan in background (thread since we're in async)
+            import threading
+            threading.Thread(
+                target=run_full_scan,
+                args=(run_id, [{"ip": host, "name": host}], user_id),
+                daemon=True,
+            ).start()
+
+            msg = (
+                f"Started security scan on `{host}` (run `{run_id}`). "
+                f"This takes 2-5 minutes. "
+                f"Full results: https://security.slederer.com/runs/{run_id}"
+            )
+            yield f'data: {_json.dumps({"choices": [{"delta": {"content": msg}}]})}\n\n'
+            yield "data: [DONE]\n\n"
+        else:
+            yield f'data: {_json.dumps({"choices": [{"delta": {"content": f"Detected URL {url}. Say `scan {url}` to start a scan."}}]})}\n\n'
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream_response(), media_type="text/event-stream")
+
+
+# ── Vercel Integration ───────────────────────────────────────────────────────
+# Vercel integrations get webhooks on deployments. Users install at
+# vercel.com/integrations/security-scanner → we receive deploy events → auto-scan.
+
+@app.post("/vercel/webhook")
+async def vercel_webhook(request: Request):
+    """Receive a Vercel deployment event, trigger a scan."""
+    # Vercel signs webhooks with x-vercel-signature
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    event_type = payload.get("type") or payload.get("event", {}).get("type")
+    if event_type != "deployment.succeeded" and event_type != "deployment.ready":
+        return {"received": True, "skipped": f"event {event_type} not relevant"}
+
+    deployment = payload.get("payload", {}).get("deployment", {}) or payload.get("deployment", {})
+    url = deployment.get("url") or deployment.get("alias", [None])[0]
+    if not url:
+        return {"received": True, "skipped": "no URL in payload"}
+
+    # The team_id / user_id mapping should be stored from OAuth install
+    team_id = payload.get("team_id") or payload.get("teamId")
+
+    # Lookup which scanner user owns this team
+    with get_db() as db:
+        row = db.execute(
+            "SELECT user_id FROM vercel_installs WHERE team_id=? AND is_active=1",
+            (team_id,),
+        ).fetchone() if team_id else None
+
+    if not row:
+        return {"received": True, "skipped": "no scanner account linked to this Vercel team"}
+
+    user_id = row["user_id"]
+    allowed, reason = can_user_scan(user_id)
+    if not allowed:
+        return {"received": True, "skipped": reason}
+
+    # Kick off scan
+    host = url.replace("https://", "").replace("http://", "").rstrip("/")
+    run_id = str(uuid.uuid4())[:8]
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as db:
+        existing = db.execute(
+            "SELECT * FROM targets WHERE host=? AND user_id=?", (host, user_id)
+        ).fetchone()
+        if not existing:
+            db.execute(
+                "INSERT INTO targets (host, label, added_at, user_id) VALUES (?,?,?,?)",
+                (host, f"vercel:{host}", now, user_id),
+            )
+        db.execute(
+            "INSERT INTO scan_runs (id, started_at, status, targets, scan_type, user_id) VALUES (?,?,?,?,?,?)",
+            (run_id, now, "running", json.dumps([host]), "vercel", user_id),
+        )
+
+    import threading
+    threading.Thread(
+        target=run_full_scan,
+        args=(run_id, [{"ip": host, "name": host}], user_id),
+        daemon=True,
+    ).start()
+
+    return {"received": True, "scan_started": True, "run_id": run_id, "target": host}
+
+
+@app.get("/vercel/install")
+async def vercel_install(request: Request, code: str = "", configurationId: str = "",
+                         next: str = "", teamId: str = "", state: str = ""):
+    """Vercel integration install callback. Links the Vercel team to the current scanner user."""
+    user = get_user(request)
+    if not user:
+        # Stash params, go to login
+        from urllib.parse import urlencode
+        request.session["pending_vercel"] = {
+            "code": code, "configurationId": configurationId, "teamId": teamId, "next": next,
+        }
+        return RedirectResponse("/login")
+
+    # Ensure vercel_installs table exists
+    with get_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS vercel_installs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                team_id TEXT,
+                configuration_id TEXT,
+                installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                is_active INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        db.execute(
+            "INSERT INTO vercel_installs (user_id, team_id, configuration_id) VALUES (?,?,?)",
+            (user["user_id"], teamId, configurationId),
+        )
+
+    if next:
+        return RedirectResponse(next)
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Vercel installed</title><style>{_AUTH_CSS}</style></head>
+<body><div class="card">
+    <h1><span>&#10003;</span> Vercel integration installed</h1>
+    <p class="sub">Security Scanner will now auto-scan every Vercel deployment for team <code>{teamId}</code>.</p>
+    <a href="/" class="btn" style="display:inline-block;text-decoration:none;">Go to dashboard</a>
+</div></body></html>""")
+
+
+# ── ChatGPT GPT Action Helper ────────────────────────────────────────────────
+
+@app.get("/chatgpt-setup", response_class=HTMLResponse)
+async def chatgpt_setup(request: Request):
+    """Setup instructions for creating a ChatGPT Custom GPT with our API."""
+    user = get_user(request)
+    if not user:
+        return RedirectResponse("/login?next=/chatgpt-setup")
+    client_secret = OAUTH_CLIENTS["chatgpt"]["client_secret"]
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>ChatGPT Setup — Security Scanner</title><style>
+{_LEGAL_CSS}
+pre {{ background: #111827; border: 1px solid #1f2937; padding: 14px; border-radius: 8px; font-family: 'SF Mono', monospace; font-size: 0.8rem; overflow-x: auto; color: #d1d5db; }}
+code {{ background: #111827; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.85rem; }}
+</style></head>
+<body>
+<nav><a href="/" class="logo"><span>&#9632;</span> Security Scanner</a><a href="/">Dashboard</a></nav>
+<div class="container">
+<h1>Create your ChatGPT GPT</h1>
+<p>Turn Security Scanner into a ChatGPT Custom GPT your team can use directly in chat.</p>
+
+<h2>1. Create a new GPT</h2>
+<p>Go to <a href="https://chat.openai.com/gpts/editor">chat.openai.com/gpts/editor</a> and click "Create a GPT". Give it a name like "Security Scanner" and description "Scan deployed apps for vulnerabilities."</p>
+
+<h2>2. Add Actions from our OpenAPI spec</h2>
+<p>In the GPT builder, click "Actions" → "Create new action" → "Import from URL":</p>
+<pre>https://security.slederer.com/v1/openapi.json</pre>
+
+<h2>3. Configure Authentication</h2>
+<p>In the Actions settings, select <strong>Authentication → OAuth</strong>:</p>
+<ul>
+    <li><strong>Client ID:</strong> <code>chatgpt</code></li>
+    <li><strong>Client Secret:</strong> <code>{client_secret}</code> <span style="color:#9ca3af;font-size:0.8rem;">(keep this private)</span></li>
+    <li><strong>Authorization URL:</strong> <code>https://security.slederer.com/oauth/authorize</code></li>
+    <li><strong>Token URL:</strong> <code>https://security.slederer.com/oauth/token</code></li>
+    <li><strong>Scope:</strong> <code>scan</code></li>
+    <li><strong>Token Exchange Method:</strong> <code>Default (POST request)</code></li>
+</ul>
+
+<h2>4. System prompt</h2>
+<p>Use this as the GPT's instructions:</p>
+<pre>You are a security scanning assistant. When a user gives you a URL, use the scanTarget action to scan it. Poll getScanStatus every 30 seconds until status is "completed". Then retrieve findings and fix instructions via getFixFile. Present findings by severity (CRITICAL first). Always warn: "Only scan targets you own or have permission to test."</pre>
+
+<h2>5. Publish</h2>
+<p>Set privacy policy URL to <code>https://security.slederer.com/privacy</code>, then publish publicly or keep it private to you.</p>
+</div>
+</body></html>""")
 
 
 if __name__ == "__main__":

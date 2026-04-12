@@ -6,9 +6,13 @@ import json
 class TestAuthRequired:
     """Unauthenticated requests should be rejected."""
 
-    def test_dashboard_redirects(self, anon_client):
+    def test_root_shows_landing_page_when_anonymous(self, anon_client):
+        """Unauthenticated users see the public landing page, not a redirect."""
         r = anon_client.get("/")
-        assert r.status_code == 307
+        assert r.status_code == 200
+        assert "Security Scanner" in r.text
+        # Landing page has pricing section
+        assert "$29" in r.text or "Pricing" in r.text or "/signup" in r.text
 
     def test_api_runs_unauthorized(self, anon_client):
         r = anon_client.get("/api/runs")

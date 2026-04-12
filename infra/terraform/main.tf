@@ -351,24 +351,6 @@ resource "aws_iam_role_policy" "mediatailor_s3_policy" {
   })
 }
 
-resource "aws_media_tailor_playback_configuration" "vod" {
-  name                     = "${var.project_name}-vod"
-  video_content_source_url = "https://${aws_cloudfront_distribution.cdn.domain_name}"
-  ad_decision_server_url   = var.ad_decision_server_url
-
-  cdn_configuration {
-    ad_segment_url_prefix      = "https://${aws_cloudfront_distribution.cdn.domain_name}"
-    content_segment_url_prefix = "https://${aws_cloudfront_distribution.cdn.domain_name}"
-  }
-}
-
-resource "aws_media_tailor_playback_configuration" "live" {
-  name                     = "${var.project_name}-live"
-  video_content_source_url = "https://${aws_cloudfront_distribution.cdn.domain_name}/live"
-  ad_decision_server_url   = var.ad_decision_server_url
-
-  cdn_configuration {
-    ad_segment_url_prefix      = "https://${aws_cloudfront_distribution.cdn.domain_name}"
-    content_segment_url_prefix = "https://${aws_cloudfront_distribution.cdn.domain_name}"
-  }
-}
+# MediaTailor playback configurations are created via AWS CLI after terraform apply
+# (aws_media_tailor_playback_configuration is not supported in this provider version)
+# See infra/scripts/setup-mediatailor.sh

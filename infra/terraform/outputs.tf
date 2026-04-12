@@ -33,12 +33,4 @@ output "cloudfront_distribution_id" {
   value       = aws_cloudfront_distribution.cdn.id
 }
 
-output "mediatailor_vod_playback_url" {
-  description = "MediaTailor VOD session initialization endpoint"
-  value       = aws_media_tailor_playback_configuration.vod.playback_endpoint_prefix
-}
-
-output "mediatailor_live_playback_url" {
-  description = "MediaTailor Live session initialization endpoint"
-  value       = aws_media_tailor_playback_configuration.live.playback_endpoint_prefix
-}
+# MediaTailor outputs will be available after running setup-mediatailor.sh

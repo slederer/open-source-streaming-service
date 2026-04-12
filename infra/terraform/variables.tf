@@ -13,7 +13,7 @@ variable "project_name" {
 variable "ec2_instance_type" {
   description = "EC2 instance type for the application server"
   type        = string
-  default     = "t3.medium"
+  default     = "t3.small"
 }
 
 variable "ec2_key_pair_name" {

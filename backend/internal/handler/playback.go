@@ -53,8 +53,9 @@ func (h *Handler) GetVideoPlayback(w http.ResponseWriter, r *http.Request) {
 			h.Config.MediaTailorVODEndpoint, video.EncodingJobID)
 	}
 
-	// Add DRM token if DoveRunner (formerly PallyCon) is configured
-	if h.Config.PallyConSiteID != "" && video.DRMContentID != "" {
+	// Add DRM token only if the video was actually DRM-encrypted during encoding
+	// (encoding_job_id is set AND drm_content_id is set = real Bitmovin encoding with DRM)
+	if h.Config.PallyConSiteID != "" && video.DRMContentID != "" && video.EncodingJobID != "" {
 		resp["drm_token"] = generatePallyConToken(h.Config, video.DRMContentID)
 		resp["drm_widevine_url"] = "https://license.pallycon.com/ri/widevineLicense"
 		resp["drm_fairplay_url"] = "https://license.pallycon.com/ri/fpLicense"

@@ -139,3 +139,82 @@ class TestCompareRuns:
         assert data["new_count"] == 1
         assert data["fixed_count"] == 1
         assert data["persistent"] == 1
+
+
+class TestTargetDiffs:
+    def test_target_diffs_with_previous_run(self, client, db):
+        """Two runs scanning the same target — verify per-target diff."""
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td1', '2026-04-11T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td2', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
+        # Previous run: 2 findings
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td1', '10.0.0.1', 'HIGH', 'web', 'Old vuln', 't')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td1', '10.0.0.1', 'MEDIUM', 'web', 'Still there', 't')")
+        # Current run: 1 persistent + 1 new
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td2', '10.0.0.1', 'MEDIUM', 'web', 'Still there', 't')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td2', '10.0.0.1', 'LOW', 'web', 'Brand new', 't')")
+        db.commit()
+
+        r = client.get("/api/runs/td2/target-diffs")
+        assert r.status_code == 200
+        data = r.json()
+        assert "10.0.0.1" in data
+        diff = data["10.0.0.1"]
+        assert diff["new_count"] == 1
+        assert diff["fixed_count"] == 1
+        assert diff["persistent_count"] == 1
+        assert diff["prev_run_id"] == "td1"
+        assert "Brand new" in diff["new"]
+        assert "Old vuln" in diff["fixed"]
+
+    def test_target_diffs_no_previous(self, client, db):
+        """First scan for a target — no diff data."""
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td3', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td3', '10.0.0.1', 'HIGH', 'web', 'First finding', 't')")
+        db.commit()
+
+        r = client.get("/api/runs/td3/target-diffs")
+        assert r.status_code == 200
+        data = r.json()
+        assert data == {}  # no previous run to compare against
+
+    def test_target_diffs_multiple_targets_independent(self, client, db):
+        """Each target compared against its own previous scan independently."""
+        # Run 1: scans target A only
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td4', '2026-04-11T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td4', '10.0.0.1', 'HIGH', 'web', 'A-old', 't')")
+        # Run 2: scans target B only
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td5', '2026-04-11T11:00:00', 'completed', '[\"10.0.0.2\"]', '{}')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td5', '10.0.0.2', 'MEDIUM', 'web', 'B-old', 't')")
+        # Run 3: scans both A and B
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td6', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\",\"10.0.0.2\"]', '{}')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td6', '10.0.0.1', 'LOW', 'web', 'A-new', 't')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td6', '10.0.0.2', 'MEDIUM', 'web', 'B-old', 't')")
+        db.commit()
+
+        r = client.get("/api/runs/td6/target-diffs")
+        data = r.json()
+
+        # Target A: compared against td4 (A-old fixed, A-new is new)
+        assert data["10.0.0.1"]["prev_run_id"] == "td4"
+        assert data["10.0.0.1"]["new_count"] == 1
+        assert data["10.0.0.1"]["fixed_count"] == 1
+
+        # Target B: compared against td5 (B-old persistent, nothing new)
+        assert data["10.0.0.2"]["prev_run_id"] == "td5"
+        assert data["10.0.0.2"]["new_count"] == 0
+        assert data["10.0.0.2"]["fixed_count"] == 0
+        assert data["10.0.0.2"]["persistent_count"] == 1
+
+    def test_target_diffs_included_in_get_run(self, client, db):
+        """GET /api/runs/{id} includes target_diffs in response."""
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td7', '2026-04-11T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td7', '10.0.0.1', 'HIGH', 'web', 'Old', 't')")
+        db.execute("INSERT INTO scan_runs (id, started_at, status, targets, summary_json) VALUES ('td8', '2026-04-12T10:00:00', 'completed', '[\"10.0.0.1\"]', '{}')")
+        db.execute("INSERT INTO findings (run_id, target, severity, category, title, tool) VALUES ('td8', '10.0.0.1', 'HIGH', 'web', 'Old', 't')")
+        db.commit()
+
+        r = client.get("/api/runs/td8")
+        data = r.json()
+        assert "target_diffs" in data
+        assert "10.0.0.1" in data["target_diffs"]
+        assert data["target_diffs"]["10.0.0.1"]["persistent_count"] == 1

@@ -736,6 +736,61 @@ async def list_runs(request: Request):
         return [dict(r) for r in rows]
 
 
+def _compute_target_diffs(run_id: str) -> dict:
+    """Compute per-target diffs against each target's most recent previous scan."""
+    diffs = {}
+    with get_db() as db:
+        run = db.execute("SELECT started_at FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return diffs
+        run_started = run["started_at"]
+
+        # Get all unique targets in this run
+        current_targets = db.execute(
+            "SELECT DISTINCT target FROM findings WHERE run_id=?", (run_id,)
+        ).fetchall()
+
+        for row in current_targets:
+            target = row["target"]
+
+            # Find the most recent completed run (before this one) that scanned this target
+            prev_run = db.execute(
+                "SELECT id FROM scan_runs WHERE id != ? AND status IN ('completed','aborted') AND started_at < ? AND targets LIKE ? ORDER BY started_at DESC LIMIT 1",
+                (run_id, run_started, f'%{target}%'),
+            ).fetchone()
+
+            if not prev_run:
+                continue
+
+            prev_id = prev_run["id"]
+
+            # Get findings for this target in both runs
+            current_findings = db.execute(
+                "SELECT title FROM findings WHERE run_id=? AND target=?", (run_id, target)
+            ).fetchall()
+            previous_findings = db.execute(
+                "SELECT title FROM findings WHERE run_id=? AND target=?", (prev_id, target)
+            ).fetchall()
+
+            current_set = {r["title"] for r in current_findings}
+            previous_set = {r["title"] for r in previous_findings}
+
+            new = current_set - previous_set
+            fixed = previous_set - current_set
+            persistent = current_set & previous_set
+
+            diffs[target] = {
+                "new": sorted(new),
+                "fixed": sorted(fixed),
+                "new_count": len(new),
+                "fixed_count": len(fixed),
+                "persistent_count": len(persistent),
+                "prev_run_id": prev_id,
+            }
+
+    return diffs
+
+
 @app.get("/api/runs/{run_id}")
 async def get_run(request: Request, run_id: str):
     user = get_user(request)
@@ -749,15 +804,29 @@ async def get_run(request: Request, run_id: str):
             "SELECT * FROM findings WHERE run_id=? ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END, target",
             (run_id,),
         ).fetchall()
-        return {"run": dict(run), "findings": [dict(f) for f in findings]}
+    target_diffs = _compute_target_diffs(run_id)
+    return {"run": dict(run), "findings": [dict(f) for f in findings], "target_diffs": target_diffs}
+
+
+@app.get("/api/runs/{run_id}/target-diffs")
+async def get_target_diffs(request: Request, run_id: str):
+    """Per-target comparison against each target's most recent previous scan."""
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    with get_db() as db:
+        run = db.execute("SELECT id FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+    return _compute_target_diffs(run_id)
 
 
 @app.get("/api/runs/{run_id}/compare/{other_id}")
 async def compare_runs(request: Request, run_id: str, other_id: str):
+    """Compare two scan runs — show new, fixed, and persistent findings."""
     user = get_user(request)
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    """Compare two scan runs — show new, fixed, and persistent findings."""
     with get_db() as db:
         current = db.execute("SELECT target, severity, title FROM findings WHERE run_id=?", (run_id,)).fetchall()
         previous = db.execute("SELECT target, severity, title FROM findings WHERE run_id=?", (other_id,)).fetchall()
@@ -935,12 +1004,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .copy-btn:hover { background: var(--muted); }
 
   /* Compare banner */
-  .compare-banner { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 24px; margin-bottom: 24px; display: none; }
-  .compare-banner h3 { font-size: 0.9rem; margin-bottom: 8px; }
-  .compare-row { display: flex; gap: 24px; }
-  .compare-item { font-size: 0.85rem; }
-  .compare-item.new { color: var(--critical); }
-  .compare-item.fixed { color: var(--green); }
+  .target-diff { display: flex; gap: 12px; margin-top: 8px; font-size: 0.75rem; align-items: center; flex-wrap: wrap; }
+  .target-diff .diff-new { color: var(--critical); font-weight: 600; }
+  .target-diff .diff-fixed { color: var(--green); font-weight: 600; }
+  .target-diff .diff-unchanged { color: var(--muted); }
+  .target-diff .diff-prev { color: var(--muted); font-size: 0.7rem; opacity: 0.7; }
 
   /* Filter buttons in results */
   .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -1021,10 +1089,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       <div class="stats" id="stats"></div>
 
-      <div class="compare-banner" id="compare-banner">
-        <h3>Changes from previous scan</h3>
-        <div class="compare-row" id="compare-content"></div>
-      </div>
+      <!-- per-target diffs shown inline in results cards -->
 
       <div class="filters" id="filters"></div>
 
@@ -1045,6 +1110,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script>
 let currentRunId = null;
 let allFindings = [];
+let targetDiffs = {};
 let activeFilter = 'ALL';
 let pollInterval = null;
 let targetsCache = [];
@@ -1166,6 +1232,7 @@ async function viewRun(runId) {
 async function loadRunResults(runId) {
   const data = await fetchJSON(`/api/runs/${runId}`);
   allFindings = data.findings;
+  targetDiffs = data.target_diffs || {};
 
   document.getElementById('results-empty').style.display = 'none';
   document.getElementById('results-content').style.display = 'block';
@@ -1183,27 +1250,6 @@ async function loadRunResults(runId) {
       <div class="stat low"><div class="label">Low</div><div class="value">${summary.low}</div></div>
       <div class="stat info"><div class="label">Info</div><div class="value">${summary.info}</div></div>
     `;
-  }
-
-  // Compare with previous run
-  const runs = await fetchJSON('/api/runs');
-  const idx = runs.findIndex(r => r.id === runId);
-  const banner = document.getElementById('compare-banner');
-  if (idx >= 0 && idx < runs.length - 1) {
-    const prevId = runs[idx + 1].id;
-    const cmp = await fetchJSON(`/api/runs/${runId}/compare/${prevId}`);
-    if (cmp.new_count > 0 || cmp.fixed_count > 0) {
-      banner.style.display = 'block';
-      document.getElementById('compare-content').innerHTML = `
-        <span class="compare-item new">+${cmp.new_count} new findings</span>
-        <span class="compare-item fixed">-${cmp.fixed_count} fixed</span>
-        <span class="compare-item">${cmp.persistent} unchanged</span>
-      `;
-    } else {
-      banner.style.display = 'none';
-    }
-  } else {
-    banner.style.display = 'none';
   }
 
   // Filters
@@ -1290,6 +1336,17 @@ function renderResults() {
       ${counts.LOW ? `<span class="badge LOW">${counts.LOW} LOW</span>` : ''}
       ${counts.INFO ? `<span class="badge INFO">${counts.INFO} INFO</span>` : ''}
     </div>`;
+    // Per-target diff vs previous scan
+    const diff = targetDiffs[target];
+    if (diff) {
+      html += `<div class="target-diff">`;
+      if (diff.new_count > 0) html += `<span class="diff-new">+${diff.new_count} new</span>`;
+      if (diff.fixed_count > 0) html += `<span class="diff-fixed">${diff.fixed_count} fixed</span>`;
+      html += `<span class="diff-unchanged">${diff.persistent_count} unchanged</span>`;
+      html += `<span class="diff-prev">vs #${diff.prev_run_id}</span>`;
+      html += `</div>`;
+    }
+
     html += `</div>`; // header
 
     // Findings grouped by severity

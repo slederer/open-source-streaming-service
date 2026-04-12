@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" id="com.osstream.vidaa" version="1.0.0">
+    <name>OSStream</name>
+    <description>Open Source Streaming Service</description>
+    <author>slederer</author>
+    <content src="index.html" />
+    <icon src="icon.png" />
+    <feature name="http://tizen.org/feature/screen.size.all" />
+    <tizen:application id="osstream" package="com.osstream" required_version="2.3" />
+</widget>

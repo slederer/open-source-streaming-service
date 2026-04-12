@@ -1,0 +1,176 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: #0a0a0f;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    overflow: hidden;
+    width: 1920px;
+    height: 1080px;
+}
+
+.view {
+    display: none;
+    width: 100%;
+    height: 100%;
+    position: absolute;
+    top: 0;
+    left: 0;
+}
+
+.view.active {
+    display: flex;
+    flex-direction: column;
+}
+
+/* Header */
+header {
+    padding: 30px 60px;
+    font-size: 28px;
+}
+
+header .accent {
+    color: #3b82f6;
+}
+
+/* Gallery Grid */
+.grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 20px;
+    padding: 20px 60px;
+    overflow: hidden;
+}
+
+.card {
+    position: relative;
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+    background: #1a1a2e;
+}
+
+.card.focused {
+    transform: scale(1.08);
+    box-shadow: 0 0 0 3px #3b82f6, 0 8px 32px rgba(59, 130, 246, 0.3);
+    z-index: 10;
+}
+
+.card-thumb {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #16213e;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #4a5568;
+    font-size: 14px;
+}
+
+.card-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.card-duration {
+    position: absolute;
+    bottom: 40px;
+    right: 8px;
+    background: rgba(0, 0, 0, 0.8);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.card-title {
+    padding: 8px 10px 4px;
+    font-size: 14px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.card-meta {
+    padding: 0 10px 10px;
+    font-size: 11px;
+    color: #9ca3af;
+}
+
+/* Detail View */
+#detail-view {
+    flex-direction: row;
+    padding: 60px;
+    gap: 40px;
+}
+
+.detail-poster {
+    width: 55%;
+    height: 100%;
+    background: #1a1a2e;
+    border-radius: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.detail-info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding-top: 40px;
+}
+
+.detail-info h2 {
+    font-size: 36px;
+}
+
+.detail-info .meta {
+    color: #9ca3af;
+    font-size: 16px;
+}
+
+.detail-info p {
+    font-size: 18px;
+    line-height: 1.6;
+    color: #d1d5db;
+}
+
+.btn {
+    display: inline-block;
+    padding: 14px 40px;
+    background: #374151;
+    border-radius: 8px;
+    font-size: 18px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+    width: fit-content;
+}
+
+.btn.focused {
+    background: #fff;
+    color: #000;
+}
+
+/* Player */
+#player-view {
+    display: none;
+    background: #000;
+}
+
+#player-view.active {
+    display: block;
+}
+
+#player-container {
+    width: 1920px;
+    height: 1080px;
+}

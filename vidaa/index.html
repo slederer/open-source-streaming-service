@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1920, initial-scale=1.0">
+    <title>OSStream</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <!-- Gallery View -->
+    <div id="gallery-view" class="view active">
+        <header>
+            <h1>OSS<span class="accent">tream</span></h1>
+        </header>
+        <div id="video-grid" class="grid"></div>
+    </div>
+
+    <!-- Detail View -->
+    <div id="detail-view" class="view">
+        <div id="detail-poster" class="detail-poster"></div>
+        <div class="detail-info">
+            <h2 id="detail-title"></h2>
+            <p id="detail-meta" class="meta"></p>
+            <p id="detail-description"></p>
+            <div id="detail-play-btn" class="btn focused">&#9654; Play</div>
+        </div>
+    </div>
+
+    <!-- Player View -->
+    <div id="player-view" class="view">
+        <div id="player-container"></div>
+    </div>
+
+    <!-- Bitmovin Player SDK -->
+    <script src="https://cdn.bitmovin.com/player/web/8/bitmovinplayer.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/player.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>

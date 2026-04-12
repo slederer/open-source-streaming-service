@@ -15,7 +15,7 @@ from typing import Optional
 
 from authlib.integrations.starlette_client import OAuth
 from fastapi import FastAPI, BackgroundTasks, Request, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 DB_PATH = Path(os.getenv("SCANNER_DB", "/home/ec2-user/scanner.db"))
@@ -85,9 +85,41 @@ def init_db():
                 tool TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS targets (
+                id INTEGER PRIMARY KEY,
+                host TEXT UNIQUE NOT NULL,
+                label TEXT,
+                added_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
             CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
         """)
+    # Seed targets from file on first run
+    _seed_targets_from_file()
+
+
+def _seed_targets_from_file():
+    """Import targets from the legacy targets.txt file if the DB table is empty."""
+    if not TARGETS_FILE.exists():
+        return
+    with get_db() as db:
+        count = db.execute("SELECT COUNT(*) FROM targets").fetchone()[0]
+        if count > 0:
+            return
+        for line in TARGETS_FILE.read_text().strip().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("#", 1)
+            host = parts[0].strip()
+            label = parts[1].strip() if len(parts) > 1 else host
+            try:
+                db.execute(
+                    "INSERT OR IGNORE INTO targets (host, label, added_at) VALUES (?, ?, ?)",
+                    (host, label, datetime.now(timezone.utc).isoformat()),
+                )
+            except sqlite3.IntegrityError:
+                pass
 
 
 @contextmanager
@@ -106,17 +138,12 @@ def get_db():
 # ── Scanning Logic ────────────────────────────────────────────────────────────
 
 def parse_targets() -> list[dict]:
-    """Read targets from file, return list of {ip, name}."""
+    """Read targets from DB, return list of {ip, name}."""
     targets = []
-    if TARGETS_FILE.exists():
-        for line in TARGETS_FILE.read_text().strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("#", 1)
-            ip = parts[0].strip()
-            name = parts[1].strip() if len(parts) > 1 else ip
-            targets.append({"ip": ip, "name": name})
+    with get_db() as db:
+        rows = db.execute("SELECT host, label FROM targets ORDER BY id").fetchall()
+        for row in rows:
+            targets.append({"ip": row["host"], "name": row["label"] or row["host"]})
     return targets
 
 
@@ -449,6 +476,110 @@ def run_full_scan(run_id: str, targets: list[dict]):
     _update_summary(run_id, status="completed")
 
 
+# ── Remediation Helpers ──────────────────────────────────────────────────────
+
+REMEDIATION_PATTERNS = [
+    (r"(?i)unauthenticated access", "Add authentication middleware. Require credentials on all endpoints."),
+    (r"(?i)missing X-Content-Type-Options", "Add `X-Content-Type-Options: nosniff` header to all responses."),
+    (r"(?i)missing Strict-Transport-Security", "Add `Strict-Transport-Security: max-age=31536000; includeSubDomains` header."),
+    (r"(?i)missing X-Frame-Options", "Add `X-Frame-Options: DENY` or `SAMEORIGIN` header to prevent clickjacking."),
+    (r"(?i)missing Content-Security-Policy", "Add a Content-Security-Policy header appropriate for your application."),
+    (r"(?i)missing Referrer-Policy", "Add `Referrer-Policy: strict-origin-when-cross-origin` header."),
+    (r"(?i)server version disclosure", "Suppress the Server header or remove version information."),
+    (r"(?i)X-Powered-By disclosure", "Remove the X-Powered-By header from all responses."),
+    (r"(?i)exposed endpoint.*(/docs|/swagger|/openapi|/redoc)", "Disable Swagger docs in production or protect behind authentication."),
+    (r"(?i)exposed endpoint.*/\.env", "URGENT: Remove .env from web root. Rotate ALL secrets immediately."),
+    (r"(?i)exposed endpoint.*/\.git", "URGENT: Remove .git directory from web root. Review for leaked secrets."),
+    (r"(?i)exposed endpoint.*/actuator", "Disable Spring Boot Actuator in production or protect behind authentication."),
+    (r"(?i)exposed endpoint.*/debug", "Disable debug endpoints in production."),
+    (r"(?i)exposed endpoint.*/admin", "Protect the admin endpoint behind authentication."),
+    (r"(?i)exposed endpoint.*/server-status", "Disable server-status or restrict to internal IPs."),
+    (r"(?i)self-signed TLS", "Replace with a valid certificate from Let's Encrypt or your CA."),
+    (r"(?i)TLS certificate expiring", "Renew TLS certificate before expiry. Consider automated renewal with certbot."),
+    (r"(?i)end-of-life nginx", "Upgrade nginx to a currently supported version."),
+    (r"(?i)werkzeug dev server", "Replace the Werkzeug development server with a production WSGI server (gunicorn, uvicorn)."),
+    (r"(?i)no rate limiting", "Add rate limiting middleware (e.g., 10 req/s per IP)."),
+    (r"(?i)open port", None),  # info only
+]
+
+
+def get_remediation(title: str, category: str = "") -> str:
+    """Generate remediation text based on finding title patterns."""
+    for pattern, remediation in REMEDIATION_PATTERNS:
+        if re.search(pattern, title):
+            return remediation if remediation else ""
+    return "Review and assess whether this finding requires action."
+
+
+def _generate_fix_markdown(run_id: str, target_filter: str = None) -> str:
+    """Generate fix instructions markdown for a run, optionally filtered by target."""
+    with get_db() as db:
+        run = db.execute("SELECT * FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return ""
+
+        if target_filter:
+            findings = db.execute(
+                "SELECT * FROM findings WHERE run_id=? AND target=? ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END",
+                (run_id, target_filter),
+            ).fetchall()
+        else:
+            findings = db.execute(
+                "SELECT * FROM findings WHERE run_id=? ORDER BY target, CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END",
+                (run_id,),
+            ).fetchall()
+
+        # Get target labels
+        targets_db = db.execute("SELECT host, label FROM targets").fetchall()
+        target_labels = {t["host"]: t["label"] or t["host"] for t in targets_db}
+
+    # Group findings by target, then severity
+    by_target = {}
+    for f in findings:
+        t = f["target"]
+        if t not in by_target:
+            by_target[t] = {"CRITICAL": [], "HIGH": [], "MEDIUM": [], "LOW": [], "INFO": []}
+        sev = f["severity"] if f["severity"] in by_target[t] else "INFO"
+        by_target[t][sev].append(f)
+
+    scan_date = run["started_at"][:10] if run["started_at"] else "unknown"
+    md_parts = []
+
+    for target_host, sevs in by_target.items():
+        label = target_labels.get(target_host, target_host)
+        md_parts.append(f"# Security Fix Instructions — {label} ({target_host})")
+        md_parts.append(f"\nScan date: {scan_date}\n")
+
+        for sev_name in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]:
+            items = sevs[sev_name]
+            if not items:
+                continue
+            md_parts.append(f"## {sev_name} Issues\n")
+            for item in items:
+                remediation = get_remediation(item["title"], item["category"])
+                md_parts.append(f"### {item['title']}")
+                if item["evidence"]:
+                    md_parts.append(f"- **Evidence:** {item['evidence']}")
+                if item["description"]:
+                    md_parts.append(f"- **Description:** {item['description']}")
+                md_parts.append(f"- **Tool:** {item['tool']}")
+                if remediation:
+                    md_parts.append(f"- **Remediation:** {remediation}")
+                md_parts.append("")
+
+        # INFO section summary
+        info_items = sevs["INFO"]
+        if info_items:
+            md_parts.append("## INFO (no action required)\n")
+            for item in info_items:
+                md_parts.append(f"- {item['title']}")
+            md_parts.append("")
+
+        md_parts.append("---\n")
+
+    return "\n".join(md_parts)
+
+
 # ── Auth Routes ────────────────────────────────────────────────────────────────
 
 @app.get("/login", response_class=HTMLResponse)
@@ -523,6 +654,54 @@ async def logout(request: Request):
 def startup():
     init_db()
 
+
+# ── Target Management API ────────────────────────────────────────────────────
+
+@app.get("/api/targets")
+async def list_targets(request: Request):
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM targets ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+
+@app.post("/api/targets")
+async def add_target(request: Request):
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    host = (body.get("host") or "").strip()
+    label = (body.get("label") or "").strip() or host
+    if not host:
+        return JSONResponse({"error": "host is required"}, status_code=400)
+    # Strip protocol if URL provided
+    host = re.sub(r"^https?://", "", host).rstrip("/")
+    try:
+        with get_db() as db:
+            db.execute(
+                "INSERT INTO targets (host, label, added_at) VALUES (?, ?, ?)",
+                (host, label, datetime.now(timezone.utc).isoformat()),
+            )
+            row = db.execute("SELECT * FROM targets WHERE host=?", (host,)).fetchone()
+            return dict(row)
+    except sqlite3.IntegrityError:
+        return JSONResponse({"error": "Target already exists"}, status_code=409)
+
+
+@app.delete("/api/targets/{target_id}")
+async def delete_target(request: Request, target_id: int):
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    with get_db() as db:
+        db.execute("DELETE FROM targets WHERE id=?", (target_id,))
+    return {"ok": True}
+
+
+# ── Scan API ─────────────────────────────────────────────────────────────────
 
 @app.post("/api/scan")
 async def start_scan(request: Request, background_tasks: BackgroundTasks, scan_type: str = "full"):
@@ -599,6 +778,34 @@ async def compare_runs(request: Request, run_id: str, other_id: str):
     }
 
 
+# ── Fix File API ─────────────────────────────────────────────────────────────
+
+@app.get("/api/runs/{run_id}/fix/{target}")
+async def get_fix_for_target(request: Request, run_id: str, target: str):
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    md = _generate_fix_markdown(run_id, target_filter=target)
+    if not md:
+        return JSONResponse({"error": "No findings"}, status_code=404)
+    return PlainTextResponse(md, media_type="text/markdown", headers={
+        "Content-Disposition": f'attachment; filename="SECURITY-FIX-{target}.md"'
+    })
+
+
+@app.get("/api/runs/{run_id}/fix-all")
+async def get_fix_all(request: Request, run_id: str):
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    md = _generate_fix_markdown(run_id)
+    if not md:
+        return JSONResponse({"error": "No findings"}, status_code=404)
+    return PlainTextResponse(md, media_type="text/markdown", headers={
+        "Content-Disposition": f'attachment; filename="SECURITY-FIX-{run_id}.md"'
+    })
+
+
 # ── HTML Dashboard ────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -617,14 +824,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'SF Mono', monospace; background: var(--bg); color: var(--text); }
   .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
-  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 32px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+
+  /* Header */
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
   header h1 { font-size: 1.4rem; font-weight: 600; letter-spacing: -0.02em; }
   header h1 span { color: var(--critical); }
+
+  /* Navigation tabs */
+  .nav-tabs { display: flex; gap: 0; margin-top: 0; margin-bottom: 32px; border-bottom: 1px solid var(--border); }
+  .nav-tab { padding: 12px 24px; font-size: 0.85rem; font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s; font-family: inherit; background: none; border-top: none; border-left: none; border-right: none; }
+  .nav-tab:hover { color: var(--text); }
+  .nav-tab.active { color: var(--text); border-bottom-color: var(--critical); }
+
+  /* Tab panels */
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* Buttons */
   .btn { background: var(--critical); color: #fff; border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600; font-family: inherit; }
   .btn:hover { opacity: 0.9; }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
   .btn-outline:hover { border-color: var(--muted); }
+  .btn-sm { padding: 4px 12px; font-size: 0.75rem; }
+  .btn-green { background: var(--green); }
+  .btn-blue { background: var(--low); }
+  .btn-icon { background: transparent; border: 1px solid var(--border); color: var(--muted); width: 28px; height: 28px; border-radius: 6px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; font-size: 1rem; padding: 0; }
+  .btn-icon:hover { border-color: var(--critical); color: var(--critical); }
 
   /* Stats bar */
   .stats { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
@@ -637,6 +863,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .stat.low .value { color: var(--low); }
   .stat.info .value { color: var(--info); }
   .stat.fixed .value { color: var(--green); }
+
+  /* Target cards */
+  .targets-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .target-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; display: flex; justify-content: space-between; align-items: center; }
+  .target-host { font-weight: 600; font-size: 0.9rem; }
+  .target-label { color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
+  .target-added { color: var(--muted); font-size: 0.7rem; margin-top: 4px; }
+  .add-target-form { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
+  .add-target-form input { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; color: var(--text); font-family: inherit; font-size: 0.85rem; min-width: 200px; flex: 1; }
+  .add-target-form input:focus { outline: none; border-color: var(--muted); }
+  .add-target-form input::placeholder { color: var(--muted); }
 
   /* Runs list */
   .runs { margin-bottom: 32px; }
@@ -660,17 +897,42 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .badge.LOW { background: #172554; color: #93c5fd; }
   .badge.INFO { background: #1f2937; color: #9ca3af; }
 
-  /* Findings table */
-  .findings { margin-top: 24px; }
-  .findings h2 { font-size: 1rem; margin-bottom: 12px; color: var(--muted); }
-  .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-  .filter-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 16px; font-size: 0.75rem; cursor: pointer; font-family: inherit; }
-  .filter-btn.active { border-color: var(--text); color: var(--text); }
-  table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; padding: 8px 12px; font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); }
-  td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 0.85rem; vertical-align: top; }
-  tr:hover { background: rgba(255,255,255,0.02); }
-  .evidence { color: var(--muted); font-size: 0.8rem; max-width: 400px; word-break: break-all; }
+  /* Health grade */
+  .grade { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 8px; font-weight: 800; font-size: 1.1rem; }
+  .grade-A { background: #14532d; color: #4ade80; }
+  .grade-B { background: #422006; color: #fde047; }
+  .grade-C { background: #431407; color: #fdba74; }
+  .grade-F { background: #450a0a; color: #fca5a5; }
+
+  /* Results: per-target breakdown */
+  .target-result-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+  .target-result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .target-result-title { display: flex; align-items: center; gap: 12px; }
+  .target-result-host { font-weight: 600; font-size: 1rem; }
+  .target-result-label { color: var(--muted); font-size: 0.8rem; }
+  .severity-counts { display: flex; gap: 8px; }
+
+  /* Collapsible finding */
+  .finding-row { border-bottom: 1px solid var(--border); padding: 10px 0; cursor: pointer; }
+  .finding-row:last-child { border-bottom: none; }
+  .finding-summary { display: flex; align-items: center; gap: 12px; }
+  .finding-title { font-size: 0.85rem; font-weight: 500; flex: 1; }
+  .finding-tool { color: var(--muted); font-size: 0.75rem; min-width: 60px; text-align: right; }
+  .finding-chevron { color: var(--muted); font-size: 0.75rem; transition: transform 0.2s; }
+  .finding-row.open .finding-chevron { transform: rotate(90deg); }
+  .finding-details { display: none; padding: 8px 0 4px 40px; font-size: 0.8rem; color: var(--muted); }
+  .finding-row.open .finding-details { display: block; }
+  .finding-details dt { font-weight: 600; color: var(--text); margin-top: 6px; }
+  .finding-details dd { margin-left: 0; margin-bottom: 4px; word-break: break-all; }
+
+  /* Fix file section */
+  .fix-section { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-top: 24px; }
+  .fix-section h3 { font-size: 0.95rem; margin-bottom: 12px; }
+  .fix-actions { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .prompt-block { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-size: 0.8rem; color: var(--text); position: relative; word-break: break-all; }
+  .prompt-block code { display: block; white-space: pre-wrap; }
+  .copy-btn { position: absolute; top: 8px; right: 8px; background: var(--border); border: none; color: var(--text); padding: 4px 8px; border-radius: 4px; font-size: 0.7rem; cursor: pointer; font-family: inherit; }
+  .copy-btn:hover { background: var(--muted); }
 
   /* Compare banner */
   .compare-banner { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 24px; margin-bottom: 24px; display: none; }
@@ -680,11 +942,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .compare-item.new { color: var(--critical); }
   .compare-item.fixed { color: var(--green); }
 
+  /* Filter buttons in results */
+  .filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .filter-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 16px; font-size: 0.75rem; cursor: pointer; font-family: inherit; }
+  .filter-btn.active { border-color: var(--text); color: var(--text); }
+
   /* Loading */
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--text); border-radius: 50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
   .empty { color: var(--muted); text-align: center; padding: 48px; }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    .container { padding: 12px; }
+    .stats { gap: 8px; }
+    .stat { min-width: 100px; padding: 12px 16px; }
+    .stat .value { font-size: 1.4rem; }
+    .targets-grid { grid-template-columns: 1fr; }
+    .add-target-form { flex-direction: column; }
+    .add-target-form input { min-width: 100%; }
+    .run-card { flex-direction: column; align-items: flex-start; gap: 8px; }
+    .nav-tab { padding: 10px 16px; font-size: 0.8rem; }
+    header { flex-direction: column; gap: 12px; align-items: flex-start; }
+  }
 </style>
 </head>
 <body>
@@ -694,31 +975,70 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div style="display:flex;gap:8px;align-items:center;">
       <!--USER_INFO-->
       <span id="scan-status" style="font-size:0.8rem;color:var(--muted);"></span>
-      <button class="btn" id="scan-btn" onclick="startScan()">Run Scan</button>
     </div>
   </header>
 
-  <div class="stats" id="stats"></div>
-
-  <div class="compare-banner" id="compare-banner">
-    <h3>Changes from previous scan</h3>
-    <div class="compare-row" id="compare-content"></div>
+  <div class="nav-tabs">
+    <button class="nav-tab active" onclick="switchTab('targets')" data-tab="targets">Targets</button>
+    <button class="nav-tab" onclick="switchTab('scans')" data-tab="scans">Scans</button>
+    <button class="nav-tab" onclick="switchTab('results')" data-tab="results">Results</button>
   </div>
 
-  <div class="runs">
-    <h2>Scan Runs</h2>
-    <div id="runs-list"><div class="empty">No scans yet. Click "Run Scan" to start.</div></div>
+  <!-- ═══ TARGETS TAB ═══ -->
+  <div class="tab-panel active" id="panel-targets">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <h2 style="font-size:1rem;color:var(--muted);">Scan Targets</h2>
+      <button class="btn" id="scan-btn" onclick="startScan()">Run Scan</button>
+    </div>
+
+    <div class="add-target-form">
+      <input type="text" id="new-target-host" placeholder="IP, hostname, or URL (e.g. 10.0.1.5)" />
+      <input type="text" id="new-target-label" placeholder="Label (optional)" style="max-width:200px;" />
+      <button class="btn btn-outline" onclick="addTarget()">Add Target</button>
+    </div>
+
+    <div class="targets-grid" id="targets-list">
+      <div class="empty">Loading targets...</div>
+    </div>
   </div>
 
-  <div class="findings" id="findings-section" style="display:none;">
-    <h2 id="findings-title">Findings</h2>
-    <div class="filters" id="filters"></div>
-    <table>
-      <thead>
-        <tr><th>Severity</th><th>Target</th><th>Category</th><th>Finding</th><th>Evidence</th><th>Tool</th></tr>
-      </thead>
-      <tbody id="findings-body"></tbody>
-    </table>
+  <!-- ═══ SCANS TAB ═══ -->
+  <div class="tab-panel" id="panel-scans">
+    <div class="runs">
+      <h2>Scan Runs</h2>
+      <div id="runs-list"><div class="empty">No scans yet. Go to Targets and click "Run Scan" to start.</div></div>
+    </div>
+  </div>
+
+  <!-- ═══ RESULTS TAB ═══ -->
+  <div class="tab-panel" id="panel-results">
+    <div id="results-empty" class="empty">Select a scan run from the Scans tab to view results.</div>
+
+    <div id="results-content" style="display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+        <h2 id="results-title" style="font-size:1rem;color:var(--muted);">Results</h2>
+      </div>
+
+      <div class="stats" id="stats"></div>
+
+      <div class="compare-banner" id="compare-banner">
+        <h3>Changes from previous scan</h3>
+        <div class="compare-row" id="compare-content"></div>
+      </div>
+
+      <div class="filters" id="filters"></div>
+
+      <div id="target-results"></div>
+
+      <div class="fix-section" id="fix-section">
+        <h3>Generate Fix Instructions</h3>
+        <div class="fix-actions" id="fix-actions"></div>
+        <div class="prompt-block">
+          <button class="copy-btn" onclick="copyPrompt()">Copy</button>
+          <code>Read SECURITY-FIX.md and implement all the fixes described. Start with CRITICAL issues, then HIGH, then MEDIUM. Run tests and deploy after each fix.</code>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -727,11 +1047,70 @@ let currentRunId = null;
 let allFindings = [];
 let activeFilter = 'ALL';
 let pollInterval = null;
+let targetsCache = [];
+
+function switchTab(tab) {
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
+  document.getElementById(`panel-${tab}`).classList.add('active');
+}
 
 async function fetchJSON(url, opts) {
   const r = await fetch(url, opts);
   return r.json();
 }
+
+// ── Targets ──
+
+async function loadTargets() {
+  const targets = await fetchJSON('/api/targets');
+  targetsCache = targets;
+  const el = document.getElementById('targets-list');
+  if (!targets.length) {
+    el.innerHTML = '<div class="empty">No targets configured. Add a target above.</div>';
+    return;
+  }
+  el.innerHTML = targets.map(t => `
+    <div class="target-card">
+      <div>
+        <div class="target-host">${escHtml(t.host)}</div>
+        ${t.label && t.label !== t.host ? `<div class="target-label">${escHtml(t.label)}</div>` : ''}
+        <div class="target-added">Added ${new Date(t.added_at).toLocaleDateString()}</div>
+      </div>
+      <button class="btn-icon" onclick="removeTarget(${t.id})" title="Remove target">&times;</button>
+    </div>
+  `).join('');
+}
+
+async function addTarget() {
+  const hostEl = document.getElementById('new-target-host');
+  const labelEl = document.getElementById('new-target-label');
+  const host = hostEl.value.trim();
+  if (!host) { hostEl.focus(); return; }
+  const label = labelEl.value.trim();
+  const res = await fetch('/api/targets', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({host, label})
+  });
+  const data = await res.json();
+  if (res.ok) {
+    hostEl.value = '';
+    labelEl.value = '';
+    await loadTargets();
+  } else {
+    alert(data.error || 'Failed to add target');
+  }
+}
+
+async function removeTarget(id) {
+  if (!confirm('Remove this target?')) return;
+  await fetch(`/api/targets/${id}`, {method: 'DELETE'});
+  await loadTargets();
+}
+
+// ── Scans ──
 
 async function loadRuns() {
   const runs = await fetchJSON('/api/runs');
@@ -750,7 +1129,7 @@ async function loadRuns() {
     const time = new Date(r.started_at).toLocaleString();
     const duration = r.finished_at ? Math.round((new Date(r.finished_at) - new Date(r.started_at)) / 1000) + 's' : '';
     return `
-      <div class="run-card ${r.id === currentRunId ? 'active' : ''}" onclick="loadRun('${r.id}')">
+      <div class="run-card ${r.id === currentRunId ? 'active' : ''}" onclick="viewRun('${r.id}')">
         <div class="run-meta">
           <span class="run-id">#${r.id}</span>
           <span class="run-status ${r.status}">${r.status === 'running' ? '<span class=spinner></span> running' : r.status}</span>
@@ -760,13 +1139,7 @@ async function loadRuns() {
       </div>`;
   }).join('');
 
-  // Auto-load latest completed run
-  if (!currentRunId) {
-    const completed = runs.find(r => r.status === 'completed');
-    if (completed) loadRun(completed.id);
-  }
-
-  // If there's a running scan, poll
+  // Poll for running scans
   const running = runs.find(r => r.status === 'running');
   if (running && !pollInterval) {
     pollInterval = setInterval(async () => {
@@ -777,18 +1150,28 @@ async function loadRuns() {
         pollInterval = null;
         document.getElementById('scan-btn').disabled = false;
         document.getElementById('scan-status').textContent = '';
-        loadRun(updated.id);
+        viewRun(updated.id);
       }
     }, 5000);
   }
 }
 
-async function loadRun(runId) {
+async function viewRun(runId) {
   currentRunId = runId;
+  switchTab('results');
+  await loadRunResults(runId);
+  await loadRuns(); // refresh highlighting
+}
+
+async function loadRunResults(runId) {
   const data = await fetchJSON(`/api/runs/${runId}`);
   allFindings = data.findings;
 
-  // Update stats
+  document.getElementById('results-empty').style.display = 'none';
+  document.getElementById('results-content').style.display = 'block';
+  document.getElementById('results-title').textContent = `Results — Run #${runId}`;
+
+  // Stats
   const summary = data.run.summary_json ? JSON.parse(data.run.summary_json) : null;
   const statsEl = document.getElementById('stats');
   if (summary) {
@@ -823,7 +1206,7 @@ async function loadRun(runId) {
     banner.style.display = 'none';
   }
 
-  // Build filters
+  // Filters
   const targets = [...new Set(allFindings.map(f => f.target))];
   const filtersEl = document.getElementById('filters');
   filtersEl.innerHTML = `
@@ -834,39 +1217,109 @@ async function loadRun(runId) {
     ${targets.map(t => `<button class="filter-btn ${activeFilter === t ? 'active' : ''}" onclick="setFilter('${t}')">${t}</button>`).join('')}
   `;
 
-  renderFindings();
-  document.getElementById('findings-section').style.display = 'block';
-  document.getElementById('findings-title').textContent = `Findings — Run #${runId}`;
+  renderResults();
 
-  // Re-highlight active run card
-  document.querySelectorAll('.run-card').forEach(c => c.classList.remove('active'));
-  const cards = document.querySelectorAll('.run-card');
-  cards.forEach(c => { if (c.textContent.includes('#' + runId)) c.classList.add('active'); });
+  // Fix actions
+  const fixEl = document.getElementById('fix-actions');
+  let fixBtns = `<a class="btn btn-sm btn-blue" href="/api/runs/${runId}/fix-all" download>Download Fix File (All Targets)</a>`;
+  targets.forEach(t => {
+    fixBtns += ` <a class="btn btn-sm btn-outline" href="/api/runs/${runId}/fix/${encodeURIComponent(t)}" download>Fix: ${escHtml(t)}</a>`;
+  });
+  fixEl.innerHTML = fixBtns;
 }
 
 function setFilter(f) {
   activeFilter = f;
-  loadRun(currentRunId);
+  if (currentRunId) loadRunResults(currentRunId);
 }
 
-function renderFindings() {
+function getGrade(findings) {
+  const sevs = new Set(findings.map(f => f.severity));
+  if (sevs.has('CRITICAL')) return 'F';
+  if (sevs.has('HIGH')) return 'C';
+  if (sevs.has('MEDIUM')) return 'B';
+  return 'A';
+}
+
+function getTargetLabel(host) {
+  const t = targetsCache.find(t => t.host === host);
+  return t && t.label && t.label !== t.host ? t.label : '';
+}
+
+function renderResults() {
   let filtered = allFindings;
   if (activeFilter === 'CRITICAL') filtered = allFindings.filter(f => f.severity === 'CRITICAL');
   else if (activeFilter === 'HIGH') filtered = allFindings.filter(f => f.severity === 'HIGH');
   else if (activeFilter === 'MEDIUM') filtered = allFindings.filter(f => f.severity === 'MEDIUM');
   else if (activeFilter !== 'ALL') filtered = allFindings.filter(f => f.target === activeFilter);
 
-  const body = document.getElementById('findings-body');
-  body.innerHTML = filtered.map(f => `
-    <tr>
-      <td><span class="badge ${f.severity}">${f.severity}</span></td>
-      <td>${f.target}</td>
-      <td>${f.category}</td>
-      <td><strong>${f.title}</strong>${f.description ? '<br><span style="color:var(--muted);font-size:0.8rem;">' + f.description + '</span>' : ''}</td>
-      <td class="evidence">${f.evidence || ''}</td>
-      <td style="color:var(--muted)">${f.tool}</td>
-    </tr>
-  `).join('');
+  // Group by target
+  const byTarget = {};
+  filtered.forEach(f => {
+    if (!byTarget[f.target]) byTarget[f.target] = [];
+    byTarget[f.target].push(f);
+  });
+
+  const resultsEl = document.getElementById('target-results');
+
+  if (!filtered.length) {
+    resultsEl.innerHTML = '<div class="empty">No findings match the current filter.</div>';
+    return;
+  }
+
+  let html = '';
+  Object.entries(byTarget).forEach(([target, findings]) => {
+    const grade = getGrade(findings);
+    const label = getTargetLabel(target);
+    const counts = {CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, INFO: 0};
+    findings.forEach(f => { if (counts[f.severity] !== undefined) counts[f.severity]++; });
+
+    html += `<div class="target-result-card">`;
+    html += `<div class="target-result-header">`;
+    html += `<div class="target-result-title">
+      <span class="grade grade-${grade}">${grade}</span>
+      <div>
+        <div class="target-result-host">${escHtml(target)}</div>
+        ${label ? `<div class="target-result-label">${escHtml(label)}</div>` : ''}
+      </div>
+    </div>`;
+    html += `<div class="severity-counts">
+      ${counts.CRITICAL ? `<span class="badge CRITICAL">${counts.CRITICAL} CRIT</span>` : ''}
+      ${counts.HIGH ? `<span class="badge HIGH">${counts.HIGH} HIGH</span>` : ''}
+      ${counts.MEDIUM ? `<span class="badge MEDIUM">${counts.MEDIUM} MED</span>` : ''}
+      ${counts.LOW ? `<span class="badge LOW">${counts.LOW} LOW</span>` : ''}
+      ${counts.INFO ? `<span class="badge INFO">${counts.INFO} INFO</span>` : ''}
+    </div>`;
+    html += `</div>`; // header
+
+    // Findings grouped by severity
+    const sevOrder = ['CRITICAL','HIGH','MEDIUM','LOW','INFO'];
+    sevOrder.forEach(sev => {
+      const sevFindings = findings.filter(f => f.severity === sev);
+      if (!sevFindings.length) return;
+      sevFindings.forEach(f => {
+        html += `<div class="finding-row" onclick="this.classList.toggle('open')">
+          <div class="finding-summary">
+            <span class="badge ${f.severity}">${f.severity}</span>
+            <span class="finding-title">${escHtml(f.title)}</span>
+            <span class="finding-tool">${escHtml(f.tool)}</span>
+            <span class="finding-chevron">&#9654;</span>
+          </div>
+          <div class="finding-details">
+            <dl>
+              ${f.description ? `<dt>Description</dt><dd>${escHtml(f.description)}</dd>` : ''}
+              ${f.evidence ? `<dt>Evidence</dt><dd>${escHtml(f.evidence)}</dd>` : ''}
+              <dt>Category</dt><dd>${escHtml(f.category)}</dd>
+            </dl>
+          </div>
+        </div>`;
+      });
+    });
+
+    html += `</div>`; // card
+  });
+
+  resultsEl.innerHTML = html;
 }
 
 async function startScan() {
@@ -875,11 +1328,33 @@ async function startScan() {
   document.getElementById('scan-status').innerHTML = '<span class="spinner"></span> Scanning...';
 
   const data = await fetchJSON('/api/scan', { method: 'POST' });
+  if (data.error) {
+    alert(data.error);
+    btn.disabled = false;
+    document.getElementById('scan-status').textContent = '';
+    return;
+  }
   currentRunId = data.run_id;
+  switchTab('scans');
   await loadRuns();
 }
 
+function copyPrompt() {
+  const text = 'Read SECURITY-FIX.md and implement all the fixes described. Start with CRITICAL issues, then HIGH, then MEDIUM. Run tests and deploy after each fix.';
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('.copy-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+  });
+}
+
+function escHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 // Initial load
+loadTargets();
 loadRuns();
 </script>
 </body>

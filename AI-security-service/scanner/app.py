@@ -2908,6 +2908,13 @@ async def me(request: Request):
     # Don't leak password hash
     full.pop("password_hash", None)
     full.pop("verification_token", None)
+    # Flag admin users
+    admins = set(
+        e.strip().lower()
+        for e in os.getenv("ADMIN_EMAILS", "stefan.a.lederer@gmail.com").split(",")
+        if e.strip()
+    )
+    full["is_admin"] = (full.get("email") or "").lower() in admins
     return full
 
 
@@ -2941,9 +2948,23 @@ def _periodic_cleanup_loop():
 @app.on_event("startup")
 def startup():
     init_db()
+    try:
+        from scanner.admin import init_admin_db
+        init_admin_db()
+    except Exception as e:
+        print(f"[startup] admin init failed: {e}")
     cleanup_stale_scans()
     t = threading.Thread(target=_periodic_cleanup_loop, daemon=True)
     t.start()
+
+
+# Mount admin module
+try:
+    from scanner.admin import router as _admin_router, api as _admin_api
+    app.include_router(_admin_router)
+    app.include_router(_admin_api)
+except Exception as _e:
+    print(f"[startup] failed to mount admin routes: {_e}")
 
 
 # ── Target Management API ────────────────────────────────────────────────────

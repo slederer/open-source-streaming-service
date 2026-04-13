@@ -484,6 +484,8 @@ async def admin_list_scans(request: Request, status: str = "", user_id: str = ""
 
 @api.post("/scans/{run_id}/kill")
 async def admin_kill_scan(request: Request, run_id: str):
+    """Admin force-stop. Sets status to 'canceled' so the background worker's
+    checkpoint loop exits cleanly on its next module boundary."""
     admin = require_admin(request)
     with _get_db() as db:
         row = db.execute("SELECT status FROM scan_runs WHERE id=?", (run_id,)).fetchone()
@@ -492,7 +494,7 @@ async def admin_kill_scan(request: Request, run_id: str):
         if row["status"] != "running":
             return {"ok": True, "note": f"status was {row['status']}, nothing to kill"}
         db.execute(
-            "UPDATE scan_runs SET status='failed', finished_at=? WHERE id=?",
+            "UPDATE scan_runs SET status='canceled', finished_at=? WHERE id=?",
             (datetime.now(timezone.utc).isoformat(), run_id),
         )
     _audit(admin["email"], "kill_scan", run_id)

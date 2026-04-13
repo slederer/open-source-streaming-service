@@ -298,7 +298,7 @@ def test_kill_running_scan(admin_client, tmp_db):
         status = conn.execute("SELECT status FROM scan_runs WHERE id=?", (run_id,)).fetchone()[0]
     finally:
         conn.close()
-    assert status == "failed"
+    assert status == "canceled"
 
 
 # ── Findings ────────────────────────────────────────────────────────────────

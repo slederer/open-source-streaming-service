@@ -1490,17 +1490,35 @@ def get_scan_module_meta():
     return [{"name": n, "description": d} for n, d, _ in SCAN_MODULES]
 
 
+def _run_status(run_id: str) -> str:
+    """Read current status of a scan run (used by the loop to detect cancellation)."""
+    try:
+        with get_db() as db:
+            row = db.execute("SELECT status FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+            return row["status"] if row else ""
+    except Exception:
+        return ""
+
+
 def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = None):
-    """Execute all scan modules against all targets, storing results incrementally."""
+    """Execute all scan modules against all targets, storing results incrementally.
+
+    Checkpoints between modules: if `scan_runs.status` has been flipped away
+    from 'running' (typically by POST /api/runs/{id}/cancel), exit early and
+    preserve the 'canceled' status so the UI can show partial results.
+    """
     seen = set()
     scan_modules = [(n, globals()[fname]) for n, _, fname in SCAN_MODULES]
     total = len(scan_modules)
     completed = []
+    canceled = False
 
     # Initial: mark progress ready
     _update_summary(run_id, status="running", current_module=None, completed_modules=[], total_modules=total)
 
     for target in targets:
+        if canceled:
+            break
         ip, name = target["ip"], target["name"]
         # SSRF guard: refuse to scan internal / metadata / private IPs. This is
         # the critical defence for a tool that blindly curls user-supplied hosts.
@@ -1515,6 +1533,10 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
             }], seen, user_id=user_id)
             continue
         for mod_name, mod_func in scan_modules:
+            # Cancellation checkpoint — cheap DB read, per-module granularity.
+            if _run_status(run_id) != "running":
+                canceled = True
+                break
             # Announce which module is about to run
             _update_summary(run_id, status="running", current_module=mod_name, completed_modules=completed, total_modules=total)
             try:
@@ -1533,6 +1555,15 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
             # Mark this module done
             completed.append(mod_name)
             _update_summary(run_id, status="running", current_module=None, completed_modules=completed, total_modules=total)
+
+    if canceled:
+        # Don't overwrite the 'canceled' status set by the cancel endpoint; just
+        # refresh the progress/findings summary. _update_summary with status=
+        # 'canceled' preserves finished_at set by the cancel endpoint.
+        _update_summary(run_id, status="canceled",
+                        current_module=None,
+                        completed_modules=completed, total_modules=total)
+        return  # no credit consumption for canceled scans
 
     _update_summary(run_id, status="completed", current_module=None, completed_modules=completed, total_modules=total)
 
@@ -3330,6 +3361,49 @@ async def get_run(request: Request, run_id: str):
     return {"run": dict(run), "findings": [dict(f) for f in findings], "target_diffs": target_diffs}
 
 
+@app.post("/api/runs/{run_id}/cancel")
+async def cancel_run(request: Request, run_id: str):
+    """Stop a running scan.
+
+    The scan loop checks `scan_runs.status` between modules and exits early when
+    it sees anything other than 'running'. This endpoint just flips that column
+    and records the cancel time; the background worker self-terminates on its
+    next checkpoint. Modules that are already in-flight finish their current
+    network call (capped by each module's own timeout), then the loop bails.
+    """
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    run = _verify_run_ownership(run_id, user["user_id"])
+    if not run:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if run["status"] != "running":
+        return JSONResponse(
+            {"ok": True, "status": run["status"], "note": "scan was not running"},
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as db:
+        # Preserve progress in summary_json so UI can still show how far we got.
+        existing = db.execute(
+            "SELECT summary_json FROM scan_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        summary = {}
+        if existing and existing["summary_json"]:
+            try:
+                summary = json.loads(existing["summary_json"])
+            except Exception:
+                summary = {}
+        summary["canceled_at"] = now
+        summary["canceled_by"] = user.get("email", "")
+        if "progress" in summary:
+            summary["progress"]["current"] = None
+        db.execute(
+            "UPDATE scan_runs SET status='canceled', finished_at=?, summary_json=? WHERE id=?",
+            (now, json.dumps(summary), run_id),
+        )
+    return {"ok": True, "status": "canceled", "run_id": run_id}
+
+
 @app.get("/api/runs/{run_id}/target-diffs")
 async def get_target_diffs(request: Request, run_id: str):
     """Per-target comparison against each target's most recent previous scan."""
@@ -4582,6 +4656,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .status-badge.running { background: #1e3a5f; color: #60a5fa; }
   .status-badge.completed { background: #14532d; color: #4ade80; }
   .status-badge.aborted, .status-badge.failed { background: #4b1d1d; color: #fca5a5; }
+  .status-badge.canceled { background: #3b2a12; color: #fbbf24; }
 
   /* Severity bar */
   .sev-row { display: flex; gap: 6px; align-items: center; }
@@ -4860,6 +4935,10 @@ VIEWS.scans = async () => {
           <tbody>
             ${runs.map(r => {
               const s = r.summary_json ? JSON.parse(r.summary_json) : {};
+              const running = r.status === 'running';
+              const actionCell = running
+                ? `<button class="btn btn-outline btn-sm" onclick="event.stopPropagation(); stopScanFromList('${r.id}')" style="color:var(--critical);border-color:var(--critical);">Stop</button>`
+                : `<span style="color:var(--text-muted);">&#8250;</span>`;
               return `<tr onclick="go('scan-detail','${r.id}')" style="cursor:pointer;">
                 <td class="mono">#${r.id}</td>
                 <td class="mono" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;">${esc(targetLabel(r))}</td>
@@ -4873,7 +4952,7 @@ VIEWS.scans = async () => {
                   ${s.low ? `<span class="badge LOW">${s.low}</span>` : ''}
                   ${!s.total ? '<span style="color:var(--text-muted);">-</span>' : ''}
                 </td>
-                <td style="text-align:right;"><span style="color:var(--text-muted);">&#8250;</span></td>
+                <td style="text-align:right;">${actionCell}</td>
               </tr>`;
             }).join('')}
           </tbody>
@@ -5003,7 +5082,10 @@ VIEWS["scan-detail"] = async (runId, isPoll = false) => {
   };
 
   // Render helpers for each dynamic section (so polls can surgically update without wiping state)
-  const statusHtml = `<div style="display:flex;align-items:center;gap:12px;"><h1>Scan #${runId}</h1><span class="status-badge ${d.run.status}">${d.run.status}</span></div>
+  const stopBtn = isRunning
+    ? `<button class="btn btn-outline btn-sm" onclick="stopScan('${runId}')" id="stop-scan-btn" style="color:var(--critical);border-color:var(--critical);">&#9632; Stop scan</button>`
+    : '';
+  const statusHtml = `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;"><h1 style="margin:0;">Scan #${runId}</h1><span class="status-badge ${d.run.status}">${d.run.status}</span>${stopBtn}</div>
       <div class="sub">${fmtTime(d.run.started_at)} · ${esc(d.run.scan_type || 'full')}${isRunning ? ' · <span style="color:var(--brand);">live</span>' : ''}</div>`;
 
   const statsHtml = `<div class="grid grid-cards" style="margin-bottom:20px;">
@@ -5058,6 +5140,26 @@ VIEWS["scan-detail"] = async (runId, isPoll = false) => {
     }, 2000);
   }
 };
+
+async function stopScan(runId) {
+  if (!confirm('Stop this scan? Findings from completed modules are kept.')) return;
+  const btn = document.getElementById('stop-scan-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping...'; }
+  const r = await api(`/api/runs/${runId}/cancel`, {method: 'POST'});
+  if (!r || r.error) {
+    if (btn) { btn.disabled = false; btn.textContent = '\u25A0 Stop scan'; }
+    return;
+  }
+  // Stop the auto-poll and re-render once; the next render will see status=canceled.
+  if (_scanPollTimer) { clearTimeout(_scanPollTimer); _scanPollTimer = null; }
+  VIEWS['scan-detail'](runId, true);
+}
+
+async function stopScanFromList(runId) {
+  if (!confirm('Stop this scan?')) return;
+  await api(`/api/runs/${runId}/cancel`, {method: 'POST'});
+  VIEWS.scans();  // refresh the list
+}
 
 async function analyze(runId) {
   const box = document.getElementById("ai-result");

@@ -5085,8 +5085,74 @@ VIEWS["scan-detail"] = async (runId, isPoll = false) => {
   const stopBtn = isRunning
     ? `<button class="btn btn-outline btn-sm" onclick="stopScan('${runId}')" id="stop-scan-btn" style="color:var(--critical);border-color:var(--critical);">&#9632; Stop scan</button>`
     : '';
-  const statusHtml = `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;"><h1 style="margin:0;">Scan #${runId}</h1><span class="status-badge ${d.run.status}">${d.run.status}</span>${stopBtn}</div>
-      <div class="sub">${fmtTime(d.run.started_at)} · ${esc(d.run.scan_type || 'full')}${isRunning ? ' · <span style="color:var(--brand);">live</span>' : ''}</div>`;
+
+  // Resolve the scanned target: `target` column for new per-domain scans;
+  // fall back to first of the JSON `targets` array for legacy multi-target runs.
+  let targetHost = d.run.target || '';
+  if (!targetHost && d.run.targets) {
+    try { const a = JSON.parse(d.run.targets); if (a.length) targetHost = a[0]; } catch {}
+  }
+  // Code / mobile scans store a full URL or filename; infra scans store a hostname.
+  const scanType = d.run.scan_type || 'full';
+  const isUrl = /^https?:\/\//i.test(targetHost);
+  const targetUrl = isUrl ? targetHost
+                   : scanType === 'code' ? targetHost   // already a github URL in practice
+                   : scanType === 'mobile' ? null       // just a filename
+                   : `https://${targetHost}`;
+  const targetIconLink = targetUrl
+    ? `<a href="${esc(targetUrl)}" target="_blank" rel="noopener noreferrer" title="Open in new tab" style="color:var(--text-muted);text-decoration:none;">&#8599;</a>`
+    : '';
+  const targetLabel = scanType === 'mobile' ? `&#128241; ${esc(targetHost)}`
+                    : scanType === 'code'   ? `&#128187; ${esc(targetHost)}`
+                    : `&#127760; ${esc(targetHost)}`;
+
+  // Duration: elapsed while running, delta while completed/canceled.
+  const fmtDuration = (startISO, endISO) => {
+    if (!startISO) return '—';
+    const start = new Date(startISO).getTime();
+    const end = endISO ? new Date(endISO).getTime() : Date.now();
+    const sec = Math.max(0, Math.round((end - start) / 1000));
+    if (sec < 60) return `${sec}s`;
+    const m = Math.floor(sec / 60), s = sec % 60;
+    if (m < 60) return `${m}m ${s}s`;
+    const h = Math.floor(m / 60), mm = m % 60;
+    return `${h}h ${mm}m`;
+  };
+
+  const findingsTotal = sumAll.total
+    ?? ((sumAll.critical || 0) + (sumAll.high || 0) + (sumAll.medium || 0) + (sumAll.low || 0) + (sumAll.info || 0));
+  const canceledNote = sumAll.canceled_at ? ` · canceled by ${esc(sumAll.canceled_by || 'admin')}` : '';
+
+  const metaRow = (label, value) =>
+    `<div style="min-width:0;"><div style="font-size:0.68rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:2px;">${label}</div><div style="font-size:0.85rem;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${value}</div></div>`;
+
+  const statusHtml = `
+    <div class="card" style="margin-bottom:20px;padding:20px 24px;">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:14px;">
+        <div style="min-width:0;flex:1;">
+          <div style="font-size:0.72rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Scan target</div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <h1 style="margin:0;font-size:1.6rem;line-height:1.2;word-break:break-all;">${targetLabel}</h1>
+            ${targetIconLink}
+          </div>
+          <div style="margin-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <span class="status-badge ${d.run.status}">${d.run.status}${isRunning ? ' · live' : ''}</span>
+            <span class="mono" style="font-size:0.75rem;color:var(--text-muted);">#${runId}</span>
+            ${canceledNote ? `<span style="font-size:0.75rem;color:var(--text-muted);">${canceledNote}</span>` : ''}
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          ${stopBtn}
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:14px;padding-top:14px;border-top:1px solid var(--border);">
+        ${metaRow('Type', esc(scanType))}
+        ${metaRow('Started', fmtTime(d.run.started_at))}
+        ${metaRow(isRunning ? 'Elapsed' : 'Duration', fmtDuration(d.run.started_at, d.run.finished_at))}
+        ${metaRow(isRunning ? 'Status' : 'Finished', isRunning ? 'in progress' : (d.run.finished_at ? fmtTime(d.run.finished_at) : '—'))}
+        ${metaRow('Findings', `${findingsTotal}`)}
+      </div>
+    </div>`;
 
   const statsHtml = `<div class="grid grid-cards" style="margin-bottom:20px;">
       <div class="stat-card crit"><div class="label">Critical</div><div class="value">${sumAll.critical || 0}</div></div>
@@ -5110,7 +5176,7 @@ VIEWS["scan-detail"] = async (runId, isPoll = false) => {
     // AI result box + buttons don't change during polls — leave them
   } else {
     root.innerHTML = `
-      <div id="sd-status" class="page-title">${statusHtml}</div>
+      <div id="sd-status">${statusHtml}</div>
       <div id="sd-progress">${renderProgress()}</div>
       <div id="sd-stats">${statsHtml}</div>
 

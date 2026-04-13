@@ -102,14 +102,55 @@ def _extract_links(base_url: str, html: str) -> list[str]:
 
 
 def _extract_js_urls(js_body: str) -> list[str]:
-    """Pull likely API endpoints and absolute URLs out of bundled JS."""
+    """Pull likely API endpoints and absolute URLs out of bundled JS.
+
+    Covers four shapes that modern bundlers (Vite, webpack, esbuild) emit:
+      - absolute URLs:            "https://api.example.com/v1"
+      - quoted path literals:     "/api/users"  '/graphql'
+      - backtick template paths:  `${HOST}/api/billing/magic-link`
+      - fetch/axios call sites:   fetch("/api/x")  axios.get(`/api/y`)
+    """
     urls = set()
-    for m in re.finditer(r'https?://[A-Za-z0-9\-._~%!$&\'()*+,;=:@/]+', js_body):
-        urls.add(m.group(0).rstrip(".,;:\\\"'"))
-    # Likely API routes referenced as relative paths.
-    for m in re.finditer(r'["\'](/api/[A-Za-z0-9_\-/.]+)["\']', js_body):
-        urls.add(m.group(1))
-    for m in re.finditer(r'["\'](/graphql[A-Za-z0-9_\-/.]*)["\']', js_body):
+    # 1. Absolute URLs — but exclude standards-doc URLs (w3.org, reactjs.org)
+    STANDARDS_HOSTS = {"www.w3.org", "reactjs.org", "developer.mozilla.org",
+                       "nodejs.org", "es5.github.io", "tc39.es"}
+    for m in re.finditer(r'https?://[A-Za-z0-9\-._~%!$&\'()*+,;=:@/?#]+', js_body):
+        u = m.group(0).rstrip(".,;:\\\"'`)]}>")
+        # Skip obvious noise
+        if any(h in u for h in STANDARDS_HOSTS):
+            continue
+        urls.add(u)
+    # 2. Path literals inside any quote style (single, double, backtick).
+    #    Matches "/foo/bar" '/foo/bar' `/foo/bar` AND the path part of
+    #    `${VAR}/api/checkout` (capturing the /... segment after the ${}).
+    path_re = re.compile(
+        r'[`"\']'                     # opening quote of any flavor
+        r'(?:\$\{[^}]*\})?'          # optional ${var} template prefix
+        r'(/[a-zA-Z][a-zA-Z0-9_\-/.]{2,200})'
+        r'[`"\']'
+    )
+    for m in path_re.finditer(js_body):
+        p = m.group(1)
+        # Filter: only keep paths that look like API/router routes, not
+        # static asset refs which are already linked from HTML.
+        if p.startswith(("/assets/", "/static/", "/images/", "/img/",
+                          "/fonts/", "/node_modules/")):
+            continue
+        if p.endswith((".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp",
+                       ".woff", ".woff2", ".ttf", ".ico", ".css", ".map")):
+            continue
+        urls.add(p)
+    # 3. fetch(...) / axios.method(...) / $.ajax(...) call sites — handles
+    #    template-literal hosts like fetch(`${API}/users`)
+    call_re = re.compile(
+        r'(?:fetch|axios(?:\.(?:get|post|put|delete|patch|head|request))?'
+        r'|\$\.(?:ajax|get|post|put|delete)'
+        r')\s*\(\s*[`"\']'
+        r'(?:\$\{[^}]*\})?'
+        r'(/[a-zA-Z][a-zA-Z0-9_\-/.:]{1,200})'
+        r'[`"\']'
+    )
+    for m in call_re.finditer(js_body):
         urls.add(m.group(1))
     return list(urls)
 
@@ -276,10 +317,19 @@ _DORKS = [
 ]
 
 
+class _SearchUnavailable(Exception):
+    """Raised when a search backend is broken (expired creds, HTTP error).
+
+    Distinct from 'backend returned zero results' — the caller can fall back
+    to an alternate backend only when the primary is unavailable, not when it
+    legitimately found nothing.
+    """
+
+
 def _serper_search(query: str, num: int = 10) -> list[dict]:
     key = os.getenv("SERPER_API_KEY", "").strip()
     if not key:
-        return []
+        raise _SearchUnavailable("no SERPER_API_KEY set")
     try:
         import httpx
         r = httpx.post(
@@ -289,16 +339,19 @@ def _serper_search(query: str, num: int = 10) -> list[dict]:
             timeout=10,
         )
         if r.status_code != 200:
-            return []
+            # Typical failures: 401 bad key, 400 "Not enough credits", 403 rate-limit.
+            raise _SearchUnavailable(f"serper http {r.status_code}: {r.text[:120]}")
         return r.json().get("organic", [])
-    except Exception:
-        return []
+    except _SearchUnavailable:
+        raise
+    except Exception as e:
+        raise _SearchUnavailable(f"serper error: {e}") from e
 
 
 def _serpapi_search(query: str, num: int = 10) -> list[dict]:
     key = os.getenv("SERPAPI_KEY", "").strip()
     if not key:
-        return []
+        raise _SearchUnavailable("no SERPAPI_KEY set")
     try:
         import httpx
         r = httpx.get(
@@ -307,10 +360,32 @@ def _serpapi_search(query: str, num: int = 10) -> list[dict]:
             timeout=10,
         )
         if r.status_code != 200:
-            return []
-        return r.json().get("organic_results", [])
-    except Exception:
-        return []
+            raise _SearchUnavailable(f"serpapi http {r.status_code}: {r.text[:120]}")
+        j = r.json()
+        if j.get("error"):
+            raise _SearchUnavailable(f"serpapi error: {j.get('error')}")
+        return j.get("organic_results", [])
+    except _SearchUnavailable:
+        raise
+    except Exception as e:
+        raise _SearchUnavailable(f"serpapi error: {e}") from e
+
+
+def _search_any(query: str, num: int = 10) -> list[dict]:
+    """Try each configured search backend in order; fall back on failure.
+
+    Returns results from the FIRST backend that successfully responded (even
+    if that response was an empty list — a valid empty query is not a
+    reason to fall through). Only genuine backend failures trigger fallback.
+    """
+    errors = []
+    for fn in (_serper_search, _serpapi_search):
+        try:
+            return fn(query, num=num)
+        except _SearchUnavailable as e:
+            errors.append(str(e))
+            continue
+    return []
 
 
 def scan_target_dorking(run_id: str, ip: str, name: str) -> list[dict]:
@@ -326,9 +401,7 @@ def scan_target_dorking(run_id: str, ip: str, name: str) -> list[dict]:
 
     for dork, title, sev in _DORKS:
         q = f"site:{ip} {dork}"
-        results = _serper_search(q, num=5)
-        if not results and os.getenv("SERPAPI_KEY"):
-            results = _serpapi_search(q, num=5)
+        results = _search_any(q, num=5)
         if not results:
             continue
         # Show up to 3 URLs inline as evidence.

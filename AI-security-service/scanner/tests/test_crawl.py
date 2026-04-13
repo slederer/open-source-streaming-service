@@ -37,6 +37,40 @@ def test_extract_js_urls_picks_up_api_paths():
     assert "/graphql/private" in urls
 
 
+def test_extract_js_urls_handles_vite_template_literals():
+    """Vite/webpack bundles frequently emit `${HOST}/api/...` which
+    previously slipped past the extractor because the outer quote is a
+    backtick and a ${var} prefix sits between quote and path."""
+    js = (
+        "var Of='https://api.prod';"
+        "fetch(`${Of}/api/billing/magic-link`).then(r=>r.json());"
+        "axios.post(`${Of}/api/checkout`,x);"
+        "const p=`${Lf}/api/auth/signin`;"
+        "new URL('/plans',base);"  # quoted path too
+    )
+    urls = _extract_js_urls(js)
+    assert "/api/billing/magic-link" in urls, f"missing; got {urls}"
+    assert "/api/checkout" in urls
+    assert "/api/auth/signin" in urls
+    assert "/plans" in urls
+
+
+def test_extract_js_urls_strips_asset_noise():
+    """Should NOT surface static asset refs — they're linked from HTML."""
+    js = "const a='/assets/logo-abc.png';const b='/static/js/main.js';const c='/api/real';"
+    urls = _extract_js_urls(js)
+    assert "/api/real" in urls
+    assert "/assets/logo-abc.png" not in urls
+    assert "/static/js/main.js" not in urls
+
+
+def test_extract_js_urls_drops_standards_urls():
+    js = 'var x = "http://www.w3.org/2000/svg"; var y = "https://api.target.com/real";'
+    urls = _extract_js_urls(js)
+    assert "https://api.target.com/real" in urls
+    assert not any("w3.org" in u for u in urls)
+
+
 def test_same_origin_matches_subdomain():
     assert _same_origin("target.com", "https://target.com/x")
     assert _same_origin("target.com", "https://api.target.com/x")
@@ -138,35 +172,48 @@ class TestDorking:
         assert scan_target_dorking("r1", "target.com", "t") == []
 
     def test_dorking_flags_env_file_hits(self, monkeypatch):
-        """When Serper returns organic results for `site:target.com ext:env`
+        """When search returns organic results for `site:target.com ext:env`
         the module should flag it as CRITICAL with the URLs as evidence."""
         monkeypatch.setenv("SERPER_API_KEY", "dummy")
 
         def fake_search(q, num=10):
-            # Only the ext:env query returns hits; other dorks return empty.
             if "ext:env" in q:
                 return [
                     {"link": "https://target.com/.env.production"},
                     {"link": "https://target.com/config/.env"},
                 ]
             return []
-        with patch("scanner.crawl._serper_search", side_effect=fake_search):
+        with patch("scanner.crawl._search_any", side_effect=fake_search):
             findings = scan_target_dorking("r1", "target.com", "t")
         env_findings = [f for f in findings if ".env" in f["title"].lower()]
         assert len(env_findings) == 1
         assert env_findings[0]["severity"] == "CRITICAL"
         assert "target.com/.env.production" in env_findings[0]["evidence"]
 
-    def test_dorking_falls_back_to_serpapi(self, monkeypatch):
-        """If Serper returns nothing but SerpAPI does, we still report."""
+    def test_dorking_falls_back_to_serpapi_on_serper_error(self, monkeypatch):
+        """When Serper fails (out of credits, bad key, HTTP error), the
+        module must fall through to SerpAPI — NOT silently return empty."""
+        from scanner.crawl import _SearchUnavailable
         monkeypatch.setenv("SERPER_API_KEY", "dummy")
         monkeypatch.setenv("SERPAPI_KEY", "dummy2")
-        with patch("scanner.crawl._serper_search", return_value=[]), \
-             patch("scanner.crawl._serpapi_search",
-                   side_effect=lambda q, num=10: [{"link": "https://target.com/admin"}]
-                                                  if "inurl:admin" in q else []):
+
+        def broken_serper(q, num=10):
+            raise _SearchUnavailable("Not enough credits")
+
+        def working_serpapi(q, num=10):
+            return [{"link": "https://target.com/admin"}] if "inurl:admin" in q else []
+
+        with patch("scanner.crawl._serper_search", side_effect=broken_serper), \
+             patch("scanner.crawl._serpapi_search", side_effect=working_serpapi):
             findings = scan_target_dorking("r1", "target.com", "t")
-        assert any("Admin" in f["title"] for f in findings)
+        assert any("Admin" in f["title"] for f in findings), \
+            "SerpAPI fallback didn't kick in when Serper raised"
+
+    def test_search_any_returns_empty_when_all_backends_unavailable(self, monkeypatch):
+        from scanner.crawl import _search_any, _SearchUnavailable
+        monkeypatch.delenv("SERPER_API_KEY", raising=False)
+        monkeypatch.delenv("SERPAPI_KEY", raising=False)
+        assert _search_any("site:x.com test") == []
 
 
 # ── Wayback module ─────────────────────────────────────────────────────────

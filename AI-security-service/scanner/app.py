@@ -733,7 +733,11 @@ SECRET_PATTERNS = [
     (r"gho_[0-9A-Za-z]{36}", "GitHub OAuth token", "HIGH"),
     (r"SG\.[0-9A-Za-z_\-]{22}\.[0-9A-Za-z_\-]{43}", "SendGrid API key", "HIGH"),
     (r"mailgun-[0-9a-f]{32}", "Mailgun API key", "HIGH"),
-    (r"re_[0-9A-Za-z_]{16,}", "Resend API key", "HIGH"),
+    # Resend keys: literal 're_' + exactly 24 base62 chars (no underscores).
+    # The old pattern `re_[0-9A-Za-z_]{16,}` matched snake_case identifiers
+    # like `re_subscription_cancel` (seen in GTM event labels) — verified as
+    # a false positive during the YC W26 batch scan.
+    (r"\bre_[0-9A-Za-z]{22,36}\b", "Resend API key", "HIGH"),
     (r"NEXT_PUBLIC_[A-Z_]*SECRET[A-Z_]*\s*[=:]", "Next.js PUBLIC variable named SECRET (exposed to browser)", "HIGH"),
     (r"NEXT_PUBLIC_[A-Z_]*PRIVATE[A-Z_]*\s*[=:]", "Next.js PUBLIC variable named PRIVATE", "HIGH"),
     (r'"password"\s*:\s*"[^"]{4,}"', "Hardcoded password in JSON", "HIGH"),

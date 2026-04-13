@@ -161,6 +161,67 @@ class TestCrawler:
         assert users_hit and users_hit[0]["severity"] == "HIGH", \
             f"sensitive-name endpoint should be HIGH; got {[(f['title'], f['severity']) for f in api_hits]}"
 
+    def test_sensitive_named_suppressed_on_login_redirect(self):
+        """/dashboard that 302→/login should NOT be flagged — auth wall works."""
+        pages = {
+            "https://target.com/": ("200", "text/html",
+                '<a href="/dashboard">Dashboard</a>'),
+            "https://target.com/dashboard": ("200", "text/html",
+                '<html><body>redirected</body></html>'),
+        }
+
+        def fake_final_url(url, timeout=5):
+            if "/dashboard" in url:
+                return "https://target.com/login"  # auth redirect
+            return url
+
+        with patch("scanner.crawl.subprocess.run", side_effect=self._curl_side_effect(pages)), \
+             patch("scanner.crawl._final_url", side_effect=fake_final_url):
+            findings = scan_target_crawl("r1", "target.com", "t")
+        assert not any("Sensitive-named page reachable" in f["title"] for f in findings)
+
+    def test_sensitive_named_demoted_when_no_app_shell_markers(self):
+        """A /dashboard returning marketing copy (no <input>, no login keywords)
+        is demoted to INFO — saw this on sparkles.dev/dashboard."""
+        marketing_html = (
+            '<html><body><h1>Coming soon</h1>'
+            '<p>Our AI-powered platform is launching in 2026</p></body></html>'
+        )
+        pages = {
+            "https://target.com/": ("200", "text/html",
+                '<a href="/dashboard">x</a>'),
+            "https://target.com/dashboard": ("200", "text/html", marketing_html),
+        }
+        with patch("scanner.crawl.subprocess.run", side_effect=self._curl_side_effect(pages)), \
+             patch("scanner.crawl._final_url",
+                   side_effect=lambda u, timeout=5: u):
+            findings = scan_target_crawl("r1", "target.com", "t")
+        # Should be INFO (demoted), not MEDIUM
+        hits = [f for f in findings if "/dashboard" in f["title"]]
+        assert hits
+        assert hits[0]["severity"] == "INFO", \
+            f"marketing-copy /dashboard must demote to INFO; got {hits[0]['severity']}"
+
+    def test_sensitive_named_stays_medium_with_app_shell_markers(self):
+        """A /dashboard with <input> / password fields / 'log out' is real MEDIUM."""
+        app_html = (
+            '<html><body>'
+            '<form><input type="text" name="username" placeholder="username">'
+            '<input type="password" name="password"></form>'
+            '<a href="/logout">Log out</a></body></html>'
+        )
+        pages = {
+            "https://target.com/": ("200", "text/html",
+                '<a href="/dashboard">x</a>'),
+            "https://target.com/dashboard": ("200", "text/html", app_html),
+        }
+        with patch("scanner.crawl.subprocess.run", side_effect=self._curl_side_effect(pages)), \
+             patch("scanner.crawl._final_url",
+                   side_effect=lambda u, timeout=5: u):
+            findings = scan_target_crawl("r1", "target.com", "t")
+        hits = [f for f in findings if "Sensitive-named page reachable" in f["title"]]
+        assert hits and hits[0]["severity"] == "MEDIUM"
+
     def test_crawl_suppresses_spa_fallback_api_findings(self):
         """If the SPA serves index.html for /api/* paths (Vercel/Netlify
         default), the crawler must NOT flag them — same SPA-fallback bug we
@@ -244,6 +305,112 @@ class TestDorking:
         monkeypatch.delenv("SERPER_API_KEY", raising=False)
         monkeypatch.delenv("SERPAPI_KEY", raising=False)
         assert _search_any("site:x.com test") == []
+
+    def test_dorking_filters_blog_posts_out_of_operational_dorks(self, monkeypatch):
+        """jinba.io had 5 'internal endpoint' hits that were all blog posts
+        (/uses/internal-api-chatting etc). Operational dorks (inurl:/ext:)
+        must drop URLs that are obviously marketing pages."""
+        monkeypatch.setenv("SERPER_API_KEY", "dummy")
+
+        def fake_search(q, num=10):
+            if "inurl:internal" in q:
+                return [
+                    {"link": "https://target.com/uses/internal-api-chatting"},
+                    {"link": "https://target.com/blog/using-internal-apis"},
+                    {"link": "https://target.com/docs/internal-api-guide"},
+                ]
+            return []
+        with patch("scanner.crawl._search_any", side_effect=fake_search):
+            findings = scan_target_dorking("r1", "target.com", "t")
+        # All three results are marketing — should produce NO finding.
+        assert not any("Internal endpoint" in f["title"] for f in findings), \
+            f"blog-post hits must not surface as internal-endpoint findings; got: {[f['title'] for f in findings]}"
+
+    def test_dorking_keeps_real_operational_hits(self, monkeypatch):
+        monkeypatch.setenv("SERPER_API_KEY", "dummy")
+
+        def fake_search(q, num=10):
+            if "inurl:admin" in q:
+                return [
+                    {"link": "https://flow-admin.target.com/"},
+                    {"link": "https://target.com/blog/how-we-built-admin"},  # marketing
+                ]
+            return []
+        with patch("scanner.crawl._search_any", side_effect=fake_search):
+            findings = scan_target_dorking("r1", "target.com", "t")
+        hits = [f for f in findings if "Admin panel" in f["title"]]
+        assert hits, "real admin subdomain hit must survive the filter"
+        # After filtering 1 marketing URL out, severity should demote one notch.
+        # (original "Admin panel indexed" is MEDIUM → becomes LOW)
+        assert hits[0]["severity"] == "LOW"
+
+
+class TestWaybackFilter:
+    def _fake_cdx(self, urls):
+        def fake_run(cmd, capture_output=True, text=True, timeout=None):
+            url = cmd[-1] if cmd else ""
+            r = MagicMock()
+            if "web.archive.org" in url:
+                rows = [["original", "statuscode"]] + [[u, "200"] for u in urls]
+                r.stdout = json.dumps(rows)
+                r.stderr = "HTTP/2 200\r\n\r\n"
+                return r
+            # All other probes 200
+            r.stdout = ""
+            r.stderr = "HTTP/2 200\r\n\r\n"
+            return r
+        return fake_run
+
+    def test_wayback_drops_static_asset_paths(self):
+        with patch("scanner.crawl.subprocess.run",
+                   side_effect=self._fake_cdx([
+                       "https://target.com/_next/static/media/font.woff2",
+                       "https://target.com/static/js/chunk.js",
+                       "https://target.com/assets/hero.png",
+                   ])):
+            findings = scan_target_wayback("r1", "target.com", "t")
+        assert not any("still live" in f["title"] for f in findings), \
+            "wayback must drop static assets — they're not orphan endpoints"
+
+    def test_wayback_drops_current_live_login_page(self):
+        """helloeos.ai had the /login page flagged as 'still live' — but login
+        pages are SUPPOSED to be live. Filter them out."""
+        with patch("scanner.crawl.subprocess.run",
+                   side_effect=self._fake_cdx([
+                       "https://target.com/login",
+                       "https://target.com/login/",
+                       "https://target.com/sign-in",
+                   ])):
+            findings = scan_target_wayback("r1", "target.com", "t")
+        assert not any("still live" in f["title"] for f in findings)
+
+    def test_wayback_keeps_real_orphan_admin_path(self):
+        with patch("scanner.crawl.subprocess.run",
+                   side_effect=self._fake_cdx([
+                       "https://target.com/admin/old-panel-v1",
+                       "https://target.com/dashboard/legacy",
+                   ])):
+            findings = scan_target_wayback("r1", "target.com", "t")
+        assert any("still live" in f["title"] for f in findings)
+
+
+class TestResendRegexTightened:
+    def test_resend_regex_rejects_snake_case_identifiers(self):
+        """The old regex matched GTM event names like 're_subscription_cancel'.
+        New regex requires 22+ base62 chars with no underscores."""
+        from scanner.app import SECRET_PATTERNS
+        import re as _re
+        resend_pat = next(p for p, lbl, _ in SECRET_PATTERNS if lbl == "Resend API key")
+
+        # Should NOT match any of these false positives
+        for s in ("re_subscription_cancel", "re_subscription_convert",
+                  "re_dupe_config", "re_subscription_renew",
+                  "re_short", "re_snake_case_name_here"):
+            assert not _re.search(resend_pat, s), f"false positive: {s}"
+
+        # SHOULD match a real Resend-style key (26 base62 chars)
+        real_key = "re_abc123XYZ456def789ghi012"
+        assert _re.search(resend_pat, real_key), f"missed real key: {real_key}"
 
 
 # ── Wayback module ─────────────────────────────────────────────────────────

@@ -79,6 +79,39 @@ def _curl(url: str, *, timeout: int = 6, head: bool = False,
 
 # ── Module: crawl ───────────────────────────────────────────────────────────
 
+def _final_url(url: str, timeout: int = 5) -> str:
+    """Follow redirects and return the final destination URL.
+
+    Used by the sensitive-named-page check: if `/dashboard` redirects to
+    `/login`, the crawler must NOT flag it as an exposed admin page — auth
+    is working. We can't rely on just HTTP status because many SPAs redirect
+    via 200 + meta-refresh or client-side router, but for server-issued 3xx
+    redirects this is enough.
+    """
+    try:
+        r = subprocess.run(
+            ["curl", "-sk", "-L", "-I", "-A", _UA,
+             "--max-time", str(timeout), "-o", "/dev/null",
+             "-w", "%{url_effective}", url],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+        return (r.stdout or "").strip() or url
+    except Exception:
+        return url
+
+
+_AUTH_LANDING_SUBSTRINGS = ("/login", "/signin", "/sign-in",
+                            "/auth/", "/oauth/", "/sso/", "/authenticate")
+
+_APP_SHELL_MARKERS = (
+    # Strong signals the page is an actual application view (not marketing).
+    # Any ONE of these being present is enough to promote from INFO to MEDIUM.
+    "<input", "password", "log out", "logout", "sign out", "signout",
+    "dashboard", "admin panel", "account settings", "api key", "bearer token",
+    "workspace", "organization", "billing portal",
+)
+
+
 def _same_origin(base_host: str, url: str) -> bool:
     try:
         p = urllib.parse.urlparse(url)
@@ -248,16 +281,51 @@ def scan_target_crawl(run_id: str, ip: str, name: str) -> list[dict]:
                 })
                 break  # one per page
             # Flag pages matching sensitive-path hints that shouldn't be public.
+            # Three post-filters suppress the common false positives we saw in the
+            # YC W26 batch scan:
+            #   (a) server-side redirect lands on /login/signin/auth → auth wall is
+            #       working; suppress
+            #   (b) body looks like marketing copy (no login form, no app shell
+            #       keywords, no /auth references) → likely a placeholder page,
+            #       not an actual sensitive view; demote to INFO
+            #   (c) actual app shell or form → genuine MEDIUM finding
             path = urllib.parse.urlparse(url).path.lower()
             if any(h in path for h in ("/admin", "/dashboard", "/console",
                                         "/internal", "/staging", "/debug")):
-                findings.append({
-                    "target": ip, "severity": "MEDIUM", "category": "web",
-                    "title": f"Sensitive-named page reachable: {path}",
-                    "description": "Page at a sensitive-looking path returned 200. Confirm it enforces authentication.",
-                    "evidence": f"GET {url} → 200",
-                    "tool": "crawler",
-                })
+                final = _final_url(url, timeout=4).lower()
+                # Check (a): redirect to auth page = suppress.
+                if any(s in final for s in _AUTH_LANDING_SUBSTRINGS):
+                    pass  # auth wall is doing its job
+                else:
+                    body_lower = body[:8192].lower() if body else ""
+                    looks_like_app = any(m in body_lower for m in _APP_SHELL_MARKERS)
+                    if looks_like_app:
+                        findings.append({
+                            "target": ip, "severity": "MEDIUM", "category": "web",
+                            "title": f"Sensitive-named page reachable: {path}",
+                            "description": (
+                                "Page at a sensitive-looking path returned 200 and "
+                                "contains app-shell markers (login form / dashboard / "
+                                "account keywords) but did NOT redirect to an auth "
+                                "page. Confirm it enforces authentication."
+                            ),
+                            "evidence": f"GET {url} → 200 · final={final}",
+                            "tool": "crawler",
+                        })
+                    else:
+                        # Demote to INFO — could be a placeholder / marketing page
+                        # at a sensitive-sounding URL (saw this on sparkles.dev/dashboard).
+                        findings.append({
+                            "target": ip, "severity": "INFO", "category": "recon",
+                            "title": f"Sensitive-named path exists but has no app-shell markers: {path}",
+                            "description": (
+                                "Page exists at a sensitive-looking URL but the body "
+                                "doesn't look like an authenticated app view. Could be "
+                                "a placeholder or marketing page — worth a human glance."
+                            ),
+                            "evidence": f"GET {url} → 200 · final={final}",
+                            "tool": "crawler",
+                        })
 
             # Queue internal links for deeper crawling.
             if depth < _MAX_CRAWL_DEPTH:
@@ -476,11 +544,35 @@ def scan_target_dorking(run_id: str, ip: str, name: str) -> list[dict]:
     if not (os.getenv("SERPER_API_KEY") or os.getenv("SERPAPI_KEY")):
         return findings  # no search keys configured → module is a no-op
 
+    # Paths that scream "marketing content, not an operational endpoint".
+    # We saw Serper flag blog posts about internal APIs as "Internal endpoint
+    # indexed" on jinba.io — filter those out of the operational dorks.
+    MARKETING_PATH_HINTS = ("/blog/", "/blogs/", "/posts/", "/articles/",
+                            "/news/", "/uses/", "/use-cases/", "/learn/",
+                            "/docs/", "/documentation/", "/resources/",
+                            "/case-studies/", "/customers/", "/about/",
+                            "/jobs/", "/careers/", "/glossary/")
+
+    def _is_marketing_url(u: str) -> bool:
+        return any(h in u.lower() for h in MARKETING_PATH_HINTS)
+
     for dork, title, sev in _DORKS:
         q = f"site:{ip} {dork}"
         results = _search_any(q, num=5)
         if not results:
             continue
+        # Operational dorks: drop results that are obvious marketing pages
+        # (the URL path tells us it's a blog post / docs page, not a live endpoint).
+        if dork.startswith("inurl:") or dork.startswith("ext:"):
+            filtered = [r for r in results
+                        if not _is_marketing_url(r.get("link") or r.get("url", ""))]
+            if not filtered:
+                continue
+            # If filtering removed results, demote severity one notch.
+            if len(filtered) < len(results):
+                sev = {"CRITICAL": "HIGH", "HIGH": "MEDIUM",
+                       "MEDIUM": "LOW", "LOW": "INFO"}.get(sev, sev)
+            results = filtered
         # Show up to 3 URLs inline as evidence.
         sample = "\n".join(
             f"- {r.get('link') or r.get('url', '')}" for r in results[:3]
@@ -523,12 +615,31 @@ def scan_target_wayback(run_id: str, ip: str, name: str) -> list[dict]:
     # rows[0] is the header — skip it.
     urls = [r[0] for r in rows[1:] if r and len(r) >= 1]
 
-    # Filter to interesting-looking paths we haven't already seeded elsewhere.
-    interesting = []
-    for u in urls:
+    # Filter out noise that's not worth a HIGH/MEDIUM finding even if still live.
+    # Static assets, fonts, build hashes and current-live login pages are things
+    # companies want to keep live — they're not orphans in the "forgotten endpoint"
+    # sense we're looking for.
+    WAYBACK_EXCLUDE_EXT = (".woff", ".woff2", ".ttf", ".eot", ".otf",
+                           ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+                           ".webp", ".avif", ".css", ".js.map", ".map")
+    WAYBACK_EXCLUDE_PATH = ("/_next/static/", "/_next/image", "/static/",
+                            "/assets/", "/public/", "/build/", "/dist/")
+    # Paths that are *supposed* to be permanent: login/signup pages.
+    WAYBACK_CURRENT_PUBLIC = ("/login", "/signin", "/sign-in", "/signup",
+                              "/sign-up", "/register")
+
+    def _wayback_keep(u: str) -> bool:
         p = urllib.parse.urlparse(u).path.lower()
-        if any(h in p for h in _SENSITIVE_PATH_HINTS):
-            interesting.append(u)
+        if any(p.endswith(ext) for ext in WAYBACK_EXCLUDE_EXT):
+            return False
+        if any(h in p for h in WAYBACK_EXCLUDE_PATH):
+            return False
+        if any(p.rstrip("/") == h or p.rstrip("/").endswith(h)
+               for h in WAYBACK_CURRENT_PUBLIC):
+            return False
+        return any(h in p for h in _SENSITIVE_PATH_HINTS)
+
+    interesting = [u for u in urls if _wayback_keep(u)]
     interesting = list(dict.fromkeys(interesting))[:15]
 
     # Re-probe each one on the LIVE site.

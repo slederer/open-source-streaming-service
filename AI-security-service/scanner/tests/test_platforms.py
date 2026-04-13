@@ -100,14 +100,14 @@ class TestChatGPTSetup:
 
 
 class TestCopilotExtension:
-    def test_copilot_no_github_token_returns_signup_prompt(self, anon_client):
+    def test_copilot_rejects_unauthenticated(self, anon_client):
+        # Hardened: /copilot now requires a Scanner API key OR a signed webhook.
+        # Anonymous requests are rejected to prevent attackers from spoofing
+        # `x-github-token` and triggering scans as other users.
         r = anon_client.post("/copilot", json={
             "messages": [{"role": "user", "content": "scan https://example.com"}]
         })
-        assert r.status_code == 200
-        # Response is SSE stream
-        text = r.text
-        assert "security.slederer.com" in text
+        assert r.status_code == 401
 
 
 class TestVercelWebhook:

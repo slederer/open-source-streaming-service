@@ -56,7 +56,8 @@ class TestV1Scan:
                 headers={"Authorization": f"Bearer {full_key}"},
             )
         data = r.json()
-        assert data["target"] == "stripped.example.com/path"
+        # Paths are stripped along with protocol (closes SSRF/hostname-validation surface).
+        assert data["target"] == "stripped.example.com"
 
 
 class TestV1Targets:

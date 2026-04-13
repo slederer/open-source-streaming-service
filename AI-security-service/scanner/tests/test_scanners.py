@@ -110,17 +110,27 @@ class TestHeadersScanner:
 
 
 class TestTlsScanner:
-    @patch("scanner.app.run_cmd")
-    def test_detects_self_signed(self, mock_cmd):
-        def side_effect(cmd, timeout=300):
-            if "s_client" in cmd and "-connect" in cmd:
-                return "CONNECTED(00000003)\nVerify return code: 18 (self-signed certificate)"
-            if "bash" in cmd:
-                return "subject=CN=10.0.0.1\nissuer=CN=10.0.0.1\nnotBefore=Jan 1 2026\nnotAfter=Jan 1 2027"
-            return ""
-        mock_cmd.side_effect = side_effect
+    def test_detects_self_signed(self):
+        """TLS scanner composes two openssl calls via Popen to avoid `bash -c`
+        interpolation (command-injection surface). Mock both the run_cmd call
+        (for the initial CONNECT) and Popen (for the cert-detail pipe)."""
+        from unittest.mock import patch, MagicMock
+        cert_text = "subject=CN=10.0.0.1\nissuer=CN=10.0.0.1\nnotBefore=Jan 1 2026\nnotAfter=Jan 1 2027"
 
-        findings = scan_target_tls("r1", "10.0.0.1", "test")
+        def popen_mock(cmd, **kwargs):
+            m = MagicMock()
+            m.stdout = MagicMock()
+            # Second Popen (openssl x509) returns the cert text via communicate().
+            if cmd and cmd[0] == "openssl" and "x509" in cmd:
+                m.communicate.return_value = (cert_text.encode(), b"")
+            else:
+                m.communicate.return_value = (b"", b"")
+            return m
+
+        with patch("scanner.app.run_cmd",
+                   return_value="CONNECTED(00000003)\nVerify return code: 18 (self-signed certificate)"), \
+             patch("scanner.app.subprocess.Popen", side_effect=popen_mock):
+            findings = scan_target_tls("r1", "10.0.0.1", "test")
         assert any(f["severity"] == "HIGH" and "Self-signed" in f["title"] for f in findings)
 
     @patch("scanner.app.run_cmd")

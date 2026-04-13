@@ -53,8 +53,8 @@ class TestTargets:
     def test_add_target_strips_protocol(self, client):
         r = client.post("/api/targets", json={"host": "https://example.com/path", "label": "example"})
         assert r.status_code == 200
-        # Strips protocol and trailing slash, keeps host
-        assert r.json()["host"] == "example.com/path"
+        # Strips protocol AND path (paths aren't valid hostnames and would fail the SSRF/hostname guard).
+        assert r.json()["host"] == "example.com"
 
     def test_add_target_strips_https(self, client):
         r = client.post("/api/targets", json={"host": "https://mysite.com", "label": "mysite"})

@@ -1,6 +1,7 @@
 """Security Scanner Web Dashboard — FastAPI + SQLite + Google OAuth."""
 
 import asyncio
+import hmac
 import json
 import os
 import re
@@ -23,21 +24,91 @@ from starlette.middleware.sessions import SessionMiddleware
 
 DB_PATH = Path(os.getenv("SCANNER_DB", "/home/ec2-user/scanner.db"))
 TARGETS_FILE = Path("/home/ec2-user/targets.txt")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "production").lower()
 
 # Google OAuth config
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
+
+_env_session_secret = os.getenv("SESSION_SECRET", "").strip()
+if not _env_session_secret:
+    if ENVIRONMENT == "production":
+        # Fail closed: regenerating the secret on every restart invalidates sessions
+        # and silently breaks OAuth/session tracking — refuse to start.
+        raise RuntimeError(
+            "SESSION_SECRET env var is required in production. "
+            "Generate one with `python -c 'import secrets;print(secrets.token_hex(32))'`."
+        )
+    _env_session_secret = secrets.token_hex(32)
+SESSION_SECRET = _env_session_secret
 ALLOWED_EMAILS = set(filter(None, os.getenv("ALLOWED_EMAILS", "stefan.a.lederer@gmail.com,stefan.lederer@bitmovin.com").split(",")))
 
+# Cookie hardening: the browser side is always HTTPS (enforced by Cloudflare + HSTS).
+# Even though the origin receives HTTP from CF Flexible SSL, we mark cookies Secure
+# so browsers never send them over a plaintext connection if CF is bypassed.
+# Starlette's SessionMiddleware honors `https_only` by checking request.url.scheme;
+# the TrustedHostMiddleware upstream + uvicorn `--proxy-headers` (or equivalent) are
+# what make the request scheme reflect X-Forwarded-Proto. In case that isn't wired,
+# we patch the cookie at emit time via a response-header rewrite middleware below.
+_COOKIE_SECURE = ENVIRONMENT == "production"
+
 app = FastAPI(title="Security Scanner", docs_url=None, redoc_url=None, openapi_url=None)
+
+# Security middleware: added LAST-first ordering so these execute on the OUTSIDE.
+from scanner.security import (
+    SecurityHeadersMiddleware, BodySizeLimitMiddleware, h as _html,
+    validate_scan_target, zip_safety_check, redact_secrets,
+    ct_equals, ensure_csrf_token, verify_csrf,
+    rate_limit, client_ip,
+)
+
+# Max request body: 250 MB (covers mobile app upload + form metadata). Rejects
+# oversized requests before they're read into memory.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=int(os.getenv("MAX_BODY_BYTES", str(250 * 1024 * 1024))))
+# Security headers (HSTS, CSP, X-Frame, XCTO, Referrer-Policy, Permissions-Policy).
+app.add_middleware(SecurityHeadersMiddleware)
+
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
     max_age=86400 * 7,
     same_site="lax",
-    https_only=False,  # Behind Cloudflare flexible SSL, origin sees HTTP
+    https_only=_COOKIE_SECURE,
 )
+
+
+@app.middleware("http")
+async def _force_secure_cookie(request: Request, call_next):
+    """Guarantee the Secure attribute on Set-Cookie regardless of origin scheme.
+
+    Background: Cloudflare Flexible SSL terminates TLS at the edge and proxies to
+    the origin over HTTP. Starlette's `https_only` gate sees request.url.scheme=http
+    and would skip Secure. The browser, however, always talks HTTPS to CF — so the
+    cookie SHOULD be Secure. We add Secure here iff the original client scheme was
+    HTTPS (via X-Forwarded-Proto) or we're explicitly in production.
+    """
+    response = await call_next(request)
+    if not _COOKIE_SECURE:
+        return response
+    xfp = request.headers.get("x-forwarded-proto", "").lower()
+    cf_visitor = request.headers.get("cf-visitor", "")
+    is_https = xfp == "https" or '"scheme":"https"' in cf_visitor or request.url.scheme == "https"
+    if not is_https:
+        return response
+    set_cookies = response.raw_headers
+    new_headers = []
+    for k, v in set_cookies:
+        if k.lower() == b"set-cookie":
+            val = v.decode("latin-1")
+            if "secure" not in val.lower():
+                val = val + "; Secure"
+            # Also tighten HttpOnly — Starlette already sets this for session cookie,
+            # but a defense-in-depth no-op won't hurt.
+            new_headers.append((k, val.encode("latin-1")))
+        else:
+            new_headers.append((k, v))
+    response.raw_headers = new_headers
+    return response
 
 # OAuth setup
 oauth = OAuth()
@@ -405,11 +476,27 @@ def scan_target_tls(run_id: str, ip: str, name: str):
     ], timeout=10)
 
     if "CONNECTED" in output:
-        # Check cert details
-        cert_output = run_cmd([
-            "bash", "-c",
-            f"echo | openssl s_client -connect {ip}:443 -servername {ip} 2>/dev/null | openssl x509 -noout -subject -issuer -dates -checkend 2592000 2>/dev/null"
-        ], timeout=10)
+        # Check cert details. Avoid `bash -c` with interpolation (command injection
+        # surface even though `ip` is usually validated upstream). Instead pipe
+        # openssl → openssl via Python Popen, passing hostname as argv.
+        try:
+            p1 = subprocess.Popen(
+                ["openssl", "s_client", "-connect", f"{ip}:443", "-servername", ip],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            p2 = subprocess.Popen(
+                ["openssl", "x509", "-noout", "-subject", "-issuer", "-dates",
+                 "-checkend", "2592000"],
+                stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            p1.stdout.close()  # allow p1 SIGPIPE on p2 exit
+            out, _ = p2.communicate(timeout=10)
+            p1.kill()
+            cert_output = out.decode("utf-8", errors="replace") if out else ""
+        except Exception as _tls_e:
+            cert_output = ""
 
         if "self-signed" in output.lower() or ("subject=" in cert_output and "issuer=" in cert_output):
             subject_match = re.search(r"subject=(.+)", cert_output)
@@ -1415,6 +1502,18 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
 
     for target in targets:
         ip, name = target["ip"], target["name"]
+        # SSRF guard: refuse to scan internal / metadata / private IPs. This is
+        # the critical defence for a tool that blindly curls user-supplied hosts.
+        _ok, _reason = validate_scan_target(ip, allow_unresolvable=True)
+        if not _ok:
+            _store_findings(run_id, [{
+                "target": ip, "severity": "INFO", "category": "error",
+                "title": "Target rejected by SSRF guard",
+                "description": _reason,
+                "evidence": "Private, loopback, link-local and metadata addresses are blocked.",
+                "tool": "policy",
+            }], seen, user_id=user_id)
+            continue
         for mod_name, mod_func in scan_modules:
             # Announce which module is about to run
             _update_summary(run_id, status="running", current_module=mod_name, completed_modules=completed, total_modules=total)
@@ -2013,7 +2112,7 @@ async def login_page(request: Request):
     verified = request.query_params.get("verified", "")
     alert = ""
     if error:
-        alert = f'<div class="error">{error}</div>'
+        alert = f'<div class="error">{_html(error[:200])}</div>'
     elif verified:
         alert = '<div class="success">Email verified. Sign in below.</div>'
 
@@ -2347,7 +2446,18 @@ async def auth_callback(request: Request):
     name = user_info.get("name", email)
     picture = user_info.get("picture", "")
 
-    # Auto-create or fetch user
+    # Google must have verified the email. Without this check, an attacker
+    # holding *any* account that claims `email=victim@example.com` (some
+    # enterprise SSO providers shipping through authlib don't pre-verify) can
+    # log in as the victim.
+    if not user_info.get("email_verified", False):
+        return RedirectResponse("/login?error=Google+did+not+verify+this+email")
+    if not email:
+        return RedirectResponse("/login?error=Missing+email+in+Google+profile")
+
+    # Auto-create or fetch user. Prevent silent takeover: if a local password-auth
+    # account already exists with this email, require that user to link their Google
+    # account manually — do NOT auto-login via OAuth.
     user = get_user_by_email(email)
     if not user:
         user_id = str(uuid.uuid4())
@@ -2357,6 +2467,10 @@ async def auth_callback(request: Request):
                 (user_id, email, name, picture, datetime.now(timezone.utc).isoformat()),
             )
     else:
+        if (user.get("auth_provider") or "email") == "email" and user.get("password_hash"):
+            # Existing password account — refuse to auto-link. User must sign in
+            # with password first, then optionally associate Google in their profile.
+            return RedirectResponse("/login?error=This+email+has+a+password+account.+Sign+in+with+your+password.")
         user_id = user["id"]
         with get_db() as db:
             db.execute(
@@ -2413,15 +2527,23 @@ def send_verification_email(email: str, token: str):
 
 @app.post("/api/auth/signup")
 async def signup(request: Request):
+    # Rate limit: 5 signups / hour / IP. Prevents mass-account creation
+    # (which pollutes the DB and can burn Resend quota via verification emails).
+    ok, retry = rate_limit(f"signup:{client_ip(request)}", max_events=5, window_seconds=3600)
+    if not ok:
+        return JSONResponse({"error": "Too many signup attempts"},
+                            status_code=429, headers={"Retry-After": str(retry)})
     body = await request.json()
     email = (body.get("email") or "").strip().lower()
     password = body.get("password") or ""
     name = (body.get("name") or "").strip() or email.split("@")[0]
 
-    if not email or "@" not in email:
+    if not email or "@" not in email or len(email) > 254:
         return JSONResponse({"error": "Valid email required"}, status_code=400)
-    if len(password) < 8:
-        return JSONResponse({"error": "Password must be at least 8 characters"}, status_code=400)
+    if len(password) < 8 or len(password) > 256:
+        return JSONResponse({"error": "Password must be 8–256 characters"}, status_code=400)
+    if len(name) > 100:
+        return JSONResponse({"error": "Name too long"}, status_code=400)
     if get_user_by_email(email):
         return JSONResponse({"error": "Email already registered. Try logging in."}, status_code=409)
 
@@ -2443,6 +2565,18 @@ async def login(request: Request):
     body = await request.json()
     email = (body.get("email") or "").strip().lower()
     password = body.get("password") or ""
+    # Two rate limits:
+    # 1. Per-IP broad cap — blocks credential stuffing from a single source.
+    # 2. Per-email cap — blocks targeted brute force against one account
+    #    even from a botnet distributed across many IPs.
+    ip_ok, retry_ip = rate_limit(f"login_ip:{client_ip(request)}",
+                                 max_events=20, window_seconds=300)
+    em_ok, retry_em = rate_limit(f"login_em:{email}",
+                                 max_events=10, window_seconds=300)
+    if not ip_ok or not em_ok:
+        retry = max(retry_ip, retry_em)
+        return JSONResponse({"error": "Too many login attempts"},
+                            status_code=429, headers={"Retry-After": str(retry)})
 
     user = get_user_by_email(email)
     if not user or not user.get("password_hash") or not verify_password(password, user["password_hash"]):
@@ -2470,19 +2604,31 @@ async def login(request: Request):
 
 @app.get("/verify", response_class=HTMLResponse)
 async def verify_email(request: Request, token: str = ""):
-    if not token:
+    if not token or len(token) < 8 or len(token) > 128:
         return HTMLResponse("<h1>Missing verification token</h1>", status_code=400)
+    # Fetch all rows whose token prefix matches (we hash/prefix-index to avoid
+    # loading every user) and do a constant-time compare in Python. Here we keep
+    # it simple: look up exact match via SQL (safe — parameterized), then
+    # re-check the token with hmac.compare_digest to defeat any timing signal
+    # the SQL layer might leak on non-matching prefixes.
     with get_db() as db:
         row = db.execute(
-            "SELECT id, verification_expires_at FROM users WHERE verification_token=?", (token,)
-        ).fetchone()
-        if not row:
+            "SELECT id, verification_token, verification_expires_at FROM users "
+            "WHERE verification_token IS NOT NULL AND length(verification_token)=?",
+            (len(token),),
+        ).fetchall()
+        match = None
+        for r in row:
+            if ct_equals(token, r["verification_token"]):
+                match = r
+                break
+        if not match:
             return HTMLResponse('<h1>Invalid or expired token</h1><a href="/login">Back to login</a>', status_code=400)
-        if row["verification_expires_at"] and row["verification_expires_at"] < datetime.now(timezone.utc).isoformat():
+        if not match["verification_expires_at"] or match["verification_expires_at"] < datetime.now(timezone.utc).isoformat():
             return HTMLResponse('<h1>Token expired</h1><a href="/login">Back to login</a>', status_code=400)
         db.execute(
             "UPDATE users SET email_verified=1, verification_token=NULL, verification_expires_at=NULL WHERE id=?",
-            (row["id"],),
+            (match["id"],),
         )
     return HTMLResponse(
         '<div style="font-family:sans-serif;max-width:480px;margin:80px auto;padding:32px;text-align:center;background:#111827;color:#e5e7eb;border-radius:12px;">'
@@ -2630,14 +2776,22 @@ async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
-    try:
-        if STRIPE_WEBHOOK_SECRET:
-            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        else:
-            # Dev mode: trust payload directly
+    # Fail closed: a missing secret in production means ANYONE can forge plan upgrades.
+    if not STRIPE_WEBHOOK_SECRET:
+        if ENVIRONMENT == "production":
+            return JSONResponse({"error": "Webhook secret not configured"}, status_code=500)
+        # Dev-only: accept raw JSON but require an explicit opt-in env to reduce foot-guns.
+        if os.getenv("STRIPE_WEBHOOK_ALLOW_UNSIGNED", "").lower() not in ("1", "true", "yes"):
+            return JSONResponse({"error": "Webhook secret not configured"}, status_code=500)
+        try:
             event = json.loads(payload)
-    except Exception as e:
-        return JSONResponse({"error": f"Invalid webhook: {e}"}, status_code=400)
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    else:
+        try:
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        except Exception:
+            return JSONResponse({"error": "Invalid webhook signature"}, status_code=400)
 
     event_type = event["type"] if isinstance(event, dict) else event.type
     data = (event["data"]["object"] if isinstance(event, dict) else event.data.object)
@@ -2992,7 +3146,11 @@ async def add_target(request: Request):
     if not host:
         return JSONResponse({"error": "host is required"}, status_code=400)
     # Strip protocol if URL provided
-    host = re.sub(r"^https?://", "", host).rstrip("/")
+    host = re.sub(r"^https?://", "", host).rstrip("/").split("/")[0]
+    # SSRF / validity guard — reject private/loopback/metadata IPs + malformed hostnames.
+    ok, reason = validate_scan_target(host, allow_unresolvable=True)
+    if not ok:
+        return JSONResponse({"error": f"Invalid target: {reason}"}, status_code=400)
 
     # Enforce target limit per plan
     full_user = get_user_by_id(user["user_id"])
@@ -3428,25 +3586,53 @@ async def github_scan_repo(request: Request):
             if github_token:
                 clone_url = repo_url.replace("https://", f"https://{github_token}@")
 
-            # Clone with explicit env to disable interactive prompts
+            # Clone with explicit env to disable interactive prompts and submodules.
             clone_env = os.environ.copy()
             clone_env["GIT_TERMINAL_PROMPT"] = "0"
             clone_env["GIT_ASKPASS"] = "echo"
+            clone_env["GIT_ALLOW_PROTOCOL"] = "https"
             clone_output = subprocess.run(
-                ["git", "clone", "--depth", "1", clone_url, tmp],
+                ["git", "clone", "--depth", "1", "--no-recurse-submodules",
+                 "--no-tags", clone_url, tmp],
                 capture_output=True, text=True, timeout=180, env=clone_env,
             )
             if clone_output.returncode != 0:
+                # Never echo git's stderr verbatim — it often contains the embedded
+                # token from the clone URL. Redact both the explicit token and any
+                # incidental secret shapes.
+                safe_stderr = redact_secrets(clone_output.stderr or "", github_token)[:500]
                 findings.append({
                     "target": repo_url, "severity": "INFO", "category": "error",
                     "title": "Could not clone repository",
-                    "description": f"git clone failed. Check the URL is correct and (for private repos) that the token is valid.",
-                    "evidence": (clone_output.stderr or "")[:500],
+                    "description": "git clone failed. Check the URL is correct and (for private repos) that the token is valid.",
+                    "evidence": safe_stderr,
                     "tool": "git",
                 })
             else:
-                clone_ok = True
+                # Remove any hooks that might trigger on checkout / post-clone.
+                import shutil as _sh
+                _sh.rmtree(os.path.join(tmp, ".git", "hooks"), ignore_errors=True)
+                # Cap total repo size — abort if too large.
+                _repo_size = 0
+                for _rt, _ds, _fs in os.walk(tmp):
+                    for _n in _fs:
+                        try:
+                            _repo_size += os.path.getsize(os.path.join(_rt, _n))
+                        except OSError:
+                            pass
+                    if _repo_size > 1_500_000_000:  # 1.5 GB
+                        findings.append({
+                            "target": repo_url, "severity": "INFO", "category": "error",
+                            "title": "Repository too large to scan",
+                            "description": "Repository exceeds 1.5 GB size cap.",
+                            "evidence": f"measured: {_repo_size} bytes",
+                            "tool": "git",
+                        })
+                        break
+                else:
+                    clone_ok = True
 
+            if clone_ok:
                 # Secrets scan via patterns — scan ALL patterns per file (no early break)
                 for root, dirs, files in os.walk(tmp):
                     # Skip .git directory entirely
@@ -3589,22 +3775,62 @@ async def mobile_scan(request: Request):
         return JSONResponse({"error": "Mobile scanning requires paid plan", "upgrade_url": "/billing"}, status_code=402)
 
     import tempfile, zipfile
+    # Pre-check content length to refuse oversized uploads before reading them.
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > 220_000_000:
+        return JSONResponse({"error": "File exceeds 200MB"}, status_code=413)
     form = await request.form()
     upload = form.get("file")
     if not upload:
         return JSONResponse({"error": "File upload required (field 'file')"}, status_code=400)
 
-    filename = upload.filename.lower()
+    filename = os.path.basename(upload.filename or "").lower()
+    if ".." in filename or "/" in filename or "\\" in filename:
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
     if not (filename.endswith(".ipa") or filename.endswith(".apk")):
         return JSONResponse({"error": "Only .ipa and .apk accepted"}, status_code=400)
 
-    # Save to temp
-    tmp_file = tempfile.mktemp(suffix=os.path.splitext(filename)[1])
-    content = await upload.read()
-    if len(content) > 200_000_000:
-        return JSONResponse({"error": "File exceeds 200MB"}, status_code=400)
-    with open(tmp_file, "wb") as f:
-        f.write(content)
+    # Stream to disk in chunks, abort on size overflow.
+    tmp_fd, tmp_file = tempfile.mkstemp(suffix=os.path.splitext(filename)[1])
+    total = 0
+    LIMIT = 200_000_000
+    try:
+        with os.fdopen(tmp_fd, "wb") as f:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > LIMIT:
+                    try:
+                        os.unlink(tmp_file)
+                    except OSError:
+                        pass
+                    return JSONResponse({"error": "File exceeds 200MB"}, status_code=413)
+                f.write(chunk)
+    except Exception:
+        try:
+            os.unlink(tmp_file)
+        except OSError:
+            pass
+        return JSONResponse({"error": "Upload failed"}, status_code=400)
+
+    # Zip-bomb safety: check member count, per-file size, and compression ratio.
+    try:
+        with zipfile.ZipFile(tmp_file) as _z_check:
+            ok, reason = zip_safety_check(_z_check)
+            if not ok:
+                try:
+                    os.unlink(tmp_file)
+                except OSError:
+                    pass
+                return JSONResponse({"error": f"Archive rejected: {reason}"}, status_code=400)
+    except zipfile.BadZipFile:
+        try:
+            os.unlink(tmp_file)
+        except OSError:
+            pass
+        return JSONResponse({"error": "Not a valid zip archive (IPA/APK)"}, status_code=400)
 
     run_id = str(uuid.uuid4())[:8]
     now = datetime.now(timezone.utc).isoformat()
@@ -4035,7 +4261,10 @@ async def v1_scan(request: Request, background_tasks: BackgroundTasks):
     label = (body.get("label") or "").strip()
     if not host:
         return JSONResponse({"error": "host is required"}, status_code=400)
-    host = re.sub(r"^https?://", "", host).rstrip("/")
+    host = re.sub(r"^https?://", "", host).rstrip("/").split("/")[0]
+    ok, reason = validate_scan_target(host, allow_unresolvable=True)
+    if not ok:
+        return JSONResponse({"error": f"Invalid target: {reason}"}, status_code=400)
     label = label or host
 
     # Auto-create target if not exists
@@ -5710,29 +5939,102 @@ async def oauth_authorize(request: Request, client_id: str = "", redirect_uri: s
         }
         return RedirectResponse(f"/login?oauth=1")
 
-    # Authenticated — show consent page
+    # Authenticated — show consent page. All interpolations HTML-escaped.
     client_name = client["name"]
+    csrf_token = ensure_csrf_token(request)
+    # Stash deny target so the Deny endpoint can redirect without letting the user
+    # rewrite the form target (closes a reflected-open-redirect via the Deny form).
+    request.session["oauth_deny"] = {
+        "redirect_uri": redirect_uri, "state": state, "client_id": client_id,
+    }
     return HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Authorize {client_name}</title><style>{_AUTH_CSS}</style></head>
+<html><head><meta charset="UTF-8"><title>Authorize {_html(client_name)}</title><style>{_AUTH_CSS}</style></head>
 <body>
 <div class="card">
-    <h1><span>&#9632;</span> Authorize {client_name}</h1>
-    <p class="sub"><strong>{client_name}</strong> is requesting access to your Security Scanner account as <strong>{user['email']}</strong>.</p>
-    <p class="sub">This will allow {client_name} to: scan your targets, read scan results, and generate fix files on your behalf.</p>
+    <h1><span>&#9632;</span> Authorize {_html(client_name)}</h1>
+    <p class="sub"><strong>{_html(client_name)}</strong> is requesting access to your Security Scanner account as <strong>{_html(user['email'])}</strong>.</p>
+    <p class="sub">This will allow {_html(client_name)} to: scan your targets, read scan results, and generate fix files on your behalf.</p>
     <form method="POST" action="/oauth/authorize">
-        <input type="hidden" name="client_id" value="{client_id}">
-        <input type="hidden" name="redirect_uri" value="{redirect_uri}">
-        <input type="hidden" name="state" value="{state}">
-        <input type="hidden" name="scope" value="{scope}">
+        <input type="hidden" name="client_id" value="{_html(client_id)}">
+        <input type="hidden" name="redirect_uri" value="{_html(redirect_uri)}">
+        <input type="hidden" name="state" value="{_html(state)}">
+        <input type="hidden" name="scope" value="{_html(scope)}">
+        <input type="hidden" name="csrf_token" value="{_html(csrf_token)}">
         <button type="submit" class="btn">Authorize</button>
     </form>
-    <form method="GET" action="{redirect_uri}" style="margin-top:10px;">
-        <input type="hidden" name="error" value="access_denied">
-        <input type="hidden" name="state" value="{state}">
+    <form method="POST" action="/oauth/deny" style="margin-top:10px;">
+        <input type="hidden" name="csrf_token" value="{_html(csrf_token)}">
         <button type="submit" class="btn" style="background:#1f2937;color:#9ca3af;">Deny</button>
     </form>
 </div>
 </body></html>""")
+
+
+@app.post("/oauth/deny")
+async def oauth_deny(request: Request):
+    """Handle user clicking Deny — redirects to the stored redirect_uri only.
+
+    Requires CSRF token (session-bound) and a matching stored `oauth_deny` entry
+    from the /oauth/authorize GET flow. This closes the open-redirect surface of
+    the prior GET form.
+    """
+    form = await request.form()
+    if not verify_csrf(request, form.get("csrf_token", "")):
+        return JSONResponse({"error": "invalid_csrf"}, status_code=400)
+    saved = request.session.pop("oauth_deny", None)
+    if not saved:
+        return RedirectResponse("/")
+    redirect_uri = saved.get("redirect_uri", "")
+    state = saved.get("state", "")
+    client = OAUTH_CLIENTS.get(saved.get("client_id", ""))
+    if not client or not _match_redirect_uri(client["redirect_uris"], redirect_uri):
+        return JSONResponse({"error": "invalid_client"}, status_code=400)
+    sep = "&" if "?" in redirect_uri else "?"
+    from urllib.parse import quote as _q
+    return RedirectResponse(f"{redirect_uri}{sep}error=access_denied&state={_q(state)}")
+
+
+def _ensure_oauth_codes_table():
+    with get_db() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS oauth_codes (
+            code_hash TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            scope TEXT,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_oauth_expires ON oauth_codes(expires_at)")
+
+
+def _store_oauth_code(code: str, data: dict):
+    import hashlib
+    _ensure_oauth_codes_table()
+    with get_db() as db:
+        # Remove anything already expired while we're here
+        db.execute("DELETE FROM oauth_codes WHERE expires_at < ?",
+                   (datetime.now(timezone.utc).isoformat(),))
+        db.execute(
+            "INSERT INTO oauth_codes (code_hash, user_id, client_id, redirect_uri, scope, expires_at, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (hashlib.sha256(code.encode()).hexdigest(),
+             data["user_id"], data["client_id"], data["redirect_uri"],
+             data.get("scope", ""), data["expires_at"].isoformat(),
+             datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def _consume_oauth_code(code: str) -> Optional[dict]:
+    import hashlib
+    _ensure_oauth_codes_table()
+    h = hashlib.sha256(code.encode()).hexdigest()
+    with get_db() as db:
+        row = db.execute("SELECT * FROM oauth_codes WHERE code_hash=?", (h,)).fetchone()
+        if not row:
+            return None
+        db.execute("DELETE FROM oauth_codes WHERE code_hash=?", (h,))
+    return dict(row)
 
 
 @app.post("/oauth/authorize")
@@ -5742,6 +6044,8 @@ async def oauth_authorize_post(request: Request):
     if not user:
         return RedirectResponse("/login")
     form = await request.form()
+    if not verify_csrf(request, form.get("csrf_token", "")):
+        return JSONResponse({"error": "invalid_csrf"}, status_code=400)
     client_id = form.get("client_id")
     redirect_uri = form.get("redirect_uri")
     state = form.get("state", "")
@@ -5752,15 +6056,19 @@ async def oauth_authorize_post(request: Request):
         return JSONResponse({"error": "invalid_client"}, status_code=400)
 
     code = secrets.token_urlsafe(32)
-    _oauth_authorization_codes[code] = {
+    _store_oauth_code(code, {
         "user_id": user["user_id"],
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "scope": scope,
         "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
-    }
+    })
+    # Rotate CSRF token after consent — one-shot.
+    request.session.pop("csrf_token", None)
+    request.session.pop("oauth_deny", None)
     sep = "&" if "?" in redirect_uri else "?"
-    return RedirectResponse(f"{redirect_uri}{sep}code={code}&state={state}")
+    from urllib.parse import quote as _q
+    return RedirectResponse(f"{redirect_uri}{sep}code={_q(code)}&state={_q(state)}")
 
 
 @app.post("/oauth/token")
@@ -5777,16 +6085,25 @@ async def oauth_token(request: Request):
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
     client = OAUTH_CLIENTS.get(client_id)
-    if not client or client["client_secret"] != client_secret:
+    # Constant-time client_secret compare to close timing-attack surface.
+    if not client or not ct_equals(client["client_secret"], client_secret or ""):
         return JSONResponse({"error": "invalid_client"}, status_code=401)
 
-    code_data = _oauth_authorization_codes.pop(code, None)
+    code_data = _consume_oauth_code(code or "")
     if not code_data:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
-    if code_data["expires_at"] < datetime.now(timezone.utc):
+    # DB-stored expires_at is an ISO string — compare as string ordering is valid
+    # for ISO timestamps, but keep the parse path clean.
+    try:
+        exp_dt = datetime.fromisoformat(code_data["expires_at"])
+    except Exception:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    if exp_dt < datetime.now(timezone.utc):
         return JSONResponse({"error": "invalid_grant", "error_description": "Code expired"}, status_code=400)
     if code_data["redirect_uri"] != redirect_uri:
         return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
+    if code_data["client_id"] != client_id:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
     # Issue an API key as the access token
     full_key, prefix, key_hash = generate_api_key()
@@ -5799,7 +6116,7 @@ async def oauth_token(request: Request):
     return {
         "access_token": full_key,
         "token_type": "Bearer",
-        "scope": code_data["scope"],
+        "scope": code_data.get("scope", ""),
     }
 
 
@@ -5815,11 +6132,36 @@ async def copilot_extension(request: Request):
 
     GitHub sends: { messages: [{ role, content }], copilot_thread_id, ... }
     We respond with NDJSON events per Copilot's extension protocol.
+
+    Auth: requires either a valid Scanner Bearer API key OR a GitHub-signed
+    payload. Without at least one, we reject — otherwise any attacker can spoof
+    `x-github-token` with a junk value and burn scan credits for any user whose
+    GitHub email happens to be registered.
     """
     from fastapi.responses import StreamingResponse
+    import hashlib as _hl
 
+    raw = await request.body()
+
+    # Path 1: Scanner API key (preferred — bindable to a specific user).
+    authed_user = require_auth_any(request)
+
+    # Path 2: GitHub Copilot HMAC signature (if configured).
+    if not authed_user:
+        gh_secret = os.getenv("COPILOT_WEBHOOK_SECRET", "").strip()
+        gh_sig = request.headers.get("github-public-key-signature", "") or \
+                 request.headers.get("x-github-signature", "")
+        if gh_secret and gh_sig:
+            expected = "sha256=" + hmac.new(gh_secret.encode(), raw, _hl.sha256).hexdigest()
+            if not ct_equals(expected, gh_sig):
+                return JSONResponse({"error": "invalid signature"}, status_code=401)
+        else:
+            return JSONResponse(
+                {"error": "Unauthorized", "hint": "Provide Bearer API key or configure COPILOT_WEBHOOK_SECRET"},
+                status_code=401,
+            )
     try:
-        body = await request.json()
+        body = json.loads(raw)
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
@@ -5829,23 +6171,29 @@ async def copilot_extension(request: Request):
         last = messages[-1]
         user_message = last.get("content", "") if isinstance(last, dict) else ""
 
-    # Identify the GitHub user — Copilot includes the user via X-GitHub-Token or similar
-    # For MVP, map to email via GitHub token if present; else ask for API key
-    gh_token = request.headers.get("x-github-token", "")
+    # Identify the user. Priority:
+    #   1. Scanner Bearer API key → bound to a specific user (safest).
+    #   2. GitHub token + signed payload → call GitHub to resolve the real user.
+    # We never trust `x-github-token` alone anymore — that was the P0 bug.
     gh_email = None
-    if gh_token:
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(
-                    "https://api.github.com/user/emails",
-                    headers={"Authorization": f"token {gh_token}"},
-                )
-                if resp.status_code == 200:
-                    emails = resp.json()
-                    primary = next((e for e in emails if e.get("primary")), None)
-                    gh_email = primary["email"] if primary else (emails[0]["email"] if emails else None)
-        except Exception:
-            pass
+    if authed_user:
+        gh_email = authed_user.get("email")
+    else:
+        gh_token = request.headers.get("x-github-token", "")
+        if gh_token:
+            # Only reached if the webhook signature verified above.
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get(
+                        "https://api.github.com/user/emails",
+                        headers={"Authorization": f"token {gh_token}"},
+                    )
+                    if resp.status_code == 200:
+                        emails = resp.json()
+                        primary = next((e for e in emails if e.get("primary")), None)
+                        gh_email = primary["email"] if primary else (emails[0]["email"] if emails else None)
+            except Exception:
+                pass
 
     # Parse intent from the user message
     import re as _re
@@ -5926,10 +6274,26 @@ async def copilot_extension(request: Request):
 
 @app.post("/vercel/webhook")
 async def vercel_webhook(request: Request):
-    """Receive a Vercel deployment event, trigger a scan."""
-    # Vercel signs webhooks with x-vercel-signature
+    """Receive a Vercel deployment event, trigger a scan.
+
+    Vercel signs every webhook with `x-vercel-signature` (HMAC-SHA1 of the body
+    using the integration's VERCEL_WEBHOOK_SECRET). We fail closed in production
+    if the secret isn't configured — without this check, any attacker can spoof
+    deployment events against a linked team and drain their scan budget.
+    """
+    import hashlib as _hl
+    raw = await request.body()
+    secret = os.getenv("VERCEL_WEBHOOK_SECRET", "").strip()
+    sig = request.headers.get("x-vercel-signature", "")
+    if not secret:
+        if ENVIRONMENT == "production":
+            return JSONResponse({"error": "Webhook secret not configured"}, status_code=500)
+    else:
+        expected = hmac.new(secret.encode(), raw, _hl.sha1).hexdigest()
+        if not ct_equals(expected, sig):
+            return JSONResponse({"error": "invalid signature"}, status_code=401)
     try:
-        payload = await request.json()
+        payload = json.loads(raw)
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
 

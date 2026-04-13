@@ -29,6 +29,10 @@ def tmp_db(tmp_path):
         "GOOGLE_CLIENT_SECRET": "test-secret",
         "SESSION_SECRET": "test-session-secret-0123456789abcdef",
         "ALLOWED_EMAILS": "test@example.com",
+        # Tests use 10.0.0.x private IPs as synthetic targets. In production
+        # the SSRF guard rejects these — tests opt in explicitly.
+        "SCANNER_ALLOW_PRIVATE_TARGETS": "1",
+        "ENVIRONMENT": "test",
     }):
         import scanner.app as app_module
         app_module.DB_PATH = db_path

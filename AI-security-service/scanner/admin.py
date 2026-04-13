@@ -302,7 +302,17 @@ async def admin_set_plan(request: Request, user_id: str):
     if plan not in ("free", "payg", "monthly", "pro"):
         raise HTTPException(status_code=400, detail="Invalid plan")
     expires = body.get("plan_expires_at")
+    # Validate expiry if provided: must be a parseable ISO timestamp.
+    if expires:
+        try:
+            datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="plan_expires_at must be ISO 8601")
     with _get_db() as db:
+        # Ensure the target user exists so we don't silently no-op a typo.
+        row = db.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
         db.execute(
             "UPDATE users SET plan=?, plan_expires_at=? WHERE id=?",
             (plan, expires, user_id),
@@ -316,14 +326,24 @@ async def admin_set_credits(request: Request, user_id: str):
     admin = require_admin(request)
     body = await request.json()
     op = body.get("op", "set")  # set | add
+    if op not in ("set", "add"):
+        raise HTTPException(status_code=400, detail="op must be 'set' or 'add'")
     try:
         amount = int(body.get("amount", 0))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="amount must be an integer")
+    # Bound the input to prevent accidental/overflow credit-granting. 10M credits
+    # is more than any conceivable plan. Negative add is allowed (for revoking)
+    # but the result is always clamped to >= 0 at the SQL level.
+    if abs(amount) > 10_000_000:
+        raise HTTPException(status_code=400, detail="amount out of range")
     with _get_db() as db:
+        row0 = db.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+        if not row0:
+            raise HTTPException(status_code=404, detail="User not found")
         if op == "add":
             db.execute(
-                "UPDATE users SET scan_credits = COALESCE(scan_credits,0) + ? WHERE id=?",
+                "UPDATE users SET scan_credits = MAX(0, COALESCE(scan_credits,0) + ?) WHERE id=?",
                 (amount, user_id),
             )
         else:
@@ -374,7 +394,7 @@ async def admin_delete_user(request: Request, user_id: str):
 
 @api.post("/users/{user_id}/impersonate")
 async def admin_impersonate(request: Request, user_id: str):
-    """Log in as this user (keeps ability to return to admin via /admin/unimpersonate)."""
+    """Log in as this user; return via POST /admin/unimpersonate."""
     admin = require_admin(request)
     with _get_db() as db:
         u = db.execute(
@@ -382,8 +402,15 @@ async def admin_impersonate(request: Request, user_id: str):
         ).fetchone()
         if not u:
             raise HTTPException(status_code=404, detail="User not found")
-    # Save the admin identity so we can return later
-    request.session["impersonation_original"] = request.session.get("user")
+    # Store only the admin's user_id + a flag. On unimpersonate we re-fetch the
+    # admin row fresh from the DB — never trust session-serialized fields.
+    # Refuse to nest impersonations: if we're already impersonating, require
+    # unimpersonate first so the stack doesn't tangle.
+    if request.session.get("_impersonating"):
+        raise HTTPException(status_code=409, detail="Already impersonating; unimpersonate first")
+    request.session["_impersonation_admin_id"] = admin["user_id"]
+    request.session["_impersonation_started_at"] = datetime.now(timezone.utc).isoformat()
+    request.session["_impersonating"] = True
     request.session["user"] = {
         "user_id": u["id"],
         "email": u["email"],
@@ -395,14 +422,33 @@ async def admin_impersonate(request: Request, user_id: str):
     return {"ok": True, "redirect": "/"}
 
 
-@router.get("/unimpersonate")
+@router.post("/unimpersonate")
 async def admin_unimpersonate(request: Request):
+    """End impersonation and restore the admin session. POST-only to avoid CSRF-via-GET."""
     from fastapi.responses import RedirectResponse
-    original = request.session.pop("impersonation_original", None)
-    if original:
-        request.session["user"] = original
-        _audit(original.get("email", "?"), "unimpersonate", "")
-    return RedirectResponse("/admin")
+    if not request.session.get("_impersonating"):
+        raise HTTPException(status_code=400, detail="Not currently impersonating")
+    admin_id = request.session.pop("_impersonation_admin_id", None)
+    request.session.pop("_impersonation_started_at", None)
+    request.session.pop("_impersonating", None)
+    if not admin_id:
+        raise HTTPException(status_code=400, detail="Impersonation state invalid")
+    # Re-fetch the admin from DB — don't trust session blobs.
+    from scanner.app import get_user_by_id
+    admin_row = get_user_by_id(admin_id)
+    if not admin_row:
+        # Admin was deleted mid-impersonation; force logout.
+        request.session.clear()
+        return RedirectResponse("/login")
+    request.session["user"] = {
+        "user_id": admin_row["id"],
+        "email": admin_row["email"],
+        "name": admin_row.get("name") or admin_row["email"],
+        "picture": admin_row.get("picture") or "",
+        "plan": admin_row.get("plan", "free"),
+    }
+    _audit(admin_row["email"], "unimpersonate", "")
+    return RedirectResponse("/admin", status_code=303)
 
 
 # ── Scans API ────────────────────────────────────────────────────────────────
@@ -639,6 +685,13 @@ async def admin_logs(request: Request, lines: int = 200):
         tail = "\n".join(text.splitlines()[-lines:])
     except Exception as e:
         tail = f"(error reading log: {e})"
+    # Defense-in-depth: even if some subprocess accidentally logged a secret,
+    # scrub common shapes before sending to the browser.
+    try:
+        from scanner.security import redact_secrets as _r
+        tail = _r(tail)
+    except Exception:
+        pass
     return PlainTextResponse(tail)
 
 
@@ -665,9 +718,18 @@ async def admin_broadcast(request: Request):
     subject = (body.get("subject") or "").strip()
     html = (body.get("html") or "").strip()
     segment = body.get("segment", "all")  # all | paid | free
+    if segment not in ("all", "paid", "free"):
+        raise HTTPException(status_code=400, detail="Invalid segment")
     dry_run = bool(body.get("dry_run", False))
     if not subject or not html:
         raise HTTPException(status_code=400, detail="subject and html are required")
+    # Reject header injection in subject (CRLF smuggling).
+    if "\n" in subject or "\r" in subject:
+        raise HTTPException(status_code=400, detail="subject must be single-line")
+    if len(subject) > 200:
+        raise HTTPException(status_code=400, detail="subject too long")
+    if len(html) > 200_000:
+        raise HTTPException(status_code=400, detail="body too large")
 
     with _get_db() as db:
         where = "email_verified=1"

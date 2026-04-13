@@ -195,18 +195,16 @@ class TestLandingAndLegal:
 class TestOAuthFullFlow:
     def test_oauth_full_token_exchange_success(self, client, db):
         """Complete OAuth flow: authorize → POST consent → exchange code for token."""
-        import time as _t
-        from scanner.app import OAUTH_CLIENTS, _oauth_authorization_codes
-        # Simulate user consent (normally done via POST form)
+        from scanner.app import OAUTH_CLIENTS, _store_oauth_code, _consume_oauth_code
         from datetime import datetime, timedelta, timezone
         code = "test-auth-code-abc"
-        _oauth_authorization_codes[code] = {
+        _store_oauth_code(code, {
             "user_id": "test-user-id-12345",
             "client_id": "chatgpt",
             "redirect_uri": "https://chatgpt.com/aip/g-test/oauth/callback",
             "scope": "scan",
             "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
-        }
+        })
 
         r = client.post("/oauth/token", data={
             "grant_type": "authorization_code",
@@ -220,16 +218,16 @@ class TestOAuthFullFlow:
         assert data["access_token"].startswith("sk-sec-")
         assert data["token_type"] == "Bearer"
 
-        # Code should be consumed (single-use)
-        assert code not in _oauth_authorization_codes
+        # Code should be consumed (single-use) — a second consume returns None.
+        assert _consume_oauth_code(code) is None
 
 
 class TestCopilotMessageParsing:
-    def test_copilot_no_url_in_message(self, anon_client):
-        """When user has no token, we respond with signup prompt."""
+    def test_copilot_rejects_unauthenticated(self, anon_client):
+        """After hardening, the Copilot endpoint requires a Bearer key OR a
+        signed webhook. Anonymous callers must be rejected — otherwise any
+        attacker can spoof `x-github-token` and trigger scans as other users."""
         r = anon_client.post("/copilot", json={
             "messages": [{"role": "user", "content": "hello"}]
         }, headers={"x-github-token": ""})
-        assert r.status_code == 200
-        # Without a GitHub token, we respond with signup/create-account prompt
-        assert "account" in r.text.lower() or "security.slederer.com" in r.text.lower()
+        assert r.status_code == 401

@@ -4642,11 +4642,58 @@ async function _loadModulesMeta() {
   return _scanModulesMeta;
 }
 
-VIEWS["scan-detail"] = async (runId) => {
+function _renderTargetCard(runId, target, findings, gradeFor, diff) {
+  const grade = gradeFor(findings);
+  const counts = {CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,INFO:0};
+  findings.forEach(f => counts[f.severity]++);
+  return `
+    <div class="target-card">
+      <div class="target-card-head">
+        <div style="display:flex;align-items:center;gap:14px;">
+          <div class="grade grade-${grade}">${grade}</div>
+          <div>
+            <h3>${esc(target)}</h3>
+            ${diff ? `<div class="host">+${diff.new_count} new · ${diff.fixed_count} fixed · ${diff.persistent_count} unchanged · vs #${diff.prev_run_id}</div>` : ''}
+          </div>
+        </div>
+        <div style="display:flex;gap:4px;">
+          ${counts.CRITICAL ? `<span class="badge CRITICAL">${counts.CRITICAL} CRIT</span>` : ''}
+          ${counts.HIGH ? `<span class="badge HIGH">${counts.HIGH} HIGH</span>` : ''}
+          ${counts.MEDIUM ? `<span class="badge MEDIUM">${counts.MEDIUM} MED</span>` : ''}
+          ${counts.LOW ? `<span class="badge LOW">${counts.LOW} LOW</span>` : ''}
+          ${counts.INFO ? `<span class="badge INFO">${counts.INFO} INFO</span>` : ''}
+        </div>
+      </div>
+      <div class="target-card-body">
+        ${['CRITICAL','HIGH','MEDIUM','LOW','INFO'].map(sev =>
+          findings.filter(f => f.severity === sev).map(f => `
+            <div class="finding" onclick="this.classList.toggle('open')">
+              <div class="finding-head">
+                <span class="badge ${f.severity}">${f.severity}</span>
+                <span class="finding-title">${esc(f.title)}</span>
+                <span class="finding-tool">${esc(f.tool)}</span>
+                <span class="finding-chev">&#9654;</span>
+              </div>
+              <div class="finding-body">
+                ${f.description ? `<dt>Description</dt><dd>${esc(f.description)}</dd>` : ''}
+                ${f.evidence ? `<dt>Evidence</dt><dd>${esc(f.evidence)}</dd>` : ''}
+                <dt>Category</dt><dd>${esc(f.category)}</dd>
+              </div>
+            </div>`).join('')).join('')}
+        <div style="margin-top:10px;"><a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">Download fix for ${esc(target)}</a></div>
+      </div>
+    </div>`;
+}
+
+VIEWS["scan-detail"] = async (runId, isPoll = false) => {
   const root = document.getElementById("view-root");
   if (!runId) { go("scans"); return; }
   if (_scanPollTimer) { clearTimeout(_scanPollTimer); _scanPollTimer = null; }
-  root.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+  // Only show loading spinner on initial load — not during background polls.
+  // Polling-triggered renders keep the current view visible until fresh render is ready.
+  if (!isPoll) {
+    root.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+  }
   const modulesMeta = await _loadModulesMeta();
   const d = await api(`/api/runs/${runId}`);
   if (!d || d.error) { root.innerHTML = `<div class="empty"><p>Scan not found</p></div>`; return; }
@@ -4705,85 +4752,58 @@ VIEWS["scan-detail"] = async (runId) => {
       </div>`;
   };
 
-  root.innerHTML = `
-    <div class="page-title">
-      <div style="display:flex;align-items:center;gap:12px;"><h1>Scan #${runId}</h1><span class="status-badge ${d.run.status}">${d.run.status}</span></div>
-      <div class="sub">${fmtTime(d.run.started_at)} · ${esc(d.run.scan_type || 'full')}${isRunning ? ' · <span style="color:var(--brand);">live</span>' : ''}</div>
-    </div>
+  // Render helpers for each dynamic section (so polls can surgically update without wiping state)
+  const statusHtml = `<div style="display:flex;align-items:center;gap:12px;"><h1>Scan #${runId}</h1><span class="status-badge ${d.run.status}">${d.run.status}</span></div>
+      <div class="sub">${fmtTime(d.run.started_at)} · ${esc(d.run.scan_type || 'full')}${isRunning ? ' · <span style="color:var(--brand);">live</span>' : ''}</div>`;
 
-    ${renderProgress()}
-
-    <div class="grid grid-cards" style="margin-bottom:20px;">
+  const statsHtml = `<div class="grid grid-cards" style="margin-bottom:20px;">
       <div class="stat-card crit"><div class="label">Critical</div><div class="value">${sumAll.critical || 0}</div></div>
       <div class="stat-card high"><div class="label">High</div><div class="value">${sumAll.high || 0}</div></div>
       <div class="stat-card med"><div class="label">Medium</div><div class="value">${sumAll.medium || 0}</div></div>
       <div class="stat-card"><div class="label">Low/Info</div><div class="value">${(sumAll.low || 0) + (sumAll.info || 0)}</div></div>
-    </div>
+    </div>`;
 
-    <div class="card" style="margin-bottom:20px;">
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
-        <div>
-          <h2 style="margin-bottom:4px;">AI Analysis &amp; Fix File</h2>
-          <div style="color:var(--text-muted);font-size:0.8rem;">Claude-powered executive summary + attack chains + Claude Code-ready fix instructions</div>
+  const targetsHtml = Object.entries(byTarget).map(([target, findings]) => _renderTargetCard(runId, target, findings, gradeFor, diffs[target])).join('');
+
+  // SURGICAL UPDATE — only on poll, only replace sections whose content actually changed
+  if (isPoll && root.querySelector('#sd-status')) {
+    const set = (id, html) => {
+      const el = document.getElementById(id);
+      if (el && el.innerHTML !== html) el.innerHTML = html;
+    };
+    set('sd-status', statusHtml);
+    set('sd-progress', renderProgress());
+    set('sd-stats', statsHtml);
+    set('sd-targets', targetsHtml);
+    // AI result box + buttons don't change during polls — leave them
+  } else {
+    root.innerHTML = `
+      <div id="sd-status" class="page-title">${statusHtml}</div>
+      <div id="sd-progress">${renderProgress()}</div>
+      <div id="sd-stats">${statsHtml}</div>
+
+      <div class="card" style="margin-bottom:20px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+          <div>
+            <h2 style="margin-bottom:4px;">AI Analysis &amp; Fix File</h2>
+            <div style="color:var(--text-muted);font-size:0.8rem;">Claude-powered executive summary + attack chains + Claude Code-ready fix instructions</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="btn btn-outline btn-sm" onclick="analyze('${runId}')">Run AI Analysis</button>
+            <a class="btn btn-sm" href="/v1/scan/${runId}/fix" download="SECURITY-FIX.md">Download SECURITY-FIX.md</a>
+          </div>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn btn-outline btn-sm" onclick="analyze('${runId}')">Run AI Analysis</button>
-          <a class="btn btn-sm" href="/v1/scan/${runId}/fix" download="SECURITY-FIX.md">Download SECURITY-FIX.md</a>
-        </div>
+        <div id="ai-result" style="margin-top:14px;"></div>
       </div>
-      <div id="ai-result" style="margin-top:14px;"></div>
-    </div>
 
-    ${Object.entries(byTarget).map(([target, findings]) => {
-      const grade = gradeFor(findings);
-      const counts = {CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,INFO:0};
-      findings.forEach(f => counts[f.severity]++);
-      const diff = diffs[target];
-      return `
-        <div class="target-card">
-          <div class="target-card-head">
-            <div style="display:flex;align-items:center;gap:14px;">
-              <div class="grade grade-${grade}">${grade}</div>
-              <div>
-                <h3>${esc(target)}</h3>
-                ${diff ? `<div class="host">+${diff.new_count} new · ${diff.fixed_count} fixed · ${diff.persistent_count} unchanged · vs #${diff.prev_run_id}</div>` : ''}
-              </div>
-            </div>
-            <div style="display:flex;gap:4px;">
-              ${counts.CRITICAL ? `<span class="badge CRITICAL">${counts.CRITICAL} CRIT</span>` : ''}
-              ${counts.HIGH ? `<span class="badge HIGH">${counts.HIGH} HIGH</span>` : ''}
-              ${counts.MEDIUM ? `<span class="badge MEDIUM">${counts.MEDIUM} MED</span>` : ''}
-              ${counts.LOW ? `<span class="badge LOW">${counts.LOW} LOW</span>` : ''}
-              ${counts.INFO ? `<span class="badge INFO">${counts.INFO} INFO</span>` : ''}
-            </div>
-          </div>
-          <div class="target-card-body">
-            ${['CRITICAL','HIGH','MEDIUM','LOW','INFO'].map(sev =>
-              findings.filter(f => f.severity === sev).map(f => `
-                <div class="finding" onclick="this.classList.toggle('open')">
-                  <div class="finding-head">
-                    <span class="badge ${f.severity}">${f.severity}</span>
-                    <span class="finding-title">${esc(f.title)}</span>
-                    <span class="finding-tool">${esc(f.tool)}</span>
-                    <span class="finding-chev">&#9654;</span>
-                  </div>
-                  <div class="finding-body">
-                    ${f.description ? `<dt>Description</dt><dd>${esc(f.description)}</dd>` : ''}
-                    ${f.evidence ? `<dt>Evidence</dt><dd>${esc(f.evidence)}</dd>` : ''}
-                    <dt>Category</dt><dd>${esc(f.category)}</dd>
-                  </div>
-                </div>`).join('')).join('')}
-            <div style="margin-top:10px;"><a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">Download fix for ${esc(target)}</a></div>
-          </div>
-        </div>`;
-    }).join('')}
-  `;
+      <div id="sd-targets">${targetsHtml}</div>`;
+  }
 
-  // Auto-refresh while running
+  // Auto-refresh while running (no flicker — render keeps showing until new one is ready)
   if (isRunning && currentView === 'scan-detail') {
     _scanPollTimer = setTimeout(() => {
       if (currentView === 'scan-detail' && location.hash.includes(runId)) {
-        VIEWS['scan-detail'](runId);
+        VIEWS['scan-detail'](runId, true);  // mark as background poll
       }
     }, 2000);
   }

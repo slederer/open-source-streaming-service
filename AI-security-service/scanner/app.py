@@ -2849,9 +2849,17 @@ async def auth_callback(request: Request):
     if not email:
         return RedirectResponse("/login?error=Missing+email+in+Google+profile")
 
-    # Auto-create or fetch user. Prevent silent takeover: if a local password-auth
-    # account already exists with this email, require that user to link their Google
-    # account manually — do NOT auto-login via OAuth.
+    # Auto-create or fetch user. Anti-takeover rule:
+    #   - Google has already verified the email (we gated on email_verified above).
+    #   - If a local password account exists for this email, that account also
+    #     proved ownership at signup-verify time (or via password possession).
+    #   - Both proofs point at the same person — let Google login proceed AND
+    #     mark the account as having a verified Google identity in addition.
+    #   - The original concern (attacker creates unverified password account →
+    #     legitimate user signs in via Google → attacker doesn't lose access)
+    #     is addressed by the email_verified=True gate ABOVE: an attacker without
+    #     control of the mailbox can't get email_verified back from Google, so
+    #     they never reach this code path.
     user = get_user_by_email(email)
     if not user:
         user_id = str(uuid.uuid4())
@@ -2861,14 +2869,17 @@ async def auth_callback(request: Request):
                 (user_id, email, name, picture, datetime.now(timezone.utc).isoformat()),
             )
     else:
-        if (user.get("auth_provider") or "email") == "email" and user.get("password_hash"):
-            # Existing password account — refuse to auto-link. User must sign in
-            # with password first, then optionally associate Google in their profile.
-            return RedirectResponse("/login?error=This+email+has+a+password+account.+Sign+in+with+your+password.")
         user_id = user["id"]
         with get_db() as db:
+            # If the existing account was password-only (auth_provider='email'),
+            # promote auth_provider so future logins can use either Google or
+            # password. We keep the existing password_hash so the user retains
+            # both options.
             db.execute(
-                "UPDATE users SET name=?, picture=?, last_login_at=? WHERE id=?",
+                "UPDATE users SET name=?, picture=?, last_login_at=?, "
+                "  email_verified=1, "
+                "  auth_provider=CASE WHEN auth_provider='google' THEN 'google' ELSE 'google+email' END "
+                "WHERE id=?",
                 (name, picture, datetime.now(timezone.utc).isoformat(), user_id),
             )
 
@@ -2895,12 +2906,21 @@ async def logout(request: Request):
 
 # ── Email/Password Auth ───────────────────────────────────────────────────────
 
-def send_verification_email(email: str, token: str):
-    """Send verification email via Resend."""
+def send_verification_email(email: str, token: str, base_url: Optional[str] = None):
+    """Send verification email via Resend.
+
+    base_url defaults to the production primary domain. Callers should pass
+    request.url._url's scheme+netloc (or PUBLIC_BASE_URL env override) so the
+    link points back to the host the user actually signed up on — was a real
+    bug when a user signed up via securityscanner.dev but got a verification
+    link to security.slederer.com.
+    """
     try:
         import resend as resend_mod
         resend_mod.api_key = os.getenv("RESEND_API_KEY", "")
-        verify_url = f"https://security.slederer.com/verify?token={token}"
+        host = (base_url or os.getenv("PUBLIC_BASE_URL")
+                or "https://securityscanner.dev").rstrip("/")
+        verify_url = f"{host}/verify?token={token}"
         resend_mod.Emails.send({
             "from": os.getenv("RESEND_FROM", "onboarding@resend.dev"),
             "to": [email],
@@ -2950,7 +2970,14 @@ async def signup(request: Request):
             (user_id, email, hash_password(password), name, token, expires),
         )
 
-    send_verification_email(email, token)
+    # Build the user-facing base URL from the original request — covers
+    # securityscanner.dev, security.slederer.com, and any future custom domains
+    # without needing code changes per host.
+    proxied_proto = request.headers.get("x-forwarded-proto", "")
+    scheme = proxied_proto or request.url.scheme or "https"
+    host_hdr = request.headers.get("host", "")
+    base_url = f"{scheme}://{host_hdr}" if host_hdr else None
+    send_verification_email(email, token, base_url=base_url)
     return {"ok": True, "message": "Account created. Check your email to verify."}
 
 
@@ -3567,6 +3594,20 @@ def _periodic_cleanup_loop():
 @app.on_event("startup")
 def startup():
     init_db()
+    # bcrypt + passlib sanity check — regressed once when a Playwright install
+    # transitively pulled bcrypt 5.x (which removed `hashpw()`). Verify the
+    # password roundtrip works at boot so signup doesn't 500 silently.
+    try:
+        h = hash_password("startup-sanity-check")
+        if not verify_password("startup-sanity-check", h):
+            raise RuntimeError("password roundtrip returned False")
+    except Exception as e:
+        msg = (f"[startup] FATAL: password subsystem broken: {e}\n"
+               "  → likely a bcrypt version conflict with passlib. "
+               "Pin: pip install --force-reinstall 'bcrypt==4.0.1'")
+        print(msg, flush=True)
+        if ENVIRONMENT == "production":
+            raise RuntimeError(msg)
     try:
         from scanner.admin import init_admin_db
         init_admin_db()

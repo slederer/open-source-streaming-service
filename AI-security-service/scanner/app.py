@@ -1566,11 +1566,23 @@ def _update_summary(run_id: str, status: str = "running", current_module: Option
         )
 
 
+# Crawler / OSINT modules (separate file — keeps app.py from growing further).
+try:
+    from scanner.crawl import (
+        scan_target_crawl, scan_target_dorking, scan_target_wayback,
+    )
+except ImportError:
+    # Flat-file layout on EC2 — same namespace fix used for admin/security.
+    from scanner_crawl import (  # type: ignore
+        scan_target_crawl, scan_target_dorking, scan_target_wayback,
+    )
+
 # Scan modules with human-readable descriptions
 SCAN_MODULES = [
     ("nmap",            "Port scan & service detection",    "scan_target_nmap"),
     ("headers",         "HTTP security headers",            "scan_target_headers"),
     ("tls",             "TLS/SSL configuration & cert",     "scan_target_tls"),
+    ("crawl",           "Web crawl · sitemap · JS bundles", "scan_target_crawl"),
     ("docs",            "Exposed endpoints (/docs, /.env)", "scan_target_docs"),
     ("ratelimit",       "Rate limiting probes",             "scan_target_ratelimit"),
     ("nuclei",          "Nuclei vulnerability templates",   "scan_target_nuclei"),
@@ -1583,6 +1595,8 @@ SCAN_MODULES = [
     ("dns_email",       "SPF/DMARC/CAA records",            "scan_target_dns_email"),
     ("baas",            "Supabase/Firebase/Clerk audit",    "scan_target_baas"),
     ("subdomain_enum",  "Subdomain enumeration (CT logs)",  "scan_target_subdomain_enum"),
+    ("dorking",         "Google dorking (Serper/SerpAPI)",  "scan_target_dorking"),
+    ("wayback",         "Wayback Machine historical URLs",  "scan_target_wayback"),
     ("llm",             "LLM endpoint security (OWASP)",    "scan_target_llm"),
     ("auth",            "Authentication probes",            "scan_target_auth"),
     ("s3_cloud",        "Cloud misconfiguration",           "scan_target_s3_cloud"),

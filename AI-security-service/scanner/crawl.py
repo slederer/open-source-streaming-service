@@ -268,24 +268,101 @@ def scan_target_crawl(run_id: str, ip: str, name: str) -> list[dict]:
 
     # JS-bundle URL extraction feeds discovered API endpoints back.
     discovered_api_urls: set[str] = set()
+    discovered_spa_routes: set[str] = set()
     for js_url, js_body in js_bundles[:12]:  # cap — bundles can be huge
         for u in _extract_js_urls(js_body):
             if u.startswith(("http://", "https://")) and _same_origin(base_host, u):
                 discovered_api_urls.add(u)
             elif u.startswith("/api/") or u.startswith("/graphql"):
                 discovered_api_urls.add(base + u)
+            elif u.startswith("/") and not u.startswith("/api/"):
+                # SPA route reference (/dashboard, /settings, /plans, etc.).
+                # Even on SPA-fallback hosts these are still meaningful as a
+                # surface map of the application.
+                discovered_spa_routes.add(u)
 
-    # Probe each discovered URL. 200 + no auth challenge = worth flagging.
+    # SPA-fallback fingerprint to filter API-probe false positives. Any path
+    # whose response body matches the root will be skipped — modern static
+    # hosts (Vercel/Netlify) serve index.html for unknown paths and we MUST
+    # NOT flag those as "exposed API" findings.
+    import hashlib as _hl
+    root_status, root_ctype, root_body = _curl(base + "/", timeout=5)
+    root_hash = _hl.sha256(root_body.encode("utf-8", errors="replace")).hexdigest() if root_body else ""
+
+    # Probe each discovered URL. Real API findings require:
+    #   (a) HTTP 200
+    #   (b) content-type that's NOT plain text/html (i.e. JSON / XML / plain
+    #       text / octet-stream — i.e. an actual API response)
+    #   (c) body different from the root SPA fallback
+    #   (d) endpoint doesn't 405 on a no-credential POST attempt (which would
+    #       indicate the host has no real backend at this path)
+    real_api_hits = 0
     for u in list(discovered_api_urls)[:15]:
-        status, ctype, _ = _curl(u, timeout=4, head=True)
-        if status == "200":
-            findings.append({
-                "target": ip, "severity": "MEDIUM", "category": "api",
-                "title": f"API endpoint from JS bundle is reachable unauthenticated: {urllib.parse.urlparse(u).path}",
-                "description": "API endpoint referenced in client bundle responded 200 without credentials. Verify it requires auth.",
-                "evidence": f"GET {u} → 200 (discovered via JS)",
-                "tool": "crawler",
-            })
+        status, ctype, body = _curl(u, timeout=4)
+        if status != "200":
+            continue
+        body_hash = _hl.sha256((body or "").encode("utf-8", errors="replace")).hexdigest()
+        # SPA-fallback: same body as root → not a real API
+        if root_hash and body_hash == root_hash:
+            continue
+        # Content-type guard: text/html with no API signature is suspicious.
+        # Real APIs return JSON/XML/text/plain. If text/html, demand a body
+        # marker that proves it's an API response (auth challenge, error JSON-
+        # like structure, etc.).
+        ct_lower = (ctype or "").lower()
+        is_api_response = (
+            "application/json" in ct_lower or
+            "application/xml" in ct_lower or
+            "text/xml" in ct_lower or
+            "text/plain" in ct_lower or
+            "octet-stream" in ct_lower or
+            # If text/html, require some kind of error-shape evidence
+            ("html" in ct_lower and any(
+                m in (body or "")[:1024].lower()
+                for m in ('"error"', '"message"', '"unauthorized"',
+                          'access denied', 'forbidden', 'authentication required')
+            ))
+        )
+        if not is_api_response:
+            continue
+        # Severity: response containing structured data → MEDIUM.
+        # Sensitive-named endpoint (auth, billing, admin, users) → HIGH.
+        path = urllib.parse.urlparse(u).path
+        sev = "MEDIUM"
+        if any(s in path.lower() for s in ("/auth", "/admin", "/users",
+                                            "/billing", "/payment", "/secret",
+                                            "/internal", "/debug", "/config")):
+            sev = "HIGH"
+        findings.append({
+            "target": ip, "severity": sev, "category": "api",
+            "title": f"API endpoint from JS bundle is reachable unauthenticated: {path}",
+            "description": (
+                "Endpoint referenced in client bundle responded 200 with a real "
+                "API response (not the SPA fallback). Verify it requires "
+                "authentication — many SPAs assume the API is protected by "
+                "CORS/cookies but expose it to direct curl access."
+            ),
+            "evidence": f"GET {u} → 200 · content-type={ctype}",
+            "tool": "crawler",
+        })
+        real_api_hits += 1
+
+    # Flag SPA routes as an INFO surface map — useful for manual triage even
+    # when no individual route is itself a vulnerability.
+    if discovered_spa_routes:
+        sample = sorted(discovered_spa_routes)[:12]
+        findings.append({
+            "target": ip, "severity": "INFO", "category": "recon",
+            "title": f"SPA routes discovered in JS bundle ({len(discovered_spa_routes)})",
+            "description": (
+                "Client-side router routes referenced in the JS bundle. These "
+                "are real navigation targets in the app — useful for mapping "
+                "the application surface and finding pages not linked from "
+                "the public navigation."
+            ),
+            "evidence": "\n".join("- " + r for r in sample),
+            "tool": "crawler",
+        })
 
     # Summary finding so dashboards show coverage.
     if pages_crawled > 0:

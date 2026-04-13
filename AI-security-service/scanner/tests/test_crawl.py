@@ -146,13 +146,43 @@ class TestCrawler:
             "https://target.com/": ("200", "text/html",
                 '<script src="/bundle.js"></script>'),
             "https://target.com/bundle.js": ("200", "application/javascript", self.JS_BUNDLE),
-            "https://target.com/api/internal/users": ("200", "application/json", "{}"),
-            "https://target.com/api/orphan": ("200", "application/json", "{}"),
+            # Real JSON API responses — not the SPA fallback.
+            "https://target.com/api/internal/users":
+                ("200", "application/json", '{"users":[{"id":1,"email":"x@y.z"}]}'),
+            "https://target.com/api/orphan":
+                ("200", "application/json", '{"data":[1,2,3]}'),
         }
         with patch("scanner.crawl.subprocess.run", side_effect=self._curl_side_effect(pages)):
             findings = scan_target_crawl("r1", "target.com", "t")
         api_hits = [f for f in findings if "JS bundle" in f["title"]]
         assert len(api_hits) >= 1, f"expected at least one JS-discovered API hit: {[f['title'] for f in findings]}"
+        # /api/internal/users matches the sensitive-name pattern → HIGH
+        users_hit = [f for f in api_hits if "users" in f["title"]]
+        assert users_hit and users_hit[0]["severity"] == "HIGH", \
+            f"sensitive-name endpoint should be HIGH; got {[(f['title'], f['severity']) for f in api_hits]}"
+
+    def test_crawl_suppresses_spa_fallback_api_findings(self):
+        """If the SPA serves index.html for /api/* paths (Vercel/Netlify
+        default), the crawler must NOT flag them — same SPA-fallback bug we
+        already squashed in scan_target_docs."""
+        spa_html = '<!doctype html><html><head><title>Co</title></head><body>app</body></html>'
+        pages = {
+            "https://target.com/": ("200", "text/html", spa_html),
+            "https://target.com/bundle.js": ("200", "application/javascript",
+                'fetch("/api/internal/users");fetch("/api/orphan");'),
+            # Both API paths return the IDENTICAL homepage HTML — SPA fallback.
+            "https://target.com/api/internal/users": ("200", "text/html", spa_html),
+            "https://target.com/api/orphan": ("200", "text/html", spa_html),
+        }
+        # Need a script tag in the homepage so the bundle gets fetched.
+        pages["https://target.com/"] = ("200", "text/html",
+            '<!doctype html><html><head><title>Co</title></head><body>app'
+            '<script src="/bundle.js"></script></body></html>')
+        with patch("scanner.crawl.subprocess.run", side_effect=self._curl_side_effect(pages)):
+            findings = scan_target_crawl("r1", "target.com", "t")
+        assert not any("JS bundle is reachable unauthenticated" in f["title"]
+                       for f in findings), \
+            f"SPA fallback /api/* responses must be suppressed; got: {[f['title'] for f in findings]}"
 
     def test_crawl_emits_summary(self):
         pages = {"https://target.com/": ("200", "text/html", "<html/>")}

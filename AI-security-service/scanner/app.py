@@ -412,15 +412,12 @@ def scan_target_headers(run_id: str, ip: str, name: str):
             status = status_match.group(1)
             headers_lower = output.lower()
 
-            # Check for unauthenticated access
-            if status == "200":
-                findings.append({
-                    "target": ip, "severity": "HIGH", "category": "web",
-                    "title": f"Unauthenticated access on {scheme}://{ip}:{port}",
-                    "description": f"HTTP {status} returned without credentials",
-                    "evidence": f"GET {url} → {status}",
-                    "tool": "curl",
-                })
+            # NOTE: the previous "Unauthenticated access on /" check was removed —
+            # a public root returning 200 is the normal behavior of every marketing
+            # site and landing page. Real unauthenticated-access findings now come
+            # from scan_target_docs (which probes /admin, /.env, /actuator, etc.
+            # with SPA-fallback detection and content-type sanity checks) and the
+            # auth-probe tests in scan_target_auth.
 
             # Server header disclosure
             server_match = re.search(r"server:\s*(.+)", headers_lower)
@@ -523,32 +520,140 @@ def scan_target_tls(run_id: str, ip: str, name: str):
 
 
 def scan_target_docs(run_id: str, ip: str, name: str):
-    """Check for exposed documentation / debug endpoints."""
+    """Check for exposed documentation / debug endpoints.
+
+    False-positive hardening: many modern SaaS sites use SPA hosting (Vercel,
+    Netlify, Cloudflare Pages, S3+CF) that falls back to serving index.html for
+    every unknown path, so naive 200-response probes produce piles of bogus
+    CRITICAL findings (exposed /.env, /.git/config, /docs, etc.) that are just
+    the React homepage re-served.
+
+    To distinguish real leaks from SPA fallbacks we:
+      1. Fetch the root (/) once as a baseline — body SHA256 + content-type.
+      2. Fetch a random nonexistent path — if that too returns 200 with the same
+         body, the host is definitively running an SPA fallback.
+      3. For each probed path: if the body matches the SPA fallback, skip.
+         Otherwise apply a content-type / body-signature check appropriate to
+         the path (JSON paths must return JSON, env files must not be HTML,
+         swagger pages must mention swagger/openapi in the body, etc.).
+    """
+    import hashlib as _hl
+
     findings = []
-    paths = [
-        "/docs", "/redoc", "/openapi.json", "/swagger.json", "/swagger-ui.html",
-        "/.env", "/.git/config", "/debug/pprof", "/actuator", "/server-status",
-        "/admin", "/__debug__",
-    ]
+
+    # Path metadata: (severity_if_real, required_content_type_prefixes, required_body_substrings)
+    # required_body_substrings: at least one must be in the first 4 KB (lowercase).
+    # Empty tuple means no body check (content-type check is sufficient).
+    SPEC = {
+        "/.env":            ("CRITICAL", ("text/plain", "application/octet-stream", "application/x-env"),
+                             ("=",)),
+        "/.git/config":     ("CRITICAL", ("text/plain", "application/octet-stream"),
+                             ("[core]", "[remote", "repositoryformatversion")),
+        "/openapi.json":    ("HIGH", ("application/json", "application/openapi+json", "text/json"),
+                             ("\"openapi\"", "\"swagger\"", "\"paths\"")),
+        "/swagger.json":    ("HIGH", ("application/json",),
+                             ("\"swagger\"", "\"openapi\"")),
+        "/docs":            ("HIGH", ("text/html",),
+                             ("swagger", "openapi", "redoc", "api docs", "api reference")),
+        "/redoc":           ("HIGH", ("text/html",),
+                             ("redoc", "openapi")),
+        "/swagger-ui.html": ("HIGH", ("text/html",),
+                             ("swagger-ui", "swagger")),
+        "/.git/HEAD":       ("CRITICAL", ("text/plain", "application/octet-stream"),
+                             ("ref:", "refs/heads")),
+        "/debug/pprof":     ("MEDIUM", ("text/html", "text/plain"),
+                             ("pprof", "profile", "goroutine")),
+        "/actuator":        ("MEDIUM", ("application/json", "application/vnd.spring",),
+                             ("_links",)),
+        "/server-status":   ("MEDIUM", ("text/html",),
+                             ("apache server status", "server uptime", "workers")),
+        # Admin is tricky: many SaaS have a legitimate /admin login page. A bare
+        # existence is LOW; only escalate if the page exposes privileged content.
+        "/admin":           ("LOW", ("text/html",),
+                             ("dashboard", "users", "admin panel", "tenants")),
+        "/__debug__":       ("MEDIUM", ("text/html", "text/plain", "application/json"),
+                             ("django", "debug", "werkzeug", "traceback")),
+    }
+    paths = list(SPEC.keys())
+
+    def _fetch(url: str, timeout: int = 8) -> tuple[str, str, bytes]:
+        """Return (status_code, content_type, body_first_4k). Empty on failure."""
+        # Two-call approach: -I for headers (status+content-type), -sk GET for body.
+        head = run_cmd(["curl", "-skI", "-m", "5", url], timeout=timeout)
+        m = re.search(r"HTTP/\S+\s+(\d+)", head or "")
+        status = m.group(1) if m else ""
+        ct_m = re.search(r"(?i)content-type:\s*([^\r\n;]+)", head or "")
+        ctype = (ct_m.group(1).strip().lower() if ct_m else "")
+        body = b""
+        if status == "200":
+            # Fetch only first 8KB to limit bandwidth on huge endpoints.
+            body_out = run_cmd(["curl", "-sk", "-m", "5", "--max-filesize", "32000",
+                                "-r", "0-8191", url], timeout=timeout)
+            body = (body_out or "").encode("utf-8", errors="replace")
+        return status, ctype, body
+
     for port in [80, 443, 3000, 8080, 8081, 8001]:
         for scheme in ["http", "https"]:
+            base = f"{scheme}://{ip}:{port}"
+
+            # Confirm the port is responsive at all.
+            probe = run_cmd(["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
+                             "-m", "2", f"{base}/"], timeout=5).strip()
+            if probe in ("000", ""):
+                break  # port/scheme combo not responding
+
+            # Build the SPA-fallback fingerprint from two baselines: the root, and
+            # a random nonexistent path. If both return 200 with identical bodies,
+            # the host serves index.html for unknown paths — record the fingerprint.
+            nonexistent = f"/__probe_{secrets.token_hex(6)}_{int(datetime.now(timezone.utc).timestamp())}"
+            root_status, root_ctype, root_body = _fetch(f"{base}/")
+            ne_status, ne_ctype, ne_body = _fetch(f"{base}{nonexistent}")
+            root_hash = _hl.sha256(root_body).hexdigest() if root_body else ""
+            ne_hash = _hl.sha256(ne_body).hexdigest() if ne_body else ""
+
+            spa_fallback_hash = None
+            if root_status == "200" and ne_status == "200" and root_hash and root_hash == ne_hash:
+                # Definitive SPA fallback — every unknown path returns the root.
+                spa_fallback_hash = root_hash
+
             for path in paths:
-                url = f"{scheme}://{ip}:{port}{path}"
-                output = run_cmd(["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-m", "3", url], timeout=8)
-                code = output.strip()
-                if code in ("200",):
-                    sev = "CRITICAL" if path in ("/.env", "/.git/config") else "HIGH" if path in ("/docs", "/openapi.json", "/swagger.json") else "MEDIUM"
-                    findings.append({
-                        "target": ip, "severity": sev, "category": "api",
-                        "title": f"Exposed endpoint: {path} on port {port}",
-                        "description": f"{url} returned HTTP 200 without authentication",
-                        "evidence": f"curl {url} → {code}",
-                        "tool": "curl",
-                    })
-            # Only check ports that are likely open
-            test = run_cmd(["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-m", "2", f"{scheme}://{ip}:{port}/"], timeout=5)
-            if test.strip() in ("000", ""):
-                break  # port not responding on this scheme, skip remaining paths
+                url = f"{base}{path}"
+                status, ctype, body = _fetch(url)
+                if status != "200":
+                    continue
+
+                body_hash = _hl.sha256(body).hexdigest() if body else ""
+                body_lower = body[:4096].decode("utf-8", errors="replace").lower()
+
+                # Rule 1: identical body to the SPA fallback → suppress.
+                if spa_fallback_hash and body_hash == spa_fallback_hash:
+                    continue
+                # Rule 2: identical body to the root — probably an SPA even if the
+                # nonexistent-path heuristic didn't confirm (some hosts 404 random
+                # paths but still serve the root for dotfiles).
+                if root_hash and body_hash == root_hash:
+                    continue
+
+                sev, ct_prefixes, body_markers = SPEC[path]
+
+                # Rule 3: content-type must match at least one of the expected
+                # prefixes. A .env served as text/html is a fallback, not a leak.
+                if ct_prefixes and not any(ctype.startswith(p) for p in ct_prefixes):
+                    continue
+
+                # Rule 4: body must contain a signature marker unique to this
+                # kind of endpoint. This catches the "technically the right
+                # content-type but empty/landing" edge case.
+                if body_markers and not any(m in body_lower for m in body_markers):
+                    continue
+
+                findings.append({
+                    "target": ip, "severity": sev, "category": "api",
+                    "title": f"Exposed endpoint: {path} on port {port}",
+                    "description": f"{url} returned HTTP 200 with expected content signature — endpoint is reachable without authentication.",
+                    "evidence": f"curl {url} → 200 · content-type={ctype or 'n/a'}",
+                    "tool": "curl",
+                })
 
     return findings
 

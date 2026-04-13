@@ -81,7 +81,11 @@ PORT     STATE SERVICE VERSION
 
 class TestHeadersScanner:
     @patch("scanner.app.run_cmd")
-    def test_detects_unauthenticated_access(self, mock_cmd):
+    def test_does_not_flag_public_root_as_unauthenticated(self, mock_cmd):
+        """The 'Unauthenticated access on /' finding was removed — it fired on
+        every marketing landing page, which is the intended behavior of a
+        public homepage. Real sensitive-endpoint detection is now owned by
+        scan_target_docs (with SPA-fallback guards)."""
         def side_effect(cmd, timeout=300):
             url = cmd[4] if len(cmd) > 4 else ""
             if "http://10.0.0.1:8080/" in url:
@@ -90,8 +94,7 @@ class TestHeadersScanner:
         mock_cmd.side_effect = side_effect
 
         findings = scan_target_headers("r1", "10.0.0.1", "test")
-        high = [f for f in findings if f["severity"] == "HIGH"]
-        assert any("Unauthenticated" in f["title"] for f in high)
+        assert not any("Unauthenticated" in f["title"] for f in findings)
 
     @patch("scanner.app.run_cmd")
     def test_detects_missing_headers(self, mock_cmd):
@@ -141,23 +144,155 @@ class TestTlsScanner:
 
 
 class TestDocsScanner:
-    @patch("scanner.app.run_cmd")
-    def test_detects_exposed_docs(self, mock_cmd):
-        def side_effect(cmd, timeout=300):
-            url = cmd[-1] if cmd else ""
-            # Return 200 for /docs on port 8080
-            if "/docs" in str(cmd) and "8080" in str(cmd) and "http://" in str(cmd):
-                return "200"
-            # Port check — respond on 8080
-            if "http://10.0.0.1:8080/" == url:
-                return "200"
-            return "000"
-        mock_cmd.side_effect = side_effect
+    """Exposed-endpoint detection with SPA-fallback and content-type guards.
 
+    The scanner used to flag any path returning 200 — which on modern SPA
+    hosting (Vercel/Netlify/Cloudflare Pages) triggered a cascade of false
+    criticals because every unknown path served index.html. The new
+    implementation compares body hashes against root + a known-nonexistent
+    path, and requires content-type + body-signature matches before flagging.
+    """
+
+    HOMEPAGE_HTML = (
+        "<!doctype html>\n<html><head><title>MarketingCo</title></head>"
+        "<body><h1>Welcome</h1></body></html>"
+    )
+    SWAGGER_HTML = (
+        "<!DOCTYPE html>\n<html><head><title>API Docs</title></head>"
+        "<body><script>window.swaggerUi = new SwaggerUi({spec: {openapi:'3.0'}});"
+        "</script></body></html>"
+    )
+    ENV_BODY = "DATABASE_URL=postgres://user:p4ss@db/app\nAPI_KEY=sk_live_abc123\n"
+    REAL_OPENAPI = '{"openapi":"3.0.0","info":{"title":"x"},"paths":{}}'
+
+    def _fake_cmd(self, responses):
+        """Build a run_cmd side_effect driven by a dict mapping url → (status, content_type, body)."""
+        def side_effect(cmd, timeout=300):
+            cmd_s = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            # Extract the URL (last argument in each of our curl invocations).
+            url = cmd[-1] if isinstance(cmd, list) else ""
+            key = responses.get(url)
+            # Fallback pattern: /__probe_* random paths → use the registered SPA fallback if any
+            if key is None and "/__probe_" in url:
+                key = responses.get("__SPA_FALLBACK__")
+            if key is None:
+                # Unknown → 404
+                if "-skI" in cmd_s or "-I " in cmd_s:
+                    return "HTTP/2 404 \r\ncontent-type: text/html\r\n\r\n"
+                if "-w" in cmd_s and "%{http_code}" in cmd_s:
+                    return "404"
+                return ""
+            status, ctype, body = key
+            if "-skI" in cmd_s or "-I " in cmd_s:
+                # HEAD response
+                return f"HTTP/2 {status} \r\ncontent-type: {ctype}\r\ncontent-length: {len(body)}\r\n\r\n"
+            if "-w" in cmd_s and "%{http_code}" in cmd_s:
+                return status
+            # Body fetch
+            return body
+        return side_effect
+
+    @patch("scanner.app.run_cmd")
+    def test_suppresses_spa_fallback(self, mock_cmd):
+        """Every path returns the same homepage HTML → NO findings."""
+        homepage = ("200", "text/html", self.HOMEPAGE_HTML)
+        responses = {
+            "https://10.0.0.1:443/": homepage,
+            "https://10.0.0.1:443/.env": homepage,
+            "https://10.0.0.1:443/.git/config": homepage,
+            "https://10.0.0.1:443/docs": homepage,
+            "https://10.0.0.1:443/openapi.json": homepage,
+            "https://10.0.0.1:443/admin": homepage,
+            "__SPA_FALLBACK__": homepage,
+        }
+        mock_cmd.side_effect = self._fake_cmd(responses)
         findings = scan_target_docs("r1", "10.0.0.1", "test")
-        exposed = [f for f in findings if "Exposed" in f["title"] and "/docs" in f["title"]]
-        assert len(exposed) >= 1
-        assert exposed[0]["severity"] == "HIGH"
+        assert findings == [], f"SPA fallback should suppress all probes, got: {[f['title'] for f in findings]}"
+
+    @patch("scanner.app.run_cmd")
+    def test_real_swagger_docs_flagged(self, mock_cmd):
+        """A path that genuinely serves Swagger UI gets flagged HIGH."""
+        homepage = ("200", "text/html", self.HOMEPAGE_HTML)
+        swagger = ("200", "text/html", self.SWAGGER_HTML)
+        responses = {
+            "https://10.0.0.1:443/": homepage,
+            "https://10.0.0.1:443/docs": swagger,
+        }
+        mock_cmd.side_effect = self._fake_cmd(responses)
+        findings = scan_target_docs("r1", "10.0.0.1", "test")
+        docs = [f for f in findings if "/docs" in f["title"]]
+        assert len(docs) == 1
+        assert docs[0]["severity"] == "HIGH"
+
+    @patch("scanner.app.run_cmd")
+    def test_real_env_file_flagged_critical(self, mock_cmd):
+        """A text/plain .env with KEY=VALUE body is a real leak."""
+        homepage = ("200", "text/html", self.HOMEPAGE_HTML)
+        env_file = ("200", "text/plain", self.ENV_BODY)
+        responses = {
+            "https://10.0.0.1:443/": homepage,
+            "https://10.0.0.1:443/.env": env_file,
+        }
+        mock_cmd.side_effect = self._fake_cmd(responses)
+        findings = scan_target_docs("r1", "10.0.0.1", "test")
+        env_findings = [f for f in findings if f["title"].endswith(".env on port 443")]
+        assert len(env_findings) == 1
+        assert env_findings[0]["severity"] == "CRITICAL"
+
+    @patch("scanner.app.run_cmd")
+    def test_env_served_as_html_suppressed(self, mock_cmd):
+        """Even when body differs from the root, /.env served as text/html is
+        a fallback, not a leak. Content-type guard should suppress."""
+        homepage = ("200", "text/html", self.HOMEPAGE_HTML)
+        env_as_html = ("200", "text/html",
+                       "<html><body>Page not found in router</body></html>")
+        responses = {
+            "https://10.0.0.1:443/": homepage,
+            "https://10.0.0.1:443/.env": env_as_html,
+        }
+        mock_cmd.side_effect = self._fake_cmd(responses)
+        findings = scan_target_docs("r1", "10.0.0.1", "test")
+        assert not any(".env" in f["title"] for f in findings)
+
+    @patch("scanner.app.run_cmd")
+    def test_openapi_json_with_right_signature_flagged(self, mock_cmd):
+        homepage = ("200", "text/html", self.HOMEPAGE_HTML)
+        openapi = ("200", "application/json", self.REAL_OPENAPI)
+        responses = {
+            "https://10.0.0.1:443/": homepage,
+            "https://10.0.0.1:443/openapi.json": openapi,
+        }
+        mock_cmd.side_effect = self._fake_cmd(responses)
+        findings = scan_target_docs("r1", "10.0.0.1", "test")
+        assert any("openapi.json" in f["title"] for f in findings)
+
+    @patch("scanner.app.run_cmd")
+    def test_admin_spa_fallback_not_flagged(self, mock_cmd):
+        """SPA-returned /admin (just the marketing homepage) is not a finding."""
+        homepage = ("200", "text/html", self.HOMEPAGE_HTML)
+        responses = {
+            "https://10.0.0.1:443/": homepage,
+            "https://10.0.0.1:443/admin": homepage,
+            "__SPA_FALLBACK__": homepage,
+        }
+        mock_cmd.side_effect = self._fake_cmd(responses)
+        findings = scan_target_docs("r1", "10.0.0.1", "test")
+        assert not any("/admin" in f["title"] for f in findings)
+
+
+class TestHeadersNoLongerFlagsPublicRoot:
+    """Marketing sites with 200 at / should NOT be tagged 'Unauthenticated access'."""
+
+    @patch("scanner.app.run_cmd")
+    def test_public_homepage_does_not_trigger_unauth_finding(self, mock_cmd):
+        from scanner.app import scan_target_headers
+        mock_cmd.return_value = (
+            "HTTP/2 200\r\nserver: cloudflare\r\n"
+            "content-type: text/html\r\n\r\n"
+        )
+        findings = scan_target_headers("r1", "10.0.0.1", "test")
+        assert not any("Unauthenticated access" in f["title"] for f in findings), \
+            "Public root at 200 must no longer produce 'Unauthenticated access' findings"
 
 
 class TestRateLimitScanner:

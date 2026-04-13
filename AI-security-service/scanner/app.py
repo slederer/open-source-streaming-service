@@ -1729,10 +1729,22 @@ try:
     from scanner.crawl import (
         scan_target_crawl, scan_target_dorking, scan_target_wayback,
     )
+    from scanner.advanced import (
+        scan_target_ai_chain, scan_target_subdomain_deep, scan_target_takeover,
+        scan_target_github_org, scan_target_default_creds, scan_target_js_cve,
+        scan_target_idor, scan_target_render, scan_target_authenticated,
+        scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
+    )
 except ImportError:
     # Flat-file layout on EC2 — same namespace fix used for admin/security.
     from scanner_crawl import (  # type: ignore
         scan_target_crawl, scan_target_dorking, scan_target_wayback,
+    )
+    from scanner_advanced import (  # type: ignore
+        scan_target_ai_chain, scan_target_subdomain_deep, scan_target_takeover,
+        scan_target_github_org, scan_target_default_creds, scan_target_js_cve,
+        scan_target_idor, scan_target_render, scan_target_authenticated,
+        scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
     )
 
 # Scan modules with human-readable descriptions
@@ -1754,12 +1766,25 @@ SCAN_MODULES = [
     ("dns_email",       "SPF/DMARC/CAA records",            "scan_target_dns_email"),
     ("baas",            "Supabase/Firebase/Clerk audit",    "scan_target_baas"),
     ("subdomain_enum",  "Subdomain enumeration (CT logs)",  "scan_target_subdomain_enum"),
+    ("subdomain_deep",  "Deep subdomain + port scan",       "scan_target_subdomain_deep"),
+    ("takeover",        "Subdomain takeover detection",     "scan_target_takeover"),
     ("dorking",         "Google dorking (Serper/SerpAPI)",  "scan_target_dorking"),
+    ("github_org",      "GitHub secret dorking",            "scan_target_github_org"),
     ("wayback",         "Wayback Machine historical URLs",  "scan_target_wayback"),
+    ("js_cve",          "Vulnerable JS libraries",          "scan_target_js_cve"),
+    ("email_deep",      "Email security deep-dive",         "scan_target_email_deep"),
+    ("render",          "Headless Chrome rendering",        "scan_target_render"),
+    ("api_fuzz",        "OpenAPI endpoint fuzzing",         "scan_target_api_fuzz"),
     ("llm",             "LLM endpoint security (OWASP)",    "scan_target_llm"),
     ("auth",            "Authentication probes",            "scan_target_auth"),
+    ("default_creds",   "Default credentials (opt-in)",     "scan_target_default_creds"),
+    ("idor",            "IDOR probing (opt-in)",            "scan_target_idor"),
+    ("authenticated",   "Authenticated re-scan (with creds)","scan_target_authenticated"),
     ("s3_cloud",        "Cloud misconfiguration",           "scan_target_s3_cloud"),
+    ("nuclei_cve",      "Nuclei CVE + takeover templates",  "scan_target_nuclei_cve"),
     ("accessibility",   "Privacy & compliance audit",       "scan_target_accessibility"),
+    # AI reasoning must run LAST — it reviews everything above.
+    ("ai_chain",        "AI reasoning (Claude+OpenAI+Gemini)","scan_target_ai_chain"),
 ]
 
 
@@ -3496,6 +3521,64 @@ async def delete_target(request: Request, target_id: int):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     with get_db() as db:
         db.execute("DELETE FROM targets WHERE id=? AND user_id=?", (target_id, user["user_id"]))
+    return {"ok": True}
+
+
+@app.post("/api/targets/{target_host}/credentials")
+async def set_target_credentials(request: Request, target_host: str):
+    """Store login credentials for authenticated scanning.
+
+    Credentials are XOR-encrypted with SESSION_SECRET (MVP — should be Fernet
+    or AWS KMS in prod). Only the target's owner can set them. Only used by
+    scan_target_authenticated to re-run probes with a real session cookie.
+    """
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+    login_url = (body.get("login_url") or "").strip()
+    if not username or not password:
+        return JSONResponse({"error": "username and password required"}, status_code=400)
+    import base64
+    secret = SESSION_SECRET.encode()
+    encrypted = base64.b64encode(bytes(
+        b ^ secret[i % len(secret)] for i, b in enumerate(password.encode())
+    )).decode()
+    # Ensure credentials table exists (defined in scanner/advanced.py).
+    try:
+        from scanner.advanced import _ensure_credentials_table
+    except ImportError:
+        from scanner_advanced import _ensure_credentials_table  # type: ignore
+    _ensure_credentials_table()
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO scan_credentials (user_id, target, login_url, username, password_encrypted) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(user_id, target) DO UPDATE SET "
+            "login_url=excluded.login_url, username=excluded.username, "
+            "password_encrypted=excluded.password_encrypted",
+            (user["user_id"], target_host, login_url, username, encrypted),
+        )
+    return {"ok": True, "note": "Credentials stored. Next scan will re-probe authenticated surface."}
+
+
+@app.delete("/api/targets/{target_host}/credentials")
+async def delete_target_credentials(request: Request, target_host: str):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        from scanner.advanced import _ensure_credentials_table
+    except ImportError:
+        from scanner_advanced import _ensure_credentials_table  # type: ignore
+    _ensure_credentials_table()
+    with get_db() as db:
+        db.execute(
+            "DELETE FROM scan_credentials WHERE user_id=? AND target=?",
+            (user["user_id"], target_host),
+        )
     return {"ok": True}
 
 

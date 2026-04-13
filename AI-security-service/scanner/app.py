@@ -258,6 +258,31 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+        # Migrate `targets.host` from GLOBAL UNIQUE → composite UNIQUE(host, user_id).
+        # Bug: when a second user added a hostname already owned by a different
+        # user, INSERT raised IntegrityError → 500 → silent UI failure.
+        # SQLite can't drop a column constraint in place — recreate the table.
+        targets_sql = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='targets'"
+        ).fetchone()
+        if targets_sql and "host TEXT UNIQUE" in targets_sql[0]:
+            db.executescript("""
+                BEGIN;
+                CREATE TABLE targets_new (
+                    id INTEGER PRIMARY KEY,
+                    host TEXT NOT NULL,
+                    label TEXT,
+                    added_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    user_id TEXT,
+                    UNIQUE(host, user_id)
+                );
+                INSERT INTO targets_new (id, host, label, added_at, user_id)
+                  SELECT id, host, label, added_at, user_id FROM targets;
+                DROP TABLE targets;
+                ALTER TABLE targets_new RENAME TO targets;
+                COMMIT;
+            """)
+
         # Migrate legacy data to Stefan's user (idempotent)
         stefan_email = "stefan.a.lederer@gmail.com"
         stefan = db.execute("SELECT id FROM users WHERE email=?", (stefan_email,)).fetchone()
@@ -4874,7 +4899,11 @@ async def v1_scan(request: Request, background_tasks: BackgroundTasks):
         return JSONResponse({"error": f"Invalid target: {reason}"}, status_code=400)
     label = label or host
 
-    # Auto-create target if not exists
+    # Auto-create target if not exists. The INSERT is wrapped because the
+    # legacy schema had a GLOBAL UNIQUE on `targets.host` — when another user
+    # had already added the same host, this INSERT would 500. Schema migration
+    # in init_db converts to composite UNIQUE(host, user_id), but we keep the
+    # try/except for safety on databases that haven't migrated yet.
     with get_db() as db:
         existing = db.execute(
             "SELECT * FROM targets WHERE host=? AND user_id=?", (host, user["user_id"])
@@ -4886,10 +4915,15 @@ async def v1_scan(request: Request, background_tasks: BackgroundTasks):
             cnt = db.execute("SELECT COUNT(*) FROM targets WHERE user_id=?", (user["user_id"],)).fetchone()[0]
             if cnt >= max_targets:
                 return JSONResponse({"error": f"Target limit reached ({max_targets} for {plan} plan)"}, status_code=402)
-            db.execute(
-                "INSERT INTO targets (host, label, added_at, user_id) VALUES (?,?,?,?)",
-                (host, label, datetime.now(timezone.utc).isoformat(), user["user_id"]),
-            )
+            try:
+                db.execute(
+                    "INSERT INTO targets (host, label, added_at, user_id) VALUES (?,?,?,?)",
+                    (host, label, datetime.now(timezone.utc).isoformat(), user["user_id"]),
+                )
+            except sqlite3.IntegrityError:
+                # Another request inserted in parallel, OR pre-migration unique
+                # constraint kicked in. Either way, the target is now reachable.
+                pass
 
     run_id = str(uuid.uuid4())[:8]
     now = datetime.now(timezone.utc).isoformat()
@@ -5357,10 +5391,30 @@ window.addEventListener("hashchange", () => {
 
 // ─── API helper ──────────────────────────────────────────────────────────────
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  let r;
+  try {
+    r = await fetch(path, opts);
+  } catch (e) {
+    // Network failure (offline, DNS, CORS, etc.) — surface to the user
+    // instead of silently returning undefined.
+    return {error: "Network error: " + (e && e.message || e)};
+  }
   if (r.status === 401) { location.href = "/login"; return; }
   const ct = r.headers.get("content-type") || "";
-  return ct.includes("json") ? await r.json() : await r.text();
+  let body;
+  try {
+    body = ct.includes("json") ? await r.json() : await r.text();
+  } catch (e) {
+    body = null;
+  }
+  // Non-2xx without a JSON {error: ...} payload — synthesize one so callers
+  // that check `r.error` actually see something. Was a real bug: 5xx → null →
+  // `if (r && r.error) alert(r.error)` did nothing, click "did nothing".
+  if (!r.ok) {
+    if (typeof body === "object" && body && body.error) return body;
+    return {error: `HTTP ${r.status}${typeof body === "string" && body ? ": " + body.substring(0, 200) : ""}`};
+  }
+  return body;
 }
 
 function esc(s) { return (s||"").toString().replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }

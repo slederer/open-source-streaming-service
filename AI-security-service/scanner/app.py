@@ -3445,6 +3445,77 @@ async def findings_for_target(request: Request, target_host: str):
         }
 
 
+@app.get("/api/targets/{target_host}/history")
+async def target_history(request: Request, target_host: str):
+    """All scan runs of a target with per-run severity counts AND the diff
+    against the previous run (new / fixed / persistent findings).
+
+    Powers the scan-diff dashboard: lets users see security drift over time
+    rather than treating each scan as standalone."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    with get_db() as db:
+        t = db.execute(
+            "SELECT * FROM targets WHERE host=? AND user_id=?",
+            (target_host, user["user_id"]),
+        ).fetchone()
+        if not t:
+            return JSONResponse({"error": "Target not found"}, status_code=404)
+
+        host_like = f'%"{target_host}"%'
+        # All COMPLETED runs for this target, oldest → newest so diffs make sense
+        runs = db.execute(
+            """SELECT id, started_at, finished_at, status, summary_json, scan_type
+               FROM scan_runs
+               WHERE user_id=? AND status='completed'
+                 AND (target=? OR targets LIKE ?)
+               ORDER BY started_at DESC LIMIT 30""",
+            (user["user_id"], target_host, host_like),
+        ).fetchall()
+        runs = [dict(r) for r in runs]
+
+        # For each run, also collect the canonical (severity, title) set so the
+        # client can compute diffs against the previous run without N round-trips.
+        for r in runs:
+            r["summary"] = json.loads(r["summary_json"]) if r["summary_json"] else {}
+            f = db.execute(
+                "SELECT severity, title, category FROM findings "
+                "WHERE run_id=? AND target=?",
+                (r["id"], target_host),
+            ).fetchall()
+            r["findings_set"] = [
+                {"severity": x["severity"], "title": x["title"], "category": x["category"]}
+                for x in f
+            ]
+            r["summary_json"] = None  # don't double-ship
+
+        # Pre-compute new / fixed / persistent against the immediately newer run
+        # (since runs are DESC ordered, runs[i+1] is older than runs[i]).
+        for i, current in enumerate(runs):
+            prev = runs[i + 1] if i + 1 < len(runs) else None
+            if not prev:
+                current["diff"] = {"new": [], "fixed": [], "persistent": []}
+                continue
+            cur_set = {(f["severity"], f["title"]) for f in current["findings_set"]}
+            prev_set = {(f["severity"], f["title"]) for f in prev["findings_set"]}
+            new = sorted(cur_set - prev_set)
+            fixed = sorted(prev_set - cur_set)
+            persistent = sorted(cur_set & prev_set)
+            current["diff"] = {
+                "new": [{"severity": s, "title": t} for s, t in new],
+                "fixed": [{"severity": s, "title": t} for s, t in fixed],
+                "persistent": [{"severity": s, "title": t} for s, t in persistent],
+                "prev_run_id": prev["id"],
+            }
+
+        return {
+            "target": dict(t),
+            "runs": runs,
+        }
+
+
 @app.get("/api/me")
 async def me(request: Request):
     user = require_auth_any(request)
@@ -5692,6 +5763,7 @@ VIEWS.targets = async () => {
             <td>${esc(t.label || '-')}</td>
             <td>${fmtTime(t.added_at)}</td>
             <td style="text-align:right;">
+              <a class="btn btn-outline btn-sm" href="#target-history/${encodeURIComponent(t.host)}">History</a>
               <button class="btn btn-sm" onclick="scanSingle('${esc(t.host)}','${esc(t.label || '')}')">Scan</button>
               <button class="btn-danger btn-sm" onclick="delTarget(${t.id})">Remove</button>
             </td>
@@ -5712,6 +5784,125 @@ async function delTarget(id) {
   await api(`/api/targets/${id}`, {method:'DELETE'});
   VIEWS.targets();
 }
+
+// ─── Target history (scan diff over time) ──────────────────────────────────
+VIEWS["target-history"] = async (host) => {
+  const root = document.getElementById("view-root");
+  if (!host) { go("targets"); return; }
+  host = decodeURIComponent(host);
+  root.innerHTML = '<div class="empty"><div class="spinner"></div></div>';
+  const d = await api(`/api/targets/${encodeURIComponent(host)}/history`);
+  if (!d || d.error) { root.innerHTML = `<div class="empty"><p>Could not load history</p></div>`; return; }
+
+  const runs = d.runs || [];
+  if (!runs.length) {
+    root.innerHTML = `<div class="page-title"><h1>${esc(host)}</h1><div class="sub">No completed scans yet.</div></div>
+                     <div class="card"><button class="btn" onclick="scanSingle('${esc(host)}','')">Run first scan</button></div>`;
+    return;
+  }
+
+  // Compute max value across all severity bars for proportional sparkline.
+  const maxVal = Math.max(1, ...runs.map(r => (r.summary.critical||0) + (r.summary.high||0) + (r.summary.medium||0)));
+
+  // Sparkline: severity-stacked bars, oldest → newest (so reverse runs which are DESC)
+  const chronological = runs.slice().reverse();
+  const sparkBars = chronological.map(r => {
+    const s = r.summary || {};
+    const c = s.critical||0, h = s.high||0, m = s.medium||0;
+    const total = c + h + m;
+    const pct = total / maxVal;
+    const barH = Math.max(2, pct * 80);
+    return `<div title="${fmtTime(r.started_at)} · C${c} H${h} M${m}" style="display:flex;flex-direction:column-reverse;height:80px;width:18px;cursor:pointer;border-radius:2px;overflow:hidden;background:#0a0f25;" onclick="go('scan-detail','${r.id}')">
+      ${m ? `<div style="background:#fbbf24;height:${(m/total*barH)||0}px;"></div>` : ''}
+      ${h ? `<div style="background:#fb923c;height:${(h/total*barH)||0}px;"></div>` : ''}
+      ${c ? `<div style="background:#dc2626;height:${(c/total*barH)||0}px;"></div>` : ''}
+    </div>`;
+  }).join('');
+
+  // Latest run + diff vs prev
+  const latest = runs[0];
+  const diff = latest.diff || {new:[], fixed:[], persistent:[]};
+  const sevColor = s => ({CRITICAL:'#dc2626',HIGH:'#fb923c',MEDIUM:'#fbbf24',LOW:'#9ca3af',INFO:'#60a5fa'}[s] || '#9ca3af');
+  const sevBadge = (s,t) => `<div style="padding:6px 10px;border-radius:4px;background:#0a0f25;border-left:3px solid ${sevColor(s)};margin-bottom:4px;font-size:0.85rem;"><span class="mono" style="color:${sevColor(s)};font-weight:600;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">${esc(s)}</span> &nbsp;${esc(t)}</div>`;
+
+  root.innerHTML = `
+    <div class="page-title">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <h1 style="margin:0;">&#127760; ${esc(host)}</h1>
+        <a href="${esc(/^https?:\/\//i.test(host) ? host : 'https://' + host)}" target="_blank" rel="noopener noreferrer" style="color:var(--text-muted);" title="Open in new tab">&#8599;</a>
+      </div>
+      <div class="sub">Scan history &amp; security drift across ${runs.length} run${runs.length===1?'':'s'}</div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <h2 style="margin:0 0 12px;">Severity over time</h2>
+      <div style="display:flex;align-items:flex-end;gap:3px;height:88px;padding:4px;">
+        ${sparkBars}
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:0.7rem;color:var(--text-muted);margin-top:6px;">
+        <span>${fmtTime(chronological[0].started_at)}</span>
+        <span>oldest → newest · click any bar for that scan</span>
+        <span>${fmtTime(chronological[chronological.length-1].started_at)}</span>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:18px;font-size:0.78rem;flex-wrap:wrap;">
+        <span><span style="display:inline-block;width:10px;height:10px;background:#dc2626;vertical-align:middle;margin-right:5px;"></span>CRITICAL</span>
+        <span><span style="display:inline-block;width:10px;height:10px;background:#fb923c;vertical-align:middle;margin-right:5px;"></span>HIGH</span>
+        <span><span style="display:inline-block;width:10px;height:10px;background:#fbbf24;vertical-align:middle;margin-right:5px;"></span>MEDIUM</span>
+      </div>
+    </div>
+
+    ${(diff.new.length || diff.fixed.length) ? `
+    <div class="card" style="margin-bottom:20px;">
+      <h2 style="margin:0 0 12px;">Changes since previous scan</h2>
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;">
+        <div>
+          <h3 style="color:#86efac;margin:0 0 8px;font-size:0.95rem;">&#43; New (${diff.new.length})</h3>
+          ${diff.new.length ? diff.new.slice(0,12).map(f => sevBadge(f.severity, f.title)).join('') + (diff.new.length>12?`<div class="sub" style="margin-top:6px;">+${diff.new.length-12} more</div>`:'') : '<div class="sub">None</div>'}
+        </div>
+        <div>
+          <h3 style="color:#fca5a5;margin:0 0 8px;font-size:0.95rem;">&#10003; Fixed (${diff.fixed.length})</h3>
+          ${diff.fixed.length ? diff.fixed.slice(0,12).map(f => sevBadge(f.severity, f.title)).join('') + (diff.fixed.length>12?`<div class="sub" style="margin-top:6px;">+${diff.fixed.length-12} more</div>`:'') : '<div class="sub">None</div>'}
+        </div>
+        <div>
+          <h3 style="color:var(--text-muted);margin:0 0 8px;font-size:0.95rem;">&middot; Persistent (${diff.persistent.length})</h3>
+          ${diff.persistent.length ? `<div class="sub">${diff.persistent.length} finding${diff.persistent.length===1?'':'s'} unchanged across both scans &mdash; <a href="#scan-detail/${latest.id}">view in latest scan</a></div>` : '<div class="sub">None</div>'}
+        </div>
+      </div>
+    </div>` : ''}
+
+    <div class="card" style="padding:0;overflow:hidden;">
+      <div style="padding:16px 20px 8px;"><h2 style="margin:0;">All scans (${runs.length})</h2></div>
+      <table class="table">
+        <thead><tr><th>Run</th><th>Started</th><th>Type</th><th>Status</th><th>CRIT</th><th>HIGH</th><th>MED</th><th>Δ</th><th></th></tr></thead>
+        <tbody>
+          ${runs.map((r,i) => {
+            const s = r.summary || {};
+            const dN = r.diff ? r.diff.new.length : 0;
+            const dF = r.diff ? r.diff.fixed.length : 0;
+            const deltaStr = (i === runs.length - 1) ? '<span class="sub">first scan</span>'
+              : `${dN ? `<span style="color:#86efac;">+${dN}</span>` : ''}${dN&&dF?' / ':''}${dF ? `<span style="color:#fca5a5;">-${dF}</span>` : ''}${!dN&&!dF?'<span class="sub">no change</span>':''}`;
+            return `<tr onclick="go('scan-detail','${r.id}')" style="cursor:pointer;">
+              <td class="mono">#${r.id}</td>
+              <td>${fmtTime(r.started_at)}</td>
+              <td>${esc(r.scan_type || 'full')}</td>
+              <td><span class="status-badge ${r.status}">${r.status}</span></td>
+              <td>${s.critical ? `<span style="color:#dc2626;font-weight:600;">${s.critical}</span>` : '<span class="sub">0</span>'}</td>
+              <td>${s.high ? `<span style="color:#fb923c;font-weight:600;">${s.high}</span>` : '<span class="sub">0</span>'}</td>
+              <td>${s.medium || 0}</td>
+              <td>${deltaStr}</td>
+              <td style="text-align:right;"><span class="sub">&#8250;</span></td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div style="margin-top:16px;display:flex;gap:8px;">
+      <button class="btn" onclick="scanSingle('${esc(host)}','')">Scan again</button>
+      <a class="btn btn-outline" href="#scans">All scans</a>
+    </div>
+  `;
+};
 
 // ─── Findings explorer ───────────────────────────────────────────────────────
 VIEWS.findings = async (targetHost) => {

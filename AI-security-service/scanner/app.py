@@ -1215,6 +1215,160 @@ def scan_target_subdomain_enum(run_id: str, ip: str, name: str):
     return findings
 
 
+def scan_target_openapi(run_id: str, ip: str, name: str):
+    """Parse any public OpenAPI spec and flag the scariest misconfigurations.
+
+    Discovered on maywoodai.com during a real-world scan: a FastAPI app was
+    exposing /openapi.json with `componentsSecuritySchemes` entirely empty —
+    i.e. 63 production endpoints (including destructive ones like
+    /mcp/v1/delete_chat) documented as publicly callable. Our previous
+    scan_target_docs module DID flag the openapi.json as "exposed", but
+    didn't actually READ it. This module does.
+
+    Signals:
+      - `components.securitySchemes` empty AND no per-operation `security`
+        requirements → CRITICAL: whole API is unauthenticated by design
+      - `Access-Control-Allow-Origin: *` on the same host → CSRF-able
+      - Any destructive operation (DELETE / `delete_*`, `remove_*`, `drop_*`,
+        `reset_*`, `wipe_*`) in the spec gets its own finding
+      - API advertises internal-looking paths (/admin, /internal, /debug)
+        even if auth is set → INFO for recon
+    """
+    findings = []
+    candidate_paths = ["/openapi.json", "/api/openapi.json", "/v1/openapi.json",
+                       "/swagger.json", "/api-docs/swagger.json",
+                       "/api/v1/openapi.json"]
+    for base in (f"https://{ip}", f"http://{ip}"):
+        for path in candidate_paths:
+            url = base + path
+            body = run_cmd(["curl", "-sk", "-m", "8", "--max-filesize", "2000000", url],
+                           timeout=10)
+            if not body or len(body) < 40:
+                continue
+            try:
+                spec = json.loads(body)
+            except Exception:
+                continue
+            # It parses as JSON — is it an OpenAPI/Swagger doc?
+            if not isinstance(spec, dict):
+                continue
+            if not (spec.get("openapi") or spec.get("swagger")):
+                continue
+
+            title = ((spec.get("info") or {}).get("title") or "").strip()
+            components = spec.get("components") or {}
+            security_schemes = components.get("securitySchemes") or {}
+            global_security = spec.get("security") or []
+            paths = spec.get("paths") or {}
+
+            # Check every operation for a per-operation security requirement.
+            op_count = 0
+            ops_without_security = 0
+            destructive_ops = []
+            internal_paths = []
+            for p, methods in (paths or {}).items():
+                if not isinstance(methods, dict):
+                    continue
+                for m, meta in methods.items():
+                    if m in ("parameters", "summary", "description", "servers"):
+                        continue
+                    if not isinstance(meta, dict):
+                        continue
+                    op_count += 1
+                    op_sec = meta.get("security")
+                    if not op_sec and not global_security:
+                        ops_without_security += 1
+                    low = (p + " " + m).lower()
+                    if (m.lower() == "delete" or
+                            any(w in p.lower() for w in
+                                ("delete_", "remove_", "drop_", "reset_",
+                                 "wipe_", "purge_", "destroy_"))):
+                        destructive_ops.append(f"{m.upper()} {p}")
+                    if any(h in p.lower() for h in
+                           ("/admin", "/internal", "/debug", "/dev_", "/private")):
+                        internal_paths.append(f"{m.upper()} {p}")
+
+            # Core finding: whole-API auth missing.
+            if not security_schemes and not global_security and op_count > 0:
+                findings.append({
+                    "target": ip, "severity": "CRITICAL", "category": "api",
+                    "title": f"Public API has no authentication defined ({op_count} endpoints)",
+                    "description": (
+                        f"OpenAPI spec at {url} lists {op_count} operations but "
+                        "components.securitySchemes is empty AND no top-level security "
+                        "requirement is declared. Any client can call every endpoint. "
+                        "If the underlying application trusts the OpenAPI spec (FastAPI "
+                        "and most modern frameworks do), this exposes the entire API."
+                    ),
+                    "evidence": (
+                        f"GET {url} → 200 · title={title!r} "
+                        f"· securitySchemes=EMPTY · global security=EMPTY "
+                        f"· ops_without_security={ops_without_security}/{op_count}"
+                    ),
+                    "tool": "openapi-audit",
+                })
+            elif ops_without_security > 0 and op_count > 0 and ops_without_security / op_count > 0.5:
+                # Mixed: some endpoints authenticated, most not. Still serious.
+                findings.append({
+                    "target": ip, "severity": "HIGH", "category": "api",
+                    "title": f"OpenAPI: {ops_without_security}/{op_count} endpoints have no security requirement",
+                    "description": (
+                        "Majority of documented endpoints have no per-operation "
+                        "security requirement and no global security default. "
+                        "Verify each unauthenticated endpoint is safe to expose."
+                    ),
+                    "evidence": f"GET {url} → 200 · title={title!r}",
+                    "tool": "openapi-audit",
+                })
+
+            # Destructive operations worth a separate finding so they aren't lost.
+            if destructive_ops and (not security_schemes and not global_security):
+                findings.append({
+                    "target": ip, "severity": "HIGH", "category": "api",
+                    "title": f"Destructive operations documented in public OpenAPI ({len(destructive_ops)})",
+                    "description": (
+                        "Destructive endpoints (delete/remove/drop/reset/wipe) are "
+                        "documented in an OpenAPI spec that declares no auth. Any "
+                        "attacker with a guessed resource ID can destroy data."
+                    ),
+                    "evidence": "\n".join("- " + op for op in destructive_ops[:10]),
+                    "tool": "openapi-audit",
+                })
+
+            if internal_paths:
+                findings.append({
+                    "target": ip, "severity": "LOW", "category": "recon",
+                    "title": f"OpenAPI lists internal-looking paths ({len(internal_paths)})",
+                    "description": "Spec advertises /admin, /internal, /debug style paths.",
+                    "evidence": "\n".join("- " + op for op in internal_paths[:8]),
+                    "tool": "openapi-audit",
+                })
+
+            # Probe the wide-open-CORS bit on the root of the API — combined with
+            # missing auth, CORS=* turns this into a drive-by-CSRF vuln.
+            cors = run_cmd(["curl", "-skI", "-m", "5",
+                            "-H", "Origin: https://evil.example", base + "/"],
+                           timeout=7)
+            if re.search(r"(?i)access-control-allow-origin:\s*\*", cors or ""):
+                if not security_schemes and not global_security:
+                    findings.append({
+                        "target": ip, "severity": "HIGH", "category": "api",
+                        "title": "Unauthenticated API + wide-open CORS (browser CSRF surface)",
+                        "description": (
+                            "API declares no auth AND returns "
+                            "`Access-Control-Allow-Origin: *` on the same host. "
+                            "Any third-party website can read/write this API from "
+                            "victim browsers with no pre-flight resistance."
+                        ),
+                        "evidence": f"{url} + Access-Control-Allow-Origin: *",
+                        "tool": "openapi-audit",
+                    })
+
+            # Return on first successful spec — don't duplicate findings.
+            return findings
+    return findings
+
+
 def scan_target_llm(run_id: str, ip: str, name: str):
     """Test AI/LLM endpoints for OWASP LLM Top 10 issues."""
     findings = []
@@ -1588,6 +1742,7 @@ SCAN_MODULES = [
     ("tls",             "TLS/SSL configuration & cert",     "scan_target_tls"),
     ("crawl",           "Web crawl · sitemap · JS bundles", "scan_target_crawl"),
     ("docs",            "Exposed endpoints (/docs, /.env)", "scan_target_docs"),
+    ("openapi",         "OpenAPI spec auth audit",          "scan_target_openapi"),
     ("ratelimit",       "Rate limiting probes",             "scan_target_ratelimit"),
     ("nuclei",          "Nuclei vulnerability templates",   "scan_target_nuclei"),
     ("secrets",         "Client bundle secret scan",        "scan_target_secrets"),

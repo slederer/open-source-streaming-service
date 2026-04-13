@@ -1959,6 +1959,20 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
     if user_id:
         consume_scan_credit(user_id)
 
+    # Email notifications hook (best-effort, never blocks). Sends:
+    #   - first-scan welcome on the user's first completed scan
+    #   - immediate alert email if any CRITICAL/HIGH findings landed
+    # Daily digest is handled separately by daily_digest.py cron.
+    if user_id:
+        try:
+            try:
+                from scanner.notifications import notify_scan_complete
+            except ImportError:
+                from scanner_notifications import notify_scan_complete  # type: ignore
+            notify_scan_complete(run_id, user_id)
+        except Exception as _e:
+            print(f"[scan] notify hook failed for run={run_id}: {_e}", flush=True)
+
 
 # ── Remediation Helpers ──────────────────────────────────────────────────────
 
@@ -3589,6 +3603,34 @@ async def me(request: Request):
     return full
 
 
+@app.get("/api/me/preferences")
+async def get_preferences(request: Request):
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    full = get_user_by_id(user["user_id"]) or {}
+    return {
+        "email_notifications": bool(full.get("email_notifications", 1)),
+        "email": full.get("email"),
+    }
+
+
+@app.post("/api/me/preferences")
+async def set_preferences(request: Request):
+    """Toggle email notification preferences. Body: {"email_notifications": bool}."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    val = 1 if body.get("email_notifications") else 0
+    with get_db() as db:
+        db.execute(
+            "UPDATE users SET email_notifications=? WHERE id=?",
+            (val, user["user_id"]),
+        )
+    return {"ok": True, "email_notifications": bool(val)}
+
+
 # ── API Routes ────────────────────────────────────────────────────────────────
 
 STALE_SCAN_THRESHOLD_MIN = int(os.getenv("STALE_SCAN_THRESHOLD_MIN", "30"))
@@ -3638,6 +3680,14 @@ def startup():
         init_admin_db()
     except Exception as e:
         print(f"[startup] admin init failed: {e}")
+    try:
+        try:
+            from scanner.notifications import ensure_email_notifications_column
+        except ImportError:
+            from scanner_notifications import ensure_email_notifications_column  # type: ignore
+        ensure_email_notifications_column()
+    except Exception as e:
+        print(f"[startup] notifications schema migration failed: {e}")
     cleanup_stale_scans()
     t = threading.Thread(target=_periodic_cleanup_loop, daemon=True)
     t.start()

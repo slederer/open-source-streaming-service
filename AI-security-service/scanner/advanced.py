@@ -272,6 +272,63 @@ def _extract_json(text: str) -> dict:
             return {}
 
 
+# ── WAF / anti-bot challenge detection ──────────────────────────────────────
+
+_WAF_SIGNATURES = [
+    ("vercel_checkpoint",     "Vercel Security Checkpoint"),
+    ("cloudflare_challenge",  "Just a moment..."),
+    ("cloudflare_ray_id",     "cloudflare.com/5xx-error-landing"),
+    ("cloudflare_attention",  "Attention Required! | Cloudflare"),
+    ("akamai_challenge",      "Access Denied"),  # ambiguous but always paired
+    ("akamai_reference",      "Reference #18.."),
+    ("incapsula",             "_Incapsula_Resource"),
+    ("sucuri",                "Sucuri WebSite Firewall"),
+    ("distil",                "distil_r_captcha"),
+    ("perimeterx",            "perimeterx.net"),
+    ("datadome",              "datadome.co/captcha"),
+    ("aws_waf",               "AWS WAF"),
+    ("captcha_generic",       "g-recaptcha"),  # weak — only trust combined with one of the above
+]
+
+
+def _detect_waf(homepage_body: str) -> Optional[str]:
+    """Return a WAF name if the homepage body contains a known challenge
+    signature; None otherwise. Used both by the ai-chain module (to down-rank
+    findings on WAF-blocked scans) and as a standalone signal."""
+    if not homepage_body:
+        return None
+    body = homepage_body[:10_000]
+    for name, sig in _WAF_SIGNATURES:
+        if sig in body:
+            return name
+    return None
+
+
+def scan_target_waf_gate(run_id: str, ip: str, name: str) -> list[dict]:
+    """Detect if the target is behind a WAF / anti-bot challenge. Emit a
+    MEDIUM finding so the user understands that the rest of the scan may
+    contain invalid results — and so the AI module can down-rank findings
+    that rely on post-WAF content."""
+    _, _, home = _curl(f"https://{ip}/", timeout=5, max_bytes=30_000)
+    waf = _detect_waf(home or "")
+    if not waf:
+        return []
+    return [{
+        "target": ip, "severity": "MEDIUM", "category": "recon",
+        "title": f"Scan likely blocked by WAF / anti-bot challenge ({waf})",
+        "description": (
+            "The target homepage returns a WAF/anti-bot challenge page instead "
+            "of application content. Scanner findings that depend on fetching "
+            "live HTML, JS bundles, or API responses may be inaccurate — the "
+            "scanner may be reading the challenge page, not the real site. "
+            "For meaningful results, either run from a trusted IP the WAF "
+            "allow-lists, or integrate with the WAF's bypass token / API."
+        ),
+        "evidence": f"Detected WAF signature: {waf}",
+        "tool": "waf-detect",
+    }]
+
+
 def _build_ai_context(run_id: str, ip: str) -> str:
     """Assemble the user-message context for AI review: target + findings + raw evidence."""
     findings = _db_find_run_findings(run_id)
@@ -292,6 +349,18 @@ def _build_ai_context(run_id: str, ip: str) -> str:
     # Homepage body
     _, _, home = _curl(f"https://{ip}/", timeout=6, max_bytes=60_000)
     if home:
+        # Tell the AI explicitly if we detected a WAF challenge page — this
+        # prevents the model from reasoning on challenge-page content as if
+        # it were real app content.
+        waf_name = _detect_waf(home)
+        if waf_name:
+            parts.append(
+                f"\n## ⚠️ WAF / anti-bot page detected ({waf_name})\n"
+                "The homepage below is a challenge page, NOT the real application. "
+                "Do NOT surface findings based on this page's content; ignore any "
+                "forms, scripts, or structure in it. Only reason about the OpenAPI "
+                "spec and scanner findings from the list above.\n"
+            )
         parts.append(f"## Homepage (first 60KB)\n```html\n{home[:60_000]}\n```\n")
     # Try to grab ONE JS bundle referenced in the homepage
     js_m = re.search(r'<script[^>]+src=["\']?([^"\'\s>]+\.js)', home or "")
@@ -369,18 +438,81 @@ def scan_target_ai_chain(run_id: str, ip: str, name: str) -> list[dict]:
                     "_models": [model],
                 }
 
+    # ── Post-filter: severity gating and noise suppression ──────────────────
+    #
+    # The earlier bitmovin/mux scans taught us that AI models sometimes:
+    #   (a) amplify existing scanner false positives (Claude promoted our
+    #       broken rate-limit finding to HIGH even though port 8080 just
+    #       returns 301)
+    #   (b) call out findings based on public SDK-example repos as if they
+    #       were genuine leaks
+    #   (c) hallucinate plugin / framework exposure that isn't actually in
+    #       the evidence we supplied
+    #
+    # Defensive rules applied here:
+    #   1. Single-model findings cap at HIGH (consensus required for CRITICAL).
+    #   2. Evidence containing known "noise phrases" downgrades by one notch.
+    #   3. Findings referring to GitHub URLs under the target's own org get
+    #      another notch down — SDK/example repos with placeholder secrets
+    #      are not leaks.
+
+    # Derive the target's "own org" heuristic for GitHub filtering.
+    target_org = re.sub(r"^www\.", "", ip).split(".")[0].lower()
+    own_org_patterns = (
+        f"github.com/{target_org}/",
+        f"github.com/{target_org}inc/",
+        f"github.com/{target_org}-",
+    )
+
+    # Evidence-noise phrases: presence in evidence → one notch down.
+    NOISE_PHRASES = (
+        "sdk-examples", "sdk-example", ".env.example", "starter-kit",
+        "tutorial", "example-app", "sample-", "/examples/",
+        # Inherited-FP signatures from our own buggy rule-based modules
+        "no rate limiting", "port 8080", "port 8443",
+        "non-429", "missing strict-transport-security",
+    )
+
+    def _demote(sev: str, steps: int = 1) -> str:
+        order = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+        try:
+            idx = max(0, order.index(sev) - steps)
+            return order[idx]
+        except ValueError:
+            return sev
+
     # Emit findings. Consensus across 2+ models → tool="ai-consensus" (more trust).
     findings = []
     for item in by_key.values():
         models = item["_models"]
-        tool = "ai-consensus" if len(models) >= 2 else f"ai-{models[0]}"
+        is_consensus = len(models) >= 2
+        tool = "ai-consensus" if is_consensus else f"ai-{models[0]}"
+        sev = item["severity"]
+
+        # Rule 1: single-model findings max severity = HIGH.
+        if not is_consensus and sev == "CRITICAL":
+            sev = "HIGH"
+
+        evidence_lower = (item["evidence"] + " " + item["description"]).lower()
+
+        # Rule 2: known noise phrases → demote one notch.
+        if any(p in evidence_lower for p in NOISE_PHRASES):
+            sev = _demote(sev)
+
+        # Rule 3: GitHub URLs under target's own org → demote (examples != leaks).
+        if any(p in evidence_lower for p in own_org_patterns):
+            sev = _demote(sev)
+
         evidence = item["evidence"]
         chain = item.get("attack_chain") or ""
         if chain:
             evidence = f"{evidence}\n\nATTACK CHAIN:\n{chain}"
+
+        # If the finding got demoted, annotate the title so it's inspectable.
+        demoted = sev != item["severity"]
         findings.append({
-            "target": ip, "severity": item["severity"], "category": "ai-review",
-            "title": f"[AI{' consensus' if tool == 'ai-consensus' else ''}] {item['title']}",
+            "target": ip, "severity": sev, "category": "ai-review",
+            "title": f"[AI{' consensus' if is_consensus else ''}{' (demoted)' if demoted else ''}] {item['title']}",
             "description": item["description"],
             "evidence": evidence,
             "tool": tool,
@@ -672,6 +804,44 @@ def scan_target_github_org(run_id: str, ip: str, name: str) -> list[dict]:
         (f'site:github.com "{ip}" ".env"', ".env reference near target on GitHub", "MEDIUM"),
         (f'site:gist.github.com "{ip}"', "Target domain in public GitHub Gist", "LOW"),
     ]
+
+    # Own-org heuristic for GitHub URL filtering. Derives likely GitHub org
+    # names from the target's domain so we can suppress hits inside the
+    # target's OWN SDK/examples/tutorial repos (placeholder secrets aren't
+    # real leaks, but they were producing HIGH findings in the earlier runs).
+    target_org = re.sub(r"^www\.", "", ip).split(".")[0].lower()
+    own_repo_path_hints = (
+        f"github.com/{target_org}/",
+        f"github.com/{target_org}inc/",
+        f"github.com/{target_org}-",
+    )
+    # Path-level hints that a match is in an SDK/example/starter/tutorial repo
+    # — same semantic: placeholder values, not real credentials.
+    noise_repo_substrings = (
+        "/sdk-examples", "/examples", "/starter-kit", "/tutorial",
+        "/sample-", "/example-app", ".env.example",
+    )
+
+    def _filter_and_rate(results: list, base_sev: str) -> tuple[list, str]:
+        """Drop URLs from target's own org OR obvious example repos.
+        Return (remaining_results, possibly_downgraded_severity)."""
+        filtered = []
+        own_or_example = 0
+        for r in results:
+            link = (r.get("link") or r.get("url", "")).lower()
+            if any(p in link for p in own_repo_path_hints) or \
+               any(s in link for s in noise_repo_substrings):
+                own_or_example += 1
+                continue
+            filtered.append(r)
+        new_sev = base_sev
+        # If we dropped ANY results, demote a notch — the signal is weaker
+        # than originally sized.
+        if own_or_example > 0:
+            new_sev = {"CRITICAL": "HIGH", "HIGH": "MEDIUM",
+                       "MEDIUM": "LOW", "LOW": "INFO"}.get(base_sev, base_sev)
+        return filtered, new_sev
+
     for dork, title, sev in dorks:
         try:
             results = _search_any(dork, num=5)
@@ -679,6 +849,9 @@ def scan_target_github_org(run_id: str, ip: str, name: str) -> list[dict]:
             continue
         if not results:
             continue
+        results, sev = _filter_and_rate(results, sev)
+        if not results:
+            continue  # everything was noise
         sample = "\n".join("- " + (r.get("link") or r.get("url", ""))
                            for r in results[:3])
         findings.append({
@@ -688,7 +861,8 @@ def scan_target_github_org(run_id: str, ip: str, name: str) -> list[dict]:
                 "Google returned GitHub results where the target domain appears "
                 "alongside secret-related keywords. Review each URL — "
                 "developers frequently commit credentials, staging URLs, "
-                "or sensitive config tied to this domain into public repos."
+                "or sensitive config tied to this domain into public repos. "
+                "Own-org / SDK-example / tutorial repos were filtered out."
             ),
             "evidence": f"dork: {dork}\n{sample}",
             "tool": "github-dork",

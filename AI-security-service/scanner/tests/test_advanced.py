@@ -44,6 +44,8 @@ class TestAiChain:
     }
 
     def test_emits_findings_from_single_model(self, monkeypatch):
+        """Single-model CRITICAL is now demoted to HIGH by the consensus gate
+        (need 2+ models agreeing for CRITICAL)."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
@@ -53,9 +55,11 @@ class TestAiChain:
                    return_value=json.dumps(self.SHARED_FINDINGS)):
             findings = scan_target_ai_chain("r1", "x.com", "t")
         assert findings
-        assert findings[0]["severity"] == "CRITICAL"
+        # Single-model CRITICAL → demoted to HIGH
+        assert findings[0]["severity"] == "HIGH"
         assert findings[0]["tool"] == "ai-claude"
         assert "IDOR" in findings[0]["title"]
+        assert "demoted" in findings[0]["title"].lower()
 
     def test_consensus_tag_when_two_models_agree(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
@@ -179,14 +183,15 @@ class TestJsCve:
 # ── Module 5: GitHub org dorking ───────────────────────────────────────────
 
 class TestGithubOrg:
-    def test_flags_gh_password_hits(self, monkeypatch):
+    def test_flags_gh_password_hits_from_third_party_repos(self, monkeypatch):
+        """Use third-party repo URLs to sidestep the own-org filter."""
         monkeypatch.setenv("SERPER_API_KEY", "dummy")
 
         def fake_search(q, num=10):
             if "password" in q:
                 return [
-                    {"link": "https://github.com/acme/api/blob/main/.env"},
-                    {"link": "https://github.com/acme/deploy/blob/main/config.yml"},
+                    {"link": "https://github.com/unrelated-dev/api/blob/main/.env"},
+                    {"link": "https://github.com/community/deploy/blob/main/config.yml"},
                 ]
             return []
 
@@ -303,6 +308,150 @@ class TestAuthenticatedScan:
 
 
 # ── Module 12: Nuclei CVE ──────────────────────────────────────────────────
+
+class TestWafGate:
+    """Fix 2 — WAF / anti-bot challenge page detection."""
+
+    def test_detects_vercel_checkpoint(self):
+        from scanner.advanced import scan_target_waf_gate
+        vercel_body = (
+            '<html><head><title>Loading...</title></head><body>'
+            'Vercel Security Checkpoint'
+            '<script>/* obfuscated challenge */</script></body></html>'
+        )
+        with patch("scanner.advanced._curl", return_value=("200", "text/html", vercel_body)):
+            findings = scan_target_waf_gate("r1", "www.mux.com", "t")
+        assert findings
+        assert findings[0]["severity"] == "MEDIUM"
+        assert "vercel" in findings[0]["evidence"].lower()
+
+    def test_no_waf_no_finding(self):
+        from scanner.advanced import scan_target_waf_gate
+        clean_body = "<html><body><h1>Our company</h1><p>We do X</p></body></html>"
+        with patch("scanner.advanced._curl", return_value=("200", "text/html", clean_body)):
+            findings = scan_target_waf_gate("r1", "normal-site.com", "t")
+        assert findings == []
+
+    def test_detects_cloudflare_attention_page(self):
+        from scanner.advanced import scan_target_waf_gate
+        cf_body = '<html><title>Attention Required! | Cloudflare</title></html>'
+        with patch("scanner.advanced._curl", return_value=("403", "text/html", cf_body)):
+            findings = scan_target_waf_gate("r1", "x.com", "t")
+        assert findings
+
+
+class TestGithubDorkOwnOrgFilter:
+    """Fix 3 — filter target's own-org SDK/example repos out of GitHub dorks."""
+
+    def test_own_org_sdk_example_filtered(self, monkeypatch):
+        """bitmovin.com + github.com/bitmovin/bitmovin-api-sdk-examples should
+        be dropped — that's the target's own SDK examples repo, not a leak."""
+        from scanner.advanced import scan_target_github_org
+        monkeypatch.setenv("SERPER_API_KEY", "dummy")
+
+        def fake_search(q, num=10):
+            if "password" in q:
+                return [
+                    {"link": "https://github.com/bitmovin/bitmovin-api-sdk-examples/blob/main/x.py"},
+                    {"link": "https://github.com/bitmovin/bitmovin-api-sdk-python"},
+                ]
+            return []
+        with patch("scanner.crawl._search_any", side_effect=fake_search):
+            findings = scan_target_github_org("r1", "bitmovin.com", "t")
+        # All hits were target's own SDK repos → no finding should be emitted.
+        assert not any("password" in f["title"].lower() for f in findings), \
+            f"own-org SDK repos must be filtered; got: {[f['title'] for f in findings]}"
+
+    def test_third_party_hit_demoted_when_mixed_with_own_org(self, monkeypatch):
+        """Mixing own-org + third-party results demotes severity one notch."""
+        from scanner.advanced import scan_target_github_org
+        monkeypatch.setenv("SERPER_API_KEY", "dummy")
+
+        def fake_search(q, num=10):
+            if "password" in q:
+                return [
+                    {"link": "https://github.com/bitmovin/bitmovin-sdk-examples/x.py"},  # own
+                    {"link": "https://github.com/random-dev/myconfig/blob/main/.env"},  # 3rd party
+                ]
+            return []
+        with patch("scanner.crawl._search_any", side_effect=fake_search):
+            findings = scan_target_github_org("r1", "bitmovin.com", "t")
+        hits = [f for f in findings if "password" in f["title"].lower()]
+        assert hits
+        # Base severity was HIGH; one own-org result filtered → demoted to MEDIUM
+        assert hits[0]["severity"] == "MEDIUM", f"got {hits[0]['severity']}"
+
+    def test_pure_third_party_hit_keeps_severity(self, monkeypatch):
+        from scanner.advanced import scan_target_github_org
+        monkeypatch.setenv("SERPER_API_KEY", "dummy")
+
+        def fake_search(q, num=10):
+            if "DATABASE_URL" in q:
+                return [{"link": "https://github.com/random/repo/blob/main/.env"}]
+            return []
+        with patch("scanner.crawl._search_any", side_effect=fake_search):
+            findings = scan_target_github_org("r1", "bitmovin.com", "t")
+        hits = [f for f in findings if "Database URL" in f["title"]]
+        assert hits
+        assert hits[0]["severity"] == "HIGH"
+
+
+class TestAiConsensusGating:
+    """Fix 4 — single-model CRITICAL demoted to HIGH; noise phrases demote further."""
+
+    def _run_with_ais(self, monkeypatch, claude_findings=None, openai_findings=None,
+                       gemini_findings=None):
+        for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+            monkeypatch.setenv(k, "dummy")
+        from scanner.advanced import scan_target_ai_chain
+        with patch("scanner.advanced._db_find_run_findings", return_value=[]), \
+             patch("scanner.advanced._curl", return_value=("200", "text/html", "<html>x</html>")), \
+             patch("scanner.advanced._ai_call_claude",
+                   return_value=json.dumps({"findings": claude_findings or []})), \
+             patch("scanner.advanced._ai_call_openai",
+                   return_value=json.dumps({"findings": openai_findings or []})), \
+             patch("scanner.advanced._ai_call_gemini",
+                   return_value=json.dumps({"findings": gemini_findings or []})):
+            return scan_target_ai_chain("r1", "target.com", "t")
+
+    def test_single_model_critical_demoted_to_high(self, monkeypatch):
+        findings = self._run_with_ais(monkeypatch, claude_findings=[
+            {"severity": "CRITICAL", "title": "Serious thing", "evidence": "legit"},
+        ])
+        assert findings
+        assert findings[0]["severity"] == "HIGH", f"got {findings[0]['severity']}"
+        assert "demoted" in findings[0]["title"].lower()
+
+    def test_consensus_keeps_critical(self, monkeypatch):
+        same_finding = {"severity": "CRITICAL", "title": "Shared bug", "evidence": "ok"}
+        findings = self._run_with_ais(monkeypatch,
+                                       claude_findings=[same_finding],
+                                       openai_findings=[same_finding])
+        consensus = [f for f in findings if f["tool"] == "ai-consensus"]
+        assert consensus
+        assert consensus[0]["severity"] == "CRITICAL"
+
+    def test_noise_phrase_demotes_single_model_finding(self, monkeypatch):
+        """Evidence containing 'no rate limiting' (known-FP signature from our
+        broken rate-limit module) demotes one notch."""
+        findings = self._run_with_ais(monkeypatch, claude_findings=[
+            {"severity": "HIGH", "title": "Unprotected port",
+             "evidence": "Scanner found no rate limiting on port 8080"},
+        ])
+        assert findings[0]["severity"] == "MEDIUM", \
+            f"noise-phrase demotion failed: {findings[0]}"
+
+    def test_own_org_github_url_demotes(self, monkeypatch):
+        """Evidence that cites a github.com/target/ URL AND contains the
+        'sdk-examples' noise phrase gets two demotions: noise → MEDIUM,
+        own-org → LOW."""
+        findings = self._run_with_ais(monkeypatch, claude_findings=[
+            {"severity": "HIGH", "title": "Leaked SDK",
+             "evidence": "https://github.com/target/target-sdk-examples/file.py"},
+        ])
+        # HIGH → MEDIUM (noise phrase 'sdk-examples') → LOW (own-org github.com/target/).
+        assert findings[0]["severity"] == "LOW"
+
 
 class TestNucleiCve:
     def test_parses_jsonl_output(self):

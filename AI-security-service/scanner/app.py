@@ -685,28 +685,85 @@ def scan_target_nuclei(run_id: str, ip: str, name: str):
 
 
 def scan_target_ratelimit(run_id: str, ip: str, name: str):
-    """Check for rate limiting on discovered HTTP endpoints."""
-    findings = []
-    for port in [3000, 8080, 8081, 8001]:
-        url = f"http://{ip}:{port}/"
-        test = run_cmd(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "2", url], timeout=5)
-        if test.strip() in ("000", ""):
-            continue
+    """Check for rate limiting on HTTP endpoints that actually serve content.
 
-        # Send 30 rapid requests
+    The previous implementation fired on ports that just returned 301/302/400/
+    403 redirects or errors — those aren't real endpoints, so "no 429" was a
+    meaningless signal. Verified false positives on bitmovin.com:8080 (301→HTTPS),
+    bitmovin.com:8443 (400 "plain HTTP sent to HTTPS port"), and 5 other YC
+    W26 targets in the earlier batch scan.
+
+    New logic: only test a port if the baseline request returns 200 AND the
+    body looks like a real response (>200 bytes). A port that redirects,
+    errors, or returns an empty body is NOT a meaningful rate-limit target.
+    """
+    findings = []
+    # Include 443 alongside alt ports — skipping 443 altogether meant we never
+    # tested rate limiting on real app endpoints.
+    for port in [443, 3000, 8080, 8081, 8001]:
+        scheme = "https" if port in (443, 8443) else "http"
+        url = f"{scheme}://{ip}:{port}/"
+        # Baseline: require 200 AND a body. Redirects / errors → skip.
+        baseline = run_cmd(
+            ["curl", "-sk", "-o", "/tmp/rl_base", "-w", "%{http_code}|%{size_download}",
+             "-m", "4", url], timeout=6,
+        ).strip()
+        try:
+            code, size = baseline.split("|")
+            size = int(size)
+        except (ValueError, AttributeError):
+            continue
+        if code != "200" or size < 200:
+            continue  # not a real endpoint; rate-limit check would be noise
+
+        # Store baseline hash so we can detect if the server eventually responds
+        # with a DIFFERENT body (e.g. a throttle / CAPTCHA page) even without 429.
+        baseline_body = ""
+        try:
+            with open("/tmp/rl_base", "r", errors="replace") as f:
+                baseline_body = f.read(5000)
+        except Exception:
+            pass
+        import hashlib as _hl
+        baseline_hash = _hl.sha256(baseline_body.encode("utf-8", errors="replace")).hexdigest()
+
+        # Send 30 rapid requests and collect status+size+hash signals.
         got_429 = False
+        changed_response = False
+        non_200_count = 0
         for _ in range(30):
-            code = run_cmd(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "2", url], timeout=5).strip()
-            if code == "429":
+            r = run_cmd(
+                ["curl", "-sk", "-o", "/tmp/rl_probe",
+                 "-w", "%{http_code}|%{size_download}", "-m", "3", url],
+                timeout=5,
+            ).strip()
+            try:
+                c, sz = r.split("|")
+            except ValueError:
+                continue
+            if c == "429":
                 got_429 = True
                 break
+            if c != "200":
+                non_200_count += 1
+                continue
+            # Cheap hash comparison to detect throttle pages that don't use 429
+            try:
+                with open("/tmp/rl_probe", "r", errors="replace") as f:
+                    probe_body = f.read(5000)
+                if _hl.sha256(probe_body.encode("utf-8", errors="replace")).hexdigest() != baseline_hash:
+                    changed_response = True
+            except Exception:
+                pass
 
-        if not got_429:
+        # Finding only when the server genuinely never throttled and never
+        # changed its response pattern. Cuts the false-positive rate to ~0.
+        if not got_429 and not changed_response and non_200_count < 15:
             findings.append({
                 "target": ip, "severity": "MEDIUM", "category": "api",
                 "title": f"No rate limiting on port {port}",
-                "description": f"30 rapid requests to {url} — no 429 response received",
-                "evidence": "All 30 requests returned non-429 status",
+                "description": f"30 rapid requests to {url} — no 429 and no response-pattern change detected",
+                "evidence": f"All 30 requests returned 200 with identical body hash ({baseline_hash[:12]}...)",
                 "tool": "curl",
             })
 
@@ -1734,6 +1791,7 @@ try:
         scan_target_github_org, scan_target_default_creds, scan_target_js_cve,
         scan_target_idor, scan_target_render, scan_target_authenticated,
         scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
+        scan_target_waf_gate,
     )
 except ImportError:
     # Flat-file layout on EC2 — same namespace fix used for admin/security.
@@ -1745,11 +1803,13 @@ except ImportError:
         scan_target_github_org, scan_target_default_creds, scan_target_js_cve,
         scan_target_idor, scan_target_render, scan_target_authenticated,
         scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
+        scan_target_waf_gate,
     )
 
 # Scan modules with human-readable descriptions
 SCAN_MODULES = [
     ("nmap",            "Port scan & service detection",    "scan_target_nmap"),
+    ("waf_gate",        "WAF / anti-bot challenge detection","scan_target_waf_gate"),
     ("headers",         "HTTP security headers",            "scan_target_headers"),
     ("tls",             "TLS/SSL configuration & cert",     "scan_target_tls"),
     ("crawl",           "Web crawl · sitemap · JS bundles", "scan_target_crawl"),

@@ -296,11 +296,47 @@ class TestHeadersNoLongerFlagsPublicRoot:
 
 
 class TestRateLimitScanner:
+    """Rate-limit scanner now requires a real 200-with-body endpoint AND
+    identical-body hash across 30 probes. Bare-200 mocks produce "200|0"
+    (empty body) which correctly skips the endpoint."""
+
     @patch("scanner.app.run_cmd")
-    def test_no_rate_limiting(self, mock_cmd):
-        mock_cmd.return_value = "200"
-        findings = scan_target_ratelimit("r1", "10.0.0.1", "test")
+    def test_no_rate_limiting_on_real_endpoint(self, mock_cmd, tmp_path, monkeypatch):
+        """When a real endpoint (200 + body) never returns 429 or changes
+        content, flag it MEDIUM."""
+        body_file = tmp_path / "body.txt"
+        body_file.write_text("x" * 500)
+
+        def side_effect(cmd, timeout=300):
+            # The new implementation writes the body to /tmp/rl_base and
+            # /tmp/rl_probe. To test without hitting the real file system,
+            # we short-circuit: always return a status+size tuple indicating
+            # a real 200 endpoint.
+            cmd_s = " ".join(cmd) if isinstance(cmd, list) else ""
+            if "%{http_code}|%{size_download}" in cmd_s:
+                return "200|500"
+            return "200"
+        mock_cmd.side_effect = side_effect
+
+        # Also patch the body-hash reads to return stable content.
+        with patch("builtins.open", create=True) as _open:
+            _open.return_value.__enter__.return_value.read.return_value = "stable body " * 50
+            findings = scan_target_ratelimit("r1", "10.0.0.1", "test")
         assert any("No rate limiting" in f["title"] for f in findings)
+
+    @patch("scanner.app.run_cmd")
+    def test_redirects_no_longer_trigger(self, mock_cmd):
+        """Ports that only serve 301 redirects (bitmovin.com:8080 bug) must
+        NOT trigger the rate-limit finding any more."""
+        def side_effect(cmd, timeout=300):
+            cmd_s = " ".join(cmd) if isinstance(cmd, list) else ""
+            if "%{http_code}|%{size_download}" in cmd_s:
+                return "301|0"
+            return "301"
+        mock_cmd.side_effect = side_effect
+        findings = scan_target_ratelimit("r1", "10.0.0.1", "test")
+        assert not any("No rate limiting" in f["title"] for f in findings), \
+            "ports returning only redirects must NOT produce rate-limit findings"
 
     @patch("scanner.app.run_cmd")
     def test_has_rate_limiting(self, mock_cmd):
@@ -308,10 +344,12 @@ class TestRateLimitScanner:
         def side_effect(cmd, timeout=300):
             nonlocal call_count
             call_count += 1
-            if call_count > 15:
-                return "429"
-            return "200"
+            cmd_s = " ".join(cmd) if isinstance(cmd, list) else ""
+            if "%{http_code}|%{size_download}" in cmd_s:
+                return "429|100" if call_count > 3 else "200|500"
+            return "429" if call_count > 3 else "200"
         mock_cmd.side_effect = side_effect
-
-        findings = scan_target_ratelimit("r1", "10.0.0.1", "test")
+        with patch("builtins.open", create=True) as _open:
+            _open.return_value.__enter__.return_value.read.return_value = "stable"
+            findings = scan_target_ratelimit("r1", "10.0.0.1", "test")
         assert not any("No rate limiting" in f["title"] for f in findings)

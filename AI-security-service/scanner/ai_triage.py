@@ -303,22 +303,37 @@ def _confirm_reverify(url: str, expected_signal: Optional[str]) -> bool:
     return expected_signal.lower() in body
 
 
+# Only AI-originated findings may be demoted by the triage pass. Deterministic
+# tools (openapi-audit, nuclei, nmap, dig, s3-probe, email-deep, curl) have
+# produced their finding from concrete evidence — the AI's "spec says X but
+# server might Y" doubt is not a valid reason to override them.
+_TRIAGEABLE_TOOLS = {"ai-claude", "ai-openai", "ai-gemini", "ai-chain",
+                     "ai-openapi", "ai-js"}
+
+
 def scan_target_ai_triage(run_id: str, ip: str, name: str) -> list[dict]:
     """Triage every HIGH/CRIT finding produced so far for this run.
 
     Mutates the existing findings (doesn't create new ones): demotes false
     positives, re-tags with [AI-TRIAGED] prefix, preserves the original
     severity in the description for audit. Runs LAST in SCAN_MODULES so it
-    sees everything prior modules emitted."""
+    sees everything prior modules emitted.
+
+    SCOPE: only findings from AI-originated tools are triaged. Deterministic
+    tool output passes through untouched — the triage classifier has been
+    observed over-demoting real CRITICALs (e.g. openapi-audit "63 unauth
+    endpoints" at api.maywoodai.com, 2026-04-14 run c9b34033)."""
     if not os.getenv("ANTHROPIC_API_KEY"):
         return []
 
     try:
         with _get_db() as db:
+            placeholders = ",".join("?" * len(_TRIAGEABLE_TOOLS))
             rows = db.execute(
-                "SELECT id, severity, tool, title, description, evidence "
-                "FROM findings WHERE run_id=? AND severity IN ('CRITICAL','HIGH')",
-                (run_id,),
+                f"SELECT id, severity, tool, title, description, evidence "
+                f"FROM findings WHERE run_id=? AND severity IN ('CRITICAL','HIGH') "
+                f"AND tool IN ({placeholders})",
+                (run_id, *_TRIAGEABLE_TOOLS),
             ).fetchall()
             findings_to_triage = [dict(r) for r in rows]
     except Exception:

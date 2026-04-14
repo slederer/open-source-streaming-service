@@ -122,9 +122,9 @@ class TestAiTriageMutatesFindings:
         from scanner.ai_triage import scan_target_ai_triage
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
         rid = _seed_run(tmp_db, findings=[
-            ("HIGH", "admin subdomain reachable", "subdomain-deep",
+            ("HIGH", "admin subdomain reachable", "ai-claude",
              "admin.x.com → 200", "DNS + port check"),
-            ("CRITICAL", "Exposed database dump", "serper",
+            ("CRITICAL", "Exposed database dump", "ai-openai",
              "found on github.com", "dork hit"),
         ])
 
@@ -184,7 +184,7 @@ class TestAiTriageMutatesFindings:
         from scanner.ai_triage import scan_target_ai_triage
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
         rid = _seed_run(tmp_db, findings=[
-            ("HIGH", "Unauth API at /api/secret", "curl",
+            ("HIGH", "Unauth API at /api/secret", "ai-claude",
              "https://x.com/api/secret → 200",
              "saw 200 from /api/secret"),
         ])
@@ -221,6 +221,57 @@ class TestAiTriageMutatesFindings:
         assert row is not None, "verified finding should still be HIGH"
         assert row[0] == "HIGH"
         assert row[1].startswith("[AI-VERIFIED]")
+
+    def test_deterministic_findings_never_demoted(self, tmp_db, monkeypatch):
+        """Regression for 2026-04-14 maywoodai run c9b34033: the triage pass
+        demoted a real openapi-audit CRITICAL ("63 unauth endpoints") because
+        Sonnet wanted a live probe to confirm. Deterministic findings must
+        never be touched by the triage pass."""
+        from scanner.ai_triage import scan_target_ai_triage
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+        rid = _seed_run(tmp_db, findings=[
+            ("CRITICAL", "Public API has no auth (63 endpoints)",
+             "openapi-audit", "openapi.json shows no security", ""),
+            ("HIGH", "Exposed endpoint: /docs", "curl",
+             "https://x.com/docs → 200", ""),
+            ("HIGH", "CVE-2021-44228 Log4j RCE", "nuclei-cve", "", ""),
+            ("HIGH", "Dangling SPF include defunct.com", "email-deep", "", ""),
+            ("HIGH", "S3 bucket takeover possible", "s3-probe", "", ""),
+        ])
+
+        # If any AI call happens at all, treat as FP — the test verifies that
+        # deterministic findings are FILTERED OUT before we reach the AI.
+        def mock_call_sonnet(system, user, **kw):
+            return {"verdict": "false_positive", "confidence": 1.0,
+                    "reasoning": "should not be reached"}
+
+        with patch("scanner.ai_triage._call_sonnet",
+                   side_effect=mock_call_sonnet) as mock_ai, \
+             patch("scanner.ai_triage._probe", return_value={
+                 "ok": True, "status": "200", "ctype": "text/html",
+                 "size": 1024, "body_prefix": "",
+                 "final_url": "", "body_hash": "", "is_html": True}):
+            scan_target_ai_triage(rid, "x.com", "t")
+
+        # AI must not have been called — nothing in the whitelist was in the
+        # seeded findings.
+        assert mock_ai.call_count == 0, \
+            f"triage AI should not run on deterministic findings; called {mock_ai.call_count}x"
+
+        # All severities preserved
+        conn = sqlite3.connect(str(tmp_db))
+        try:
+            rows = conn.execute(
+                "SELECT severity, title FROM findings WHERE run_id=?", (rid,),
+            ).fetchall()
+        finally:
+            conn.close()
+        sev_by_title = {t: s for s, t in rows}
+        assert sev_by_title["Public API has no auth (63 endpoints)"] == "CRITICAL"
+        assert sev_by_title["Exposed endpoint: /docs"] == "HIGH"
+        assert sev_by_title["CVE-2021-44228 Log4j RCE"] == "HIGH"
+        assert sev_by_title["Dangling SPF include defunct.com"] == "HIGH"
+        assert sev_by_title["S3 bucket takeover possible"] == "HIGH"
 
     def test_no_api_key_no_op(self, tmp_db, monkeypatch):
         from scanner.ai_triage import scan_target_ai_triage

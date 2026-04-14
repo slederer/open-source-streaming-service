@@ -1856,37 +1856,321 @@ def scan_target_auth(run_id: str, ip: str, name: str):
 
 
 def scan_target_s3_cloud(run_id: str, ip: str, name: str):
-    """Cloud misconfig: find S3 buckets, check public access."""
+    """Cloud misconfig: find S3 + GCS buckets, check public LIST access.
+
+    Candidate sources, in priority order:
+      1. Bucket names extracted from HTML + JS bundle (`<foo>.s3.amazonaws.com`,
+         `storage.googleapis.com/<bucket>`, `.storage.bucket(...)` refs)
+      2. Dictionary attack built from the apex domain name
+    """
     findings = []
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         return findings
     domain = ip
+
+    # ── Phase 1: harvest bucket names from the app's own surface ───────────
+    s3_candidates: set[str] = set()
+    gcs_candidates: set[str] = set()
+    corpus = ""
+    for scheme in ("https", "http"):
+        base = f"{scheme}://{domain}"
+        html = run_cmd(["curl", "-sk", "-m", "5", base + "/"], timeout=8)
+        if html and "[TIMEOUT" not in html and "[ERROR" not in html and len(html) > 50:
+            corpus = html
+            # Fetch the first JS bundle for bucket refs hidden inside
+            js_srcs = re.findall(
+                r'<script[^>]+src=["\']([^"\'\s>]+\.js[^"\'\s>]*)', html
+            )
+            for src in js_srcs[:3]:
+                js_url = (src if src.startswith("http")
+                          else base.rstrip("/") + (src if src.startswith("/") else "/" + src))
+                js_url = js_url.split("?", 1)[0]
+                body = run_cmd(
+                    ["curl", "-sk", "-m", "8", "--max-filesize", "5000000", js_url],
+                    timeout=12,
+                )
+                if body and "[TIMEOUT" not in body and "[ERROR" not in body:
+                    corpus += "\n" + body
+            break
+    # S3 bucket refs: <bucket>.s3.amazonaws.com  OR  s3.amazonaws.com/<bucket>
+    for m in re.finditer(
+        r"(?:https?://)?([a-z0-9.\-]{3,63})\.s3[.\-][a-z0-9\-]*\.?amazonaws\.com",
+        corpus, re.IGNORECASE,
+    ):
+        s3_candidates.add(m.group(1).lower().strip("."))
+    for m in re.finditer(
+        r"s3[.\-][a-z0-9\-]*\.amazonaws\.com/([a-z0-9.\-]{3,63})/?",
+        corpus, re.IGNORECASE,
+    ):
+        s3_candidates.add(m.group(1).lower().strip("."))
+    # GCS bucket refs: storage.googleapis.com/<bucket>  OR  <bucket>.storage.googleapis.com
+    for m in re.finditer(
+        r"(?:https?://)?storage\.googleapis\.com/([a-z0-9_.\-]{3,63})/?",
+        corpus, re.IGNORECASE,
+    ):
+        gcs_candidates.add(m.group(1).lower())
+    for m in re.finditer(
+        r"(?:https?://)?([a-z0-9_.\-]{3,63})\.storage\.googleapis\.com",
+        corpus, re.IGNORECASE,
+    ):
+        gcs_candidates.add(m.group(1).lower())
+
+    # ── Phase 2: dictionary attack from apex root name ─────────────────────
+    # Keep discovered (from-the-wild) buckets separate so they get probed
+    # FIRST and aren't crowded out by the dictionary attack at the 25-cap.
+    discovered_s3 = set(s3_candidates)
+    discovered_gcs = set(gcs_candidates)
+    dict_buckets: set[str] = set()
     parts = domain.split(".")
-    candidates = set()
-    # Common bucket name patterns
     if len(parts) >= 2:
-        root = parts[-2]  # e.g. slederer in slederer.com
-        for prefix in ["", "assets-", "static-", "media-", "uploads-", "backup-", "data-"]:
-            for suffix in ["", "-prod", "-production", "-staging", "-dev", "-backup", "-assets", "-static"]:
-                candidates.add(f"{prefix}{root}{suffix}")
-    # Check against S3
-    for bucket in list(candidates)[:20]:
+        root = parts[-2]
+        for prefix in ("", "assets-", "static-", "media-", "uploads-",
+                       "backup-", "data-", "prod-", "dev-", "cdn-"):
+            for suffix in ("", "-prod", "-production", "-staging", "-dev",
+                           "-backup", "-assets", "-static", "-uploads"):
+                cand = f"{prefix}{root}{suffix}"
+                if 3 <= len(cand) <= 63:
+                    dict_buckets.add(cand)
+
+    # Probe discovered buckets first, then fill with dictionary up to cap.
+    s3_probe_list = (
+        sorted(discovered_s3) +
+        [b for b in sorted(dict_buckets) if b not in discovered_s3]
+    )[:25]
+    gcs_probe_list = (
+        sorted(discovered_gcs) +
+        [b for b in sorted(dict_buckets) if b not in discovered_gcs]
+    )[:25]
+
+    # ── Phase 3: probe each candidate (S3) ─────────────────────────────────
+    probed = 0
+    for bucket in s3_probe_list:
         url = f"https://{bucket}.s3.amazonaws.com/"
-        code = run_cmd(["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-m", "3", url], timeout=5).strip()
+        code = run_cmd(
+            ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
+             "-m", "3", url], timeout=5,
+        ).strip()
+        probed += 1
         if code == "200":
-            # Public listing — bad
             body = run_cmd(["curl", "-sk", "-m", "5", url], timeout=8)
             if body and "<ListBucketResult" in body:
+                key_matches = re.findall(r"<Key>([^<]+)</Key>", body)[:5]
                 findings.append({
                     "target": ip, "severity": "HIGH", "category": "cloud",
-                    "title": f"S3 bucket with public listing: {bucket}",
-                    "description": "Bucket allows public LIST. Block public access in S3 settings.",
-                    "evidence": f"GET {url} → 200 with ListBucketResult",
+                    "title": f"S3 bucket with public LIST: {bucket}",
+                    "description": (
+                        "The S3 bucket returns a ListBucketResult to "
+                        "anonymous GET — every object key is enumerable, "
+                        "and any object set to public-read is downloadable. "
+                        "Fix: S3 → Permissions → Block public access → "
+                        "enable all four settings."
+                    ),
+                    "evidence": (
+                        f"GET {url} → 200\n"
+                        f"first keys: {', '.join(key_matches) or '(empty listing)'}"
+                    ),
                     "tool": "s3-probe",
                 })
-        elif code == "403":
-            # Exists but private — just info
-            pass
+
+    # ── Phase 4: probe each candidate (GCS) ────────────────────────────────
+    # GCS LIST endpoint for a bucket:
+    #   https://storage.googleapis.com/storage/v1/b/<bucket>/o?maxResults=5
+    # An open bucket returns a JSON object with an "items" array.
+    for bucket in gcs_probe_list:
+        url = (
+            f"https://storage.googleapis.com/storage/v1/b/{bucket}/o?maxResults=5"
+        )
+        resp = run_cmd(["curl", "-sk", "-m", "5", url], timeout=8)
+        if resp and '"items"' in resp and '"name"' in resp:
+            names = re.findall(r'"name"\s*:\s*"([^"]+)"', resp)[:5]
+            findings.append({
+                "target": ip, "severity": "HIGH", "category": "cloud",
+                "title": f"GCS bucket publicly listable: {bucket}",
+                "description": (
+                    "The Google Cloud Storage bucket allows anonymous LIST. "
+                    "Every object name is enumerable. Fix: in Cloud Console, "
+                    "remove the `allUsers` and `allAuthenticatedUsers` "
+                    "principals from the bucket's IAM policy, or disable "
+                    "public access entirely under Bucket Settings."
+                ),
+                "evidence": f"GET {url} → items: {', '.join(names) or '(empty)'}",
+                "tool": "gcs-probe",
+            })
+    return findings
+
+
+# Minimal GraphQL introspection query — returns the schema's type names.
+_GRAPHQL_INTROSPECTION = (
+    "{__schema{types{name fields{name}}mutationType{fields{name}}}}"
+)
+
+# Type / field names that signal sensitive domain concepts. If introspection
+# works AND one of these appears, it's a more meaningful finding than just
+# "introspection enabled" (which is fine on developer APIs).
+_GRAPHQL_SENSITIVE_TYPES = (
+    "user", "admin", "invoice", "payment", "subscription", "creditcard",
+    "secret", "password", "session", "token", "apikey", "privatekey",
+    "auditlog", "billingaccount",
+)
+_GRAPHQL_DANGEROUS_MUTATIONS = (
+    "deleteuser", "deleteaccount", "deleteorganization", "executesql",
+    "executequery", "runshell", "eval", "impersonate", "assumerole",
+    "grantadmin", "setrole", "resetpassword", "disablemfa",
+)
+
+
+def scan_target_graphql(run_id: str, ip: str, name: str):
+    """Probe common GraphQL endpoints for introspection + dangerous mutations.
+
+    Severity ladder:
+      - Introspection works, schema has no obviously-sensitive types → INFO
+      - Introspection works AND schema contains sensitive types
+        (User, Payment, Invoice, …) → MEDIUM
+      - Introspection works AND schema exposes dangerous mutations
+        (deleteUser, executeSQL, impersonate, …) → HIGH
+      - Introspection works AND schema has a field literally named
+        `password` returnable from a query type → CRITICAL
+    """
+    findings = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    candidates = [
+        "/graphql", "/api/graphql", "/graphql/v1", "/v1/graphql",
+        "/query", "/api/query", "/_graphql", "/graphiql",
+    ]
+
+    # Pull candidate paths from this run's crawler / ai-js findings too
+    try:
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT evidence FROM findings WHERE run_id=? AND tool IN "
+                "('ai-js','crawler','ai-openapi')",
+                (run_id,),
+            ).fetchall()
+        for r in rows:
+            ev = (r["evidence"] or "")[:4000]
+            for m in re.finditer(r"/(?:api/)?graphql[A-Za-z0-9/_\-]*", ev):
+                candidates.append(m.group(0))
+    except Exception:
+        pass
+    candidates = list(dict.fromkeys(candidates))[:10]
+
+    for path in candidates:
+        url = f"https://{ip}{path}"
+        # POST introspection
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "6",
+                 "-H", "content-type: application/json",
+                 "-X", "POST", "-d",
+                 json.dumps({"query": _GRAPHQL_INTROSPECTION}), url],
+                capture_output=True, text=True, timeout=8,
+            )
+            body = (r.stdout or "")[:100000]
+        except Exception:
+            continue
+
+        if not body or len(body) < 30:
+            continue
+        if '"__schema"' not in body and '"types"' not in body:
+            continue
+
+        # Extract type + mutation names
+        type_names = set(m.lower() for m in re.findall(
+            r'"name"\s*:\s*"([A-Za-z][A-Za-z0-9_]+)"', body,
+        ))
+        # Crude: mutations are fields inside mutationType
+        mutation_section = re.search(
+            r'"mutationType"\s*:\s*\{[^}]*"fields"\s*:\s*\[([^\]]+)\]', body,
+        )
+        mutation_names = set()
+        if mutation_section:
+            for m in re.finditer(
+                r'"name"\s*:\s*"([A-Za-z][A-Za-z0-9_]+)"',
+                mutation_section.group(1),
+            ):
+                mutation_names.add(m.group(1).lower())
+
+        sensitive_hits = [t for t in _GRAPHQL_SENSITIVE_TYPES if t in type_names]
+        dangerous_hits = [m for m in _GRAPHQL_DANGEROUS_MUTATIONS
+                          if any(m in mn for mn in mutation_names)]
+        has_password_field = bool(
+            re.search(r'"name"\s*:\s*"password"', body, re.IGNORECASE)
+        )
+
+        # CRITICAL — password field in schema
+        if has_password_field:
+            findings.append({
+                "target": ip, "severity": "CRITICAL", "category": "api",
+                "title": f"GraphQL schema exposes a 'password' field at {path}",
+                "description": (
+                    "Introspection is enabled AND the schema contains a field "
+                    "named `password`. If this is on a type returnable via a "
+                    "query, user password hashes (or worse, plaintext) can be "
+                    "enumerated. Audit resolvers on any type with `password` "
+                    "and either remove the field or mark it non-queryable; "
+                    "disable introspection in production."
+                ),
+                "evidence": f"POST {url} with introspection → schema includes `password`",
+                "tool": "graphql-probe",
+            })
+            continue
+
+        # HIGH — dangerous mutations
+        if dangerous_hits:
+            findings.append({
+                "target": ip, "severity": "HIGH", "category": "api",
+                "title": f"GraphQL exposes dangerous mutations at {path}",
+                "description": (
+                    "Introspection reveals mutation operations that would "
+                    "normally be admin-only. Verify each requires "
+                    "authorization at resolver-level (not just at client). "
+                    "Disable introspection in production: add `introspection: "
+                    "false` to your Apollo / Yoga / graphql-ruby config when "
+                    "NODE_ENV === 'production'."
+                ),
+                "evidence": (
+                    f"Dangerous mutations discovered: {', '.join(dangerous_hits)}\n"
+                    f"POST {url}"
+                ),
+                "tool": "graphql-probe",
+            })
+            continue
+
+        # MEDIUM — sensitive types
+        if sensitive_hits:
+            findings.append({
+                "target": ip, "severity": "MEDIUM", "category": "api",
+                "title": f"GraphQL introspection enabled at {path} (sensitive types exposed)",
+                "description": (
+                    "Introspection works and the schema contains types like "
+                    f"{', '.join(sensitive_hits[:5])}. An attacker can map your "
+                    "data model and pick targets. Disable introspection in "
+                    "production; keep it behind an internal-only auth gate "
+                    "for dev."
+                ),
+                "evidence": (
+                    f"Sensitive types in schema: {', '.join(sensitive_hits[:10])}\n"
+                    f"POST {url}"
+                ),
+                "tool": "graphql-probe",
+            })
+            continue
+
+        # INFO — benign introspection
+        findings.append({
+            "target": ip, "severity": "INFO", "category": "api",
+            "title": f"GraphQL introspection enabled at {path}",
+            "description": (
+                "Introspection responds with a schema. This is not in itself "
+                "a vulnerability — many developer-facing APIs intentionally "
+                "expose schemas — but it does expand the scanner's attack "
+                "surface. Disable in prod if the API isn't developer-facing."
+            ),
+            "evidence": f"POST {url} → schema returned",
+            "tool": "graphql-probe",
+        })
     return findings
 
 
@@ -2129,7 +2413,8 @@ SCAN_MODULES = [
     ("idor",            "IDOR / BOLA probe (GET-only)",     "scan_target_idor"),
     ("prompt_injection","AI chat prompt-injection probe",   "scan_target_prompt_injection"),
     ("authenticated",   "Authenticated re-scan (with creds)","scan_target_authenticated"),
-    ("s3_cloud",        "Cloud misconfiguration",           "scan_target_s3_cloud"),
+    ("s3_cloud",        "S3 / GCS bucket exposure",         "scan_target_s3_cloud"),
+    ("graphql",         "GraphQL introspection + audit",    "scan_target_graphql"),
     ("nuclei_cve",      "Nuclei CVE + takeover templates",  "scan_target_nuclei_cve"),
     ("accessibility",   "Privacy & compliance audit",       "scan_target_accessibility"),
     # Structured AI modules (replaces the retired `ai_chain` fuzzy reasoner).

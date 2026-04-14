@@ -52,9 +52,14 @@ def _get_db():
 
 # ── Sonnet structured caller ────────────────────────────────────────────────
 
-def _call_sonnet(system: str, user: str, *, max_tokens: int = 2048) -> Optional[dict]:
+def _call_sonnet(system: str, user: str, *, max_tokens: int = 2048,
+                 timeout: float = 20.0) -> Optional[dict]:
     """Single Anthropic call with JSON enforcement at the prompt level.
-    Returns parsed dict or None on failure. Temperature=0 for determinism."""
+    Returns parsed dict or None on failure. Temperature=0 for determinism.
+
+    Timeout default was 45s but that compounds into multi-minute stalls when
+    a target has many findings × multi-call pipeline. 20s per call + triage
+    wall-clock budget upstream keeps total bounded."""
     key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not key:
         return None
@@ -74,7 +79,7 @@ def _call_sonnet(system: str, user: str, *, max_tokens: int = 2048) -> Optional[
                 "system": system,
                 "messages": [{"role": "user", "content": user}],
             },
-            timeout=45,
+            timeout=timeout,
         )
         if r.status_code != 200:
             # Fallback to Opus-4 if Sonnet 4.6 not yet available on the tenant
@@ -342,9 +347,22 @@ def scan_target_ai_triage(run_id: str, ip: str, name: str) -> list[dict]:
     # Cache URL classifications so we don't re-classify the same URL N times.
     classification_cache: dict[str, dict] = {}
 
-    triage_stats = {"kept": 0, "demoted": 0, "confirmed": 0, "failed": 0}
+    triage_stats = {"kept": 0, "demoted": 0, "confirmed": 0,
+                    "failed": 0, "skipped_budget": 0}
+
+    # Wall-clock budget — stragglers from the 2026-04-14 Supabase rescan
+    # showed that a target with many AI-originated findings + slow Sonnet
+    # responses could stall a scan for 10+ minutes. Cap total time here so
+    # one unlucky target can't hold up the batch.
+    import time as _time
+    _BUDGET_S = 180.0  # 3 minutes per target for triage
+    _started = _time.monotonic()
 
     for f in findings_to_triage:
+        if _time.monotonic() - _started > _BUDGET_S:
+            triage_stats["skipped_budget"] += 1
+            continue
+
         url = _extract_url_from_finding(f)
         url_cls = None
         if url:
@@ -408,8 +426,20 @@ def scan_target_ai_triage(run_id: str, ip: str, name: str) -> list[dict]:
     # Emit a single INFO finding summarizing what triage did.
     return [{
         "target": ip, "severity": "INFO", "category": "ai-review",
-        "title": f"AI triage: kept={triage_stats['kept']} confirmed={triage_stats['confirmed']} demoted={triage_stats['demoted']} failed={triage_stats['failed']}",
-        "description": "Each HIGH/CRIT was classified by Sonnet against known FP patterns. 'kept' = AI said real, 'confirmed' = live re-verify succeeded, 'demoted' = AI said FP or re-verify failed.",
+        "title": (
+            f"AI triage: kept={triage_stats['kept']} "
+            f"confirmed={triage_stats['confirmed']} "
+            f"demoted={triage_stats['demoted']} "
+            f"failed={triage_stats['failed']} "
+            f"skipped(budget)={triage_stats['skipped_budget']}"
+        ),
+        "description": (
+            "Each HIGH/CRIT from an AI-originated tool was classified by "
+            "Sonnet against known FP patterns. 'kept' = AI said real, "
+            "'confirmed' = live re-verify succeeded, 'demoted' = AI said FP "
+            "or re-verify failed, 'skipped(budget)' = 3-minute wall-clock "
+            "budget hit before this finding could be triaged."
+        ),
         "evidence": f"model={_MODEL}",
         "tool": "ai-triage",
     }]

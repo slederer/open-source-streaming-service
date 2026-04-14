@@ -129,6 +129,117 @@ class TestDnsEmail:
         assert findings == []
 
 
+class TestGraphQLProbe:
+    @patch("scanner.app.subprocess.run")
+    @patch("scanner.app.get_db")
+    def test_password_field_is_critical(self, mock_db, mock_run):
+        mock_db.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = []
+        class R:
+            stdout = (
+                '{"data":{"__schema":{"types":['
+                '{"name":"User","fields":[{"name":"id"},{"name":"email"},{"name":"password"}]}'
+                ']}}}'
+            )
+            stderr = ""
+            returncode = 0
+        mock_run.return_value = R()
+        from scanner.app import scan_target_graphql
+        findings = scan_target_graphql("r1", "example.com", "t")
+        crits = [f for f in findings if f["severity"] == "CRITICAL"]
+        assert crits and "password" in crits[0]["title"]
+
+    @patch("scanner.app.subprocess.run")
+    @patch("scanner.app.get_db")
+    def test_dangerous_mutations_is_high(self, mock_db, mock_run):
+        mock_db.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = []
+        class R:
+            stdout = (
+                '{"data":{"__schema":{"types":['
+                '{"name":"Query","fields":[{"name":"hello"}]}'
+                '],"mutationType":{"fields":['
+                '{"name":"deleteUser"},{"name":"executeSQL"}'
+                ']}}}}'
+            )
+            stderr = ""
+            returncode = 0
+        mock_run.return_value = R()
+        from scanner.app import scan_target_graphql
+        findings = scan_target_graphql("r1", "example.com", "t")
+        high = [f for f in findings if f["severity"] == "HIGH"]
+        assert high and "dangerous mutations" in high[0]["title"]
+
+    @patch("scanner.app.subprocess.run")
+    @patch("scanner.app.get_db")
+    def test_no_graphql_endpoint_no_findings(self, mock_db, mock_run):
+        mock_db.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = []
+        class R:
+            stdout = "404 not found"
+            stderr = ""
+            returncode = 0
+        mock_run.return_value = R()
+        from scanner.app import scan_target_graphql
+        findings = scan_target_graphql("r1", "example.com", "t")
+        assert findings == []
+
+
+class TestS3CloudEnhancements:
+    @patch("scanner.app.run_cmd")
+    def test_extracts_s3_bucket_from_js(self, mock_cmd):
+        """Bucket name in JS bundle (foo-uploads.s3.amazonaws.com) should be
+        probed even if the dictionary attack would never guess it."""
+        html_body = '<html><script src="/assets/app.js"></script></html>'
+        js_body = (
+            "const CDN = 'https://weird-unique-bucket-xyz.s3.amazonaws.com';"
+            + "x" * 200
+        )
+        list_body = (
+            "<?xml version='1.0'?><ListBucketResult><Key>secrets.json</Key>"
+            "<Key>users.csv</Key></ListBucketResult>"
+        )
+
+        def side_effect(cmd, timeout=300):
+            url = cmd[-1] if cmd else ""
+            if url.endswith("/") and ".s3.amazonaws.com" not in url:
+                return html_body
+            if url.endswith(".js"):
+                return js_body
+            if "weird-unique-bucket-xyz.s3.amazonaws.com" in url:
+                # Differentiate probe vs body fetch by presence of -w flag
+                if "%{http_code}" in " ".join(cmd):
+                    return "200"
+                return list_body
+            if "%{http_code}" in " ".join(cmd):
+                return "404"
+            return ""
+        mock_cmd.side_effect = side_effect
+
+        from scanner.app import scan_target_s3_cloud
+        findings = scan_target_s3_cloud("r1", "example.com", "t")
+        s3 = [f for f in findings if "weird-unique-bucket-xyz" in f["title"]]
+        assert s3, f"Expected weird-unique-bucket-xyz finding; got {[f['title'] for f in findings]}"
+
+    @patch("scanner.app.run_cmd")
+    def test_gcs_bucket_listable_is_high(self, mock_cmd):
+        html_body = ('<html>uses storage.googleapis.com/my-gcs-bucket/file.png</html>')
+        list_resp = '{"kind":"storage#objects","items":[{"name":"file.png"},{"name":"data.csv"}]}'
+
+        def side_effect(cmd, timeout=300):
+            url = cmd[-1] if cmd else ""
+            if url.endswith("/") and "storage.googleapis.com" not in url:
+                return html_body
+            if "storage.googleapis.com/storage/v1/b/my-gcs-bucket" in url:
+                return list_resp
+            if "%{http_code}" in " ".join(cmd):
+                return "404"
+            return ""
+        mock_cmd.side_effect = side_effect
+
+        from scanner.app import scan_target_s3_cloud
+        findings = scan_target_s3_cloud("r1", "example.com", "t")
+        gcs = [f for f in findings if "my-gcs-bucket" in f["title"] and f["severity"] == "HIGH"]
+        assert gcs, f"Expected GCS HIGH finding; got {[f['title'] for f in findings]}"
+
+
 class TestSupabaseServiceRoleDetection:
     """Regression tests for the catastrophic service_role JWT leak —
     the #1 vibe-coding mistake: AI devs pasting the admin-privileged
@@ -380,7 +491,7 @@ class TestS3Cloud:
         mock_cmd.side_effect = side_effect
         from scanner.app import scan_target_s3_cloud
         findings = scan_target_s3_cloud("r1", "example.com", "t")
-        assert any("S3 bucket with public listing" in f["title"] for f in findings)
+        assert any("S3 bucket with public LIST" in f["title"] for f in findings)
 
 
 class TestAccessibility:

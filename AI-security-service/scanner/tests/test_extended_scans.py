@@ -129,6 +129,85 @@ class TestDnsEmail:
         assert findings == []
 
 
+class TestSupabaseServiceRoleDetection:
+    """Regression tests for the catastrophic service_role JWT leak —
+    the #1 vibe-coding mistake: AI devs pasting the admin-privileged
+    service_role key (bypasses RLS) into a client-side bundle."""
+
+    def _make_jwt(self, role: str) -> str:
+        import base64, json
+        header = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').decode().rstrip("=")
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"iss": "supabase", "ref": "xyz", "role": role}).encode()
+        ).decode().rstrip("=")
+        return f"{header}.{payload}.fakesignature_xxxxxxxxxxxxxxxx"
+
+    def test_detects_service_role_jwt(self):
+        from scanner.app import _supabase_service_role_jwts
+        jwt = self._make_jwt("service_role")
+        hits = _supabase_service_role_jwts(f"const ADMIN = '{jwt}';")
+        assert hits == [jwt]
+
+    def test_anon_jwt_not_flagged_as_service_role(self):
+        """anon keys are fine to ship; must NOT be flagged."""
+        from scanner.app import _supabase_service_role_jwts
+        jwt = self._make_jwt("anon")
+        hits = _supabase_service_role_jwts(f"const KEY = '{jwt}';")
+        assert hits == []
+
+    @patch("scanner.app.run_cmd")
+    def test_service_role_surfaces_as_critical(self, mock_cmd):
+        from scanner.app import scan_target_secrets
+        jwt = self._make_jwt("service_role")
+        # First call returns HTTP 200, subsequent fetches return the JS body
+        call = {"n": 0}
+        def side_effect(cmd, timeout=300):
+            call["n"] += 1
+            if "%{http_code}" in " ".join(cmd):
+                return "200"
+            return f"var x = 1; const SUPABASE_SERVICE = '{jwt}'; var y = 2;"
+        mock_cmd.side_effect = side_effect
+        findings = scan_target_secrets("r1", "example.com", "t")
+        crit_role = [f for f in findings
+                     if f["severity"] == "CRITICAL" and "service_role" in f["title"]]
+        assert crit_role, f"expected service_role CRITICAL; got titles: {[f['title'] for f in findings]}"
+
+
+class TestWafCdnFingerprint:
+    @patch("scanner.app.run_cmd")
+    def test_detects_cloudflare(self, mock_cmd):
+        mock_cmd.return_value = (
+            "HTTP/2 200\n"
+            "server: cloudflare\n"
+            "cf-ray: abc123-LAX\n"
+            "set-cookie: __cf_bm=foo\n"
+        )
+        from scanner.app import scan_target_waf_cdn
+        findings = scan_target_waf_cdn("r1", "example.com", "t")
+        assert findings
+        assert "Cloudflare" in findings[0]["title"]
+        assert findings[0]["severity"] == "INFO"
+
+    @patch("scanner.app.run_cmd")
+    def test_detects_akamai(self, mock_cmd):
+        mock_cmd.return_value = (
+            "HTTP/2 200\nserver: AkamaiGHost\nx-akamai-cache-status: HIT\n"
+        )
+        from scanner.app import scan_target_waf_cdn
+        findings = scan_target_waf_cdn("r1", "bank.example.com", "t")
+        assert findings
+        assert "Akamai" in findings[0]["title"]
+
+    @patch("scanner.app.run_cmd")
+    def test_no_cdn_emits_low(self, mock_cmd):
+        mock_cmd.return_value = "HTTP/2 200\nserver: nginx\ncontent-length: 512\n"
+        from scanner.app import scan_target_waf_cdn
+        findings = scan_target_waf_cdn("r1", "origin.example.com", "t")
+        assert findings
+        assert findings[0]["severity"] == "LOW"
+        assert "No CDN or WAF" in findings[0]["title"]
+
+
 class TestBaaSDetection:
     @patch("scanner.app.run_cmd")
     def test_detects_supabase(self, mock_cmd):
@@ -143,6 +222,62 @@ class TestBaaSDetection:
         from scanner.app import scan_target_baas
         findings = scan_target_baas("r1", "example.com", "t")
         assert any("Firebase" in f["title"] for f in findings)
+
+    @patch("scanner.app.run_cmd")
+    def test_extracts_real_table_names_from_js(self, mock_cmd):
+        """Regression: generic-list probing (users/profiles/etc) missed app-
+        specific table names like 'bookings' or 'inventory_items'. Module
+        must extract .from('x') / .rpc('y') names from the JS bundle and
+        probe those."""
+        html_body = '<html><script src="/assets/app.js"></script></html>'
+        jwt = ("eyJhbGciOiJIUzI1NiJ9."
+               "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InByb2oiLCJyb2xlIjoiYW5vbiJ9."
+               "sig")
+        # Bundle references custom tables + a bucket + an edge function
+        js_body = (
+            f"const sb = createClient('https://proj.supabase.co','{jwt}');"
+            "sb.from('bookings').select('*');"
+            "sb.from('invoice_items').select('id');"
+            "sb.rpc('calculate_total', {id: 1});"
+            "sb.storage.from('receipts').list();"
+            "sb.functions.invoke('send-email', {body: {}});"
+        )
+        # Anon-key read on 'bookings' returns real data → CRIT expected
+        rls_hit = '[{"id":1,"customer_id":42,"date":"2026-04-14"}]'
+        # Storage bucket listable → HIGH expected
+        bucket_list = '[{"name":"user1.pdf","id":"abc","updated_at":"2026"}]'
+
+        def side_effect(cmd, timeout=8, **kw):
+            url = cmd[-1] if cmd else ""
+            if url.endswith("/"):
+                return html_body
+            if url.endswith(".js"):
+                return js_body
+            if "/rest/v1/bookings" in url:
+                return rls_hit
+            if "/storage/v1/object/list/receipts" in url:
+                return bucket_list
+            return "{}"
+        mock_cmd.side_effect = side_effect
+        from scanner.app import scan_target_baas
+        findings = scan_target_baas("r1", "example.com", "t")
+        titles = [f["title"] for f in findings]
+        # Discovered-tables INFO should list our 3 custom names
+        assert any("tables discovered in bundle" in t for t in titles), titles
+        disc = [f for f in findings if "tables discovered" in f["title"]]
+        assert "bookings" in disc[0]["evidence"]
+        assert "invoice_items" in disc[0]["evidence"]
+        assert "calculate_total" in disc[0]["evidence"]
+        # Bookings table probe CRIT
+        assert any(f["severity"] == "CRITICAL" and "bookings" in f["title"]
+                   for f in findings), f"bookings CRIT missing; titles={titles}"
+        # Storage bucket HIGH
+        assert any(f["severity"] == "HIGH" and "receipts" in f["title"]
+                   for f in findings), f"bucket HIGH missing; titles={titles}"
+        # Edge function enumeration INFO
+        assert any("edge functions referenced" in t for t in titles), titles
+        edge = [f for f in findings if "edge functions referenced" in f["title"]]
+        assert "send-email" in edge[0]["evidence"]
 
     @patch("scanner.app.run_cmd")
     def test_detects_supabase_in_js_bundle_not_html(self, mock_cmd):

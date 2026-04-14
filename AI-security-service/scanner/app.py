@@ -830,6 +830,28 @@ SECRET_PATTERNS = [
 ]
 
 
+def _supabase_service_role_jwts(body: str) -> list[str]:
+    """Return any JWTs in body whose decoded payload is role=service_role.
+
+    The Supabase service_role key is THE catastrophic leak: it bypasses RLS
+    on every table. Format-wise it's indistinguishable from the anon key
+    (same JWT shape); only the decoded payload's `role` field separates
+    them. We base64-decode the middle segment and check."""
+    import base64
+    hits = []
+    for m in re.finditer(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", body):
+        jwt = m.group(0)
+        try:
+            payload_b64 = jwt.split(".")[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            payload = base64.urlsafe_b64decode(payload_b64).decode("utf-8", errors="ignore")
+            if '"role":"service_role"' in payload.replace(" ", ""):
+                hits.append(jwt)
+        except Exception:
+            continue
+    return hits
+
+
 def scan_target_secrets(run_id: str, ip: str, name: str):
     """Scan for secrets leaked in client-side JS bundles and config files."""
     findings = []
@@ -868,10 +890,116 @@ def scan_target_secrets(run_id: str, ip: str, name: str):
                         "evidence": f"Found: {snippet}",
                         "tool": "secret-scan",
                     })
+            # Supabase service_role JWT — decoded-payload check (regex can't
+            # distinguish anon from service_role since both are JWTs).
+            for svc_jwt in _supabase_service_role_jwts(body):
+                findings.append({
+                    "target": ip, "severity": "CRITICAL", "category": "secrets",
+                    "title": f"Supabase service_role key exposed at {path}",
+                    "description": (
+                        "A Supabase service_role JWT was found in a client-side "
+                        "bundle. This key bypasses Row Level Security on every "
+                        "table — any user of this app has admin-level read+write "
+                        "access to the entire database. Rotate the key in the "
+                        "Supabase dashboard (Settings → API → Reset) and move to "
+                        "server-side only. NEVER ship service_role keys to the browser."
+                    ),
+                    "evidence": f"Found: {svc_jwt[:40]}...{svc_jwt[-8:]}",
+                    "tool": "secret-scan",
+                })
             if bodies_fetched >= 25:
                 break
         if bodies_fetched >= 25:
             break
+    return findings
+
+
+# (fingerprint_regex, label, is_waf) — is_waf=True means this product provides
+# security filtering (not just CDN/edge). Ordering matters only for readability.
+_WAF_CDN_FINGERPRINTS = [
+    (r"(?i)(^|\n)(cf-ray:|server:\s*cloudflare)|__cf_bm=", "Cloudflare", True),
+    (r"(?i)(^|\n)(x-amz-cf-id:|server:\s*cloudfront)|via:.*cloudfront", "AWS CloudFront", False),
+    (r"(?i)(^|\n)x-akamai-|server:\s*akamaighost", "Akamai", True),
+    (r"(?i)(^|\n)x-served-by:\s*cache-|fastly-debug-path", "Fastly", False),
+    (r"(?i)(^|\n)(x-azure-ref|x-msedge-ref):", "Azure Front Door", True),
+    (r"(?i)(^|\n)(x-iinfo:|x-cdn:\s*incapsula)|visid_incap_", "Imperva/Incapsula", True),
+    (r"(?i)(^|\n)x-sucuri-id|server:\s*sucuri", "Sucuri", True),
+    (r"(?i)BIGipServer", "F5 BIG-IP", True),
+    (r"(?i)(^|\n)(x-vercel-|server:\s*vercel)", "Vercel Edge", False),
+    (r"(?i)(^|\n)(server:\s*netlify|x-nf-request-id)", "Netlify Edge", False),
+    (r"(?i)x-cache:.*bunnycdn", "BunnyCDN", False),
+    (r"(?i)(^|\n)x-stackpath-", "StackPath", False),
+    (r"(?i)(^|\n)x-drupal-cache", "Drupal Cache (backend)", False),
+    (r"(?i)barra_counter_session", "Barracuda", True),
+]
+
+
+def scan_target_waf_cdn(run_id: str, ip: str, name: str):
+    """Fingerprint the CDN / WAF fronting the target via response headers.
+
+    Different from scan_target_waf_gate (which flags WAF challenge pages that
+    block scanning). This runs always and emits an INFO/LOW finding with the
+    detected edge stack so the user knows what's protecting (or not protecting)
+    their app.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        candidates = [f"http://{ip}", f"https://{ip}"]
+    else:
+        candidates = [f"https://{ip}", f"http://{ip}"]
+    resp = ""
+    for base in candidates:
+        resp = run_cmd(
+            ["curl", "-skI", "-L", "-m", "6", "-A",
+             "Mozilla/5.0 (compatible; SecurityScannerBot/1.0)", base + "/"],
+            timeout=9,
+        )
+        if resp and "[TIMEOUT" not in resp and "[ERROR" not in resp and len(resp) > 40:
+            break
+    if not resp or "[TIMEOUT" in resp or "[ERROR" in resp:
+        return findings
+
+    detected = []
+    for regex, label, is_waf in _WAF_CDN_FINGERPRINTS:
+        if re.search(regex, resp):
+            detected.append((label, is_waf))
+    # Dedupe while preserving order
+    seen = set()
+    detected = [d for d in detected if not (d[0] in seen or seen.add(d[0]))]
+
+    if detected:
+        labels = ", ".join(d[0] for d in detected)
+        waf_names = [d[0] for d in detected if d[1]]
+        findings.append({
+            "target": ip, "severity": "INFO", "category": "edge-infra",
+            "title": f"Edge / CDN / WAF detected: {labels}",
+            "description": (
+                f"Traffic is proxied through: {labels}. "
+                + (f"WAF coverage present via: {', '.join(waf_names)}. Scanner "
+                   "findings may be masked or rate-limited; consider allow-listing "
+                   "the scanner's IP."
+                   if waf_names else
+                   "These are CDN/edge products only (no dedicated WAF signal). "
+                   "DDoS resilience + caching are covered; request-filtering is not.")
+            ),
+            "evidence": resp[:500],
+            "tool": "waf-cdn",
+        })
+    else:
+        findings.append({
+            "target": ip, "severity": "LOW", "category": "edge-infra",
+            "title": "No CDN or WAF in front of origin",
+            "description": (
+                "Response headers show no recognized CDN or WAF. Origin is "
+                "directly reachable. For any production app, fronting with "
+                "Cloudflare (free tier works), AWS CloudFront, or Fastly "
+                "gives DDoS resilience, global latency gains, and a WAF rule "
+                "engine. Direct-origin exposure also means attackers can probe "
+                "your server at the application layer with no filtering."
+            ),
+            "evidence": resp[:300],
+            "tool": "waf-cdn",
+        })
     return findings
 
 
@@ -1170,7 +1298,7 @@ def scan_target_baas(run_id: str, ip: str, name: str):
                 pass
 
         # Detect Supabase (search across HTML + JS bundles)
-        supabase_match = re.search(r"https?://([a-z0-9]{5,40})\.supabase\.co", search_corpus)
+        supabase_match = re.search(r"https?://([a-z0-9]{3,40})\.supabase\.co", search_corpus)
         # JWT-form anon keys look like eyJXXX.eyJYYY.ZZZ. Permissive match; we
         # verify by hitting the REST API, so false positives can't escalate.
         supabase_anon = (
@@ -1186,14 +1314,42 @@ def scan_target_baas(run_id: str, ip: str, name: str):
                 "evidence": supabase_match.group(0),
                 "tool": "baas-detect",
             })
-            # If we found an anon key, try hitting the REST API to check if tables are unprotected
+            # If we found an anon key, probe REST API for unprotected tables.
             if supabase_anon:
                 anon_key = supabase_anon.group(1)
-                # Common table names across Lovable/Bolt/Replit-style apps.
-                # Keep this list tight — every table adds one HTTP request per target.
-                for table in ["users", "profiles", "accounts", "messages", "posts",
-                              "admin", "sites", "pages", "orders", "invoices",
-                              "tasks", "businesses"]:
+
+                # Extract REAL table names from the bundle's supabase client
+                # calls (`.from('x')`, `.rpc('y')`). This is the key upgrade
+                # vs the old generic-list approach — vibe-coded apps have
+                # table names like 'sonic_reads' or 'bookings_v2' that the
+                # generic list never catches.
+                discovered = set()
+                for m in re.finditer(
+                    r"""\.(?:from|rpc)\(\s*["']([a-zA-Z_][a-zA-Z0-9_]{1,60})["']""",
+                    search_corpus,
+                ):
+                    discovered.add(m.group(1))
+                # Generic fallback so we still catch bundles that obfuscated
+                # the table names (Vite minifier sometimes inlines constants).
+                generic = {"users", "profiles", "accounts", "messages",
+                           "posts", "admin", "sites", "pages", "orders",
+                           "invoices", "tasks", "businesses"}
+                tables_to_probe = list(discovered | generic)[:40]
+                if discovered:
+                    findings.append({
+                        "target": ip, "severity": "INFO", "category": "baas",
+                        "title": f"Supabase tables discovered in bundle: {len(discovered)}",
+                        "description": (
+                            "Extracted the following table names from .from()/"
+                            ".rpc() calls in the public JS bundle. Every one "
+                            "of these needs RLS verification; the scanner "
+                            "probes them in the next step."
+                        ),
+                        "evidence": ", ".join(sorted(discovered)[:40])[:400],
+                        "tool": "baas-detect",
+                    })
+
+                for table in tables_to_probe:
                     resp = run_cmd([
                         "curl", "-sk", "-m", "5",
                         "-H", f"apikey: {anon_key}",
@@ -1204,10 +1360,81 @@ def scan_target_baas(run_id: str, ip: str, name: str):
                         findings.append({
                             "target": ip, "severity": "CRITICAL", "category": "baas",
                             "title": f"Supabase table '{table}' readable by anon key",
-                            "description": "Row Level Security (RLS) is disabled or misconfigured on this table. Enable RLS immediately.",
+                            "description": (
+                                "Row Level Security is disabled or misconfigured "
+                                f"on table `{table}`. Any client with the public "
+                                "anon key (i.e., every visitor) can read rows. "
+                                "Fix: `ALTER TABLE " + table + " ENABLE ROW LEVEL "
+                                "SECURITY;` and add policies that scope access "
+                                "to the authenticated user."
+                            ),
                             "evidence": f"GET /rest/v1/{table} → {resp[:200]}",
                             "tool": "supabase-audit",
                         })
+
+                # Storage buckets — extract names from `.storage.from('bucket')`
+                # and list them with the anon key. LIST is a read-only operation.
+                buckets = set()
+                for m in re.finditer(
+                    r"""\.storage\.from\(\s*["']([a-zA-Z_][a-zA-Z0-9_\-]{1,60})["']""",
+                    search_corpus,
+                ):
+                    buckets.add(m.group(1))
+                for bucket in list(buckets)[:10]:
+                    list_url = (f"https://{project}.supabase.co/storage/v1/"
+                                f"object/list/{bucket}")
+                    resp = run_cmd([
+                        "curl", "-sk", "-m", "5", "-X", "POST",
+                        "-H", f"apikey: {anon_key}",
+                        "-H", f"Authorization: Bearer {anon_key}",
+                        "-H", "content-type: application/json",
+                        "-d", '{"prefix":"","limit":5}',
+                        list_url,
+                    ], timeout=8)
+                    if resp and resp.startswith("[{") and '"name"' in resp:
+                        findings.append({
+                            "target": ip, "severity": "HIGH", "category": "baas",
+                            "title": f"Supabase storage bucket '{bucket}' publicly listable",
+                            "description": (
+                                f"The anon key can list contents of bucket `{bucket}`. "
+                                "An attacker can enumerate every uploaded file "
+                                "(user avatars, receipts, documents). In the "
+                                "Supabase dashboard: Storage → Policies — restrict "
+                                "the `SELECT` policy to `auth.uid() = owner` or similar."
+                            ),
+                            "evidence": f"POST /storage/v1/object/list/{bucket} → {resp[:200]}",
+                            "tool": "supabase-audit",
+                        })
+
+                # Edge functions — enumerate but do NOT execute (POST body
+                # could trigger billing / state mutation). Emit INFO with
+                # the list so the user can manually verify each.
+                edge_fns = set()
+                for m in re.finditer(
+                    r"""\.functions\.invoke\(\s*["']([a-zA-Z_][a-zA-Z0-9_\-]{1,60})["']""",
+                    search_corpus,
+                ):
+                    edge_fns.add(m.group(1))
+                for m in re.finditer(
+                    rf"{project}\.supabase\.co/functions/v1/([a-zA-Z_][a-zA-Z0-9_\-]{{1,60}})",
+                    search_corpus,
+                ):
+                    edge_fns.add(m.group(1))
+                if edge_fns:
+                    findings.append({
+                        "target": ip, "severity": "INFO", "category": "baas",
+                        "title": f"Supabase edge functions referenced: {len(edge_fns)}",
+                        "description": (
+                            "The bundle references the following edge functions. "
+                            "For each: verify the function checks `req.headers.get"
+                            "('authorization')` and validates the user ID before "
+                            "performing any privileged action. The scanner does "
+                            "NOT probe these automatically (executing them could "
+                            "cause unintended state changes or billing)."
+                        ),
+                        "evidence": ", ".join(sorted(edge_fns)),
+                        "tool": "baas-detect",
+                    })
 
         # Detect Firebase
         firebase_match = re.search(r'["\']?apiKey["\']?\s*:\s*["\']([A-Za-z0-9_\-]{20,})["\']', html)
@@ -1843,7 +2070,7 @@ try:
         scan_target_github_org, scan_target_default_creds, scan_target_js_cve,
         scan_target_idor, scan_target_render, scan_target_authenticated,
         scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
-        scan_target_waf_gate,
+        scan_target_waf_gate, scan_target_prompt_injection,
     )
     from scanner.ai_triage import (
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -1859,7 +2086,7 @@ except ImportError:
         scan_target_github_org, scan_target_default_creds, scan_target_js_cve,
         scan_target_idor, scan_target_render, scan_target_authenticated,
         scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
-        scan_target_waf_gate,
+        scan_target_waf_gate, scan_target_prompt_injection,
     )
     from scanner_ai_triage import (  # type: ignore
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -1870,6 +2097,7 @@ except ImportError:
 SCAN_MODULES = [
     ("nmap",            "Port scan & service detection",    "scan_target_nmap"),
     ("waf_gate",        "WAF / anti-bot challenge detection","scan_target_waf_gate"),
+    ("waf_cdn",         "CDN / WAF fingerprint",            "scan_target_waf_cdn"),
     ("headers",         "HTTP security headers",            "scan_target_headers"),
     ("tls",             "TLS/SSL configuration & cert",     "scan_target_tls"),
     ("crawl",           "Web crawl · sitemap · JS bundles", "scan_target_crawl"),
@@ -1898,7 +2126,8 @@ SCAN_MODULES = [
     ("llm",             "LLM endpoint security (OWASP)",    "scan_target_llm"),
     ("auth",            "Authentication probes",            "scan_target_auth"),
     ("default_creds",   "Default credentials (opt-in)",     "scan_target_default_creds"),
-    ("idor",            "IDOR probing (opt-in)",            "scan_target_idor"),
+    ("idor",            "IDOR / BOLA probe (GET-only)",     "scan_target_idor"),
+    ("prompt_injection","AI chat prompt-injection probe",   "scan_target_prompt_injection"),
     ("authenticated",   "Authenticated re-scan (with creds)","scan_target_authenticated"),
     ("s3_cloud",        "Cloud misconfiguration",           "scan_target_s3_cloud"),
     ("nuclei_cve",      "Nuclei CVE + takeover templates",  "scan_target_nuclei_cve"),

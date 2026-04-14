@@ -176,10 +176,81 @@ class TestDefaultCreds:
 # ── Module 8: IDOR probe (gated) ───────────────────────────────────────────
 
 class TestIdor:
-    def test_no_consent_no_op(self):
-        with patch("scanner.advanced._user_consented", return_value=False):
+    def test_bola_without_pii_is_high(self):
+        """3 distinct JSON bodies with no auth → HIGH (BOLA pattern)."""
+        from scanner.advanced import scan_target_idor
+        def fake_curl(url, timeout=4, max_bytes=20000, head=False):
+            # Return distinct bodies for ids 1,2,3 (no PII markers)
+            if "/api/bookings/1" in url:
+                return "200", "application/json", '{"id":1,"status":"paid"}'
+            if "/api/bookings/2" in url:
+                return "200", "application/json", '{"id":2,"status":"pending"}'
+            if "/api/bookings/3" in url:
+                return "200", "application/json", '{"id":3,"status":"canceled"}'
+            return "404", "", ""
+        # No endpoints from this run → falls through to generic list
+        with patch("scanner.advanced._curl", side_effect=fake_curl), \
+             patch("scanner.advanced._id_bearing_templates_from_run",
+                   return_value=["/api/bookings/{id}"]):
             findings = scan_target_idor("r1", "x.com", "t")
+        assert findings
+        assert any(f["severity"] == "HIGH" and "bookings" in f["title"]
+                   for f in findings), [f["title"] for f in findings]
+
+    def test_pii_leak_is_critical(self):
+        """Same endpoint but response leaks emails → CRITICAL."""
+        from scanner.advanced import scan_target_idor
+        def fake_curl(url, timeout=4, max_bytes=20000, head=False):
+            for i in (1, 2, 3):
+                if f"/{i}" in url:
+                    return "200", "application/json", (
+                        f'{{"id":{i},"email":"user{i}@example.com","status":"x"}}'
+                    )
+            return "404", "", ""
+        with patch("scanner.advanced._curl", side_effect=fake_curl), \
+             patch("scanner.advanced._id_bearing_templates_from_run",
+                   return_value=["/api/bookings/{id}"]):
+            findings = scan_target_idor("r1", "x.com", "t")
+        assert any(f["severity"] == "CRITICAL" and "PII" in f["title"]
+                   for f in findings), [f["title"] for f in findings]
+
+    def test_skips_ips(self):
+        from scanner.advanced import scan_target_idor
+        assert scan_target_idor("r1", "1.2.3.4", "t") == []
+
+
+class TestPromptInjection:
+    def test_canary_echo_is_high(self):
+        """Chat endpoint echoes the canary → HIGH (prompt injection confirmed)."""
+        from scanner.advanced import scan_target_prompt_injection
+        import subprocess as sp
+
+        def fake_curl_live(url, timeout=4, head=False, max_bytes=2000):
+            return "200", "application/json", "ok"
+
+        class R:
+            stdout = '{"reply":"SHIBBOLETH42"}'
+            stderr = ""
+            returncode = 0
+
+        with patch("scanner.advanced._curl", side_effect=fake_curl_live), \
+             patch("scanner.advanced._discover_chat_endpoints",
+                   return_value=["https://x.com/api/chat"]), \
+             patch("scanner.advanced.subprocess.run", return_value=R()):
+            findings = scan_target_prompt_injection("r1", "x.com", "t")
+        assert any(f["severity"] == "HIGH" and "prompt-injection" in f["title"].lower()
+                   for f in findings), [f["title"] for f in findings]
+
+    def test_no_endpoints_no_findings(self):
+        from scanner.advanced import scan_target_prompt_injection
+        # Discovery returns nothing AND HEAD probes all 404 → no findings
+        with patch("scanner.advanced._discover_chat_endpoints", return_value=[]):
+            findings = scan_target_prompt_injection("r1", "x.com", "t")
         assert findings == []
+
+    def test_skips_ips(self):
+        from scanner.advanced import scan_target_prompt_injection
+        assert scan_target_prompt_injection("r1", "1.2.3.4", "t") == []
 
 
 # ── Module 9: Render (optional playwright) ─────────────────────────────────

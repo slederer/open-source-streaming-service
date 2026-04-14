@@ -1150,9 +1150,33 @@ def scan_target_baas(run_id: str, ip: str, name: str):
         if not html or "[TIMEOUT" in html or "[ERROR" in html or len(html) < 50:
             continue
 
-        # Detect Supabase
-        supabase_match = re.search(r"https?://([a-z0-9]+)\.supabase\.co", html)
-        supabase_anon = re.search(r'anon[\s=:"]+["\']?(eyJ[A-Za-z0-9_\-\.]+)', html) or re.search(r'supabase.*?anon.*?["\']([A-Za-z0-9_\-\.]+)["\']', html)
+        # Modern Vite/Webpack bundlers keep Supabase config inside .js chunks, not
+        # inline HTML. Fetch the first referenced bundle and concat into the
+        # search corpus. Without this, almost every Lovable/Bolt app reads as
+        # "no BaaS detected".
+        search_corpus = html
+        js_srcs = re.findall(r'<script[^>]+src=["\']([^"\'\s>]+\.js[^"\'\s>]*)', html)
+        for src in js_srcs[:3]:  # first 3 bundles cover the auth/init chunks
+            js_url = src if src.startswith("http") else base.rstrip("/") + (src if src.startswith("/") else "/" + src)
+            js_url = js_url.split("?", 1)[0]
+            try:
+                # Bundle size cap: Lovable/Bolt bundles run 1-3 MB; keep cap
+                # well above that but bounded so we don't slurp a 50 MB vendor
+                # blob. The --max-time already caps wall clock.
+                body = run_cmd(["curl", "-sk", "-m", "10", "--max-filesize", "5000000", js_url], timeout=14)
+                if body and "[TIMEOUT" not in body and "[ERROR" not in body:
+                    search_corpus += "\n" + body
+            except Exception:
+                pass
+
+        # Detect Supabase (search across HTML + JS bundles)
+        supabase_match = re.search(r"https?://([a-z0-9]{5,40})\.supabase\.co", search_corpus)
+        # JWT-form anon keys look like eyJXXX.eyJYYY.ZZZ. Permissive match; we
+        # verify by hitting the REST API, so false positives can't escalate.
+        supabase_anon = (
+            re.search(r'["\']?(?:anon|supabaseKey|supabaseAnonKey|VITE_SUPABASE_ANON_KEY)["\']?\s*[:=]\s*["\']?(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)', search_corpus)
+            or re.search(r'(eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]+)', search_corpus)
+        )
         if supabase_match:
             project = supabase_match.group(1)
             findings.append({
@@ -1165,8 +1189,11 @@ def scan_target_baas(run_id: str, ip: str, name: str):
             # If we found an anon key, try hitting the REST API to check if tables are unprotected
             if supabase_anon:
                 anon_key = supabase_anon.group(1)
-                # Try common table names
-                for table in ["users", "profiles", "accounts", "messages", "posts", "admin"]:
+                # Common table names across Lovable/Bolt/Replit-style apps.
+                # Keep this list tight — every table adds one HTTP request per target.
+                for table in ["users", "profiles", "accounts", "messages", "posts",
+                              "admin", "sites", "pages", "orders", "invoices",
+                              "tasks", "businesses"]:
                     resp = run_cmd([
                         "curl", "-sk", "-m", "5",
                         "-H", f"apikey: {anon_key}",

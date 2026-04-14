@@ -144,6 +144,45 @@ class TestBaaSDetection:
         findings = scan_target_baas("r1", "example.com", "t")
         assert any("Firebase" in f["title"] for f in findings)
 
+    @patch("scanner.app.run_cmd")
+    def test_detects_supabase_in_js_bundle_not_html(self, mock_cmd):
+        """Regression: Vite/Webpack bundlers put Supabase config in .js chunks,
+        not inline HTML. Module must fetch the bundle and find it there.
+        Observed on 2026-04-14 pressure test: 27/28 Lovable apps had the
+        anon key only in the JS bundle and were missed by the old scanner."""
+        html_body = (
+            '<html><body><script type="module" src="/assets/index-abc.js"></script>'
+            '</body></html>'
+        )
+        js_body = (
+            'const SUPABASE_URL = "https://myproj123.supabase.co";'
+            'const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.'
+            'eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im15cHJvajEyMyIsInJvbGUiOiJhbm9uIn0.'
+            'XXXsignature";'
+        )
+        # RLS-missing table response (populated array)
+        rls_hit = '[{"id":1,"email":"user@example.com"}]'
+
+        def side_effect(cmd, timeout=8, **kw):
+            url = cmd[-1] if cmd else ""
+            if url.endswith("/"):
+                return html_body
+            if url.endswith(".js"):
+                return js_body
+            if "/rest/v1/users" in url:
+                return rls_hit
+            return ""
+        mock_cmd.side_effect = side_effect
+        from scanner.app import scan_target_baas
+        findings = scan_target_baas("r1", "example.com", "t")
+        titles = [f["title"] for f in findings]
+        assert any("Supabase detected" in t for t in titles), titles
+        assert any("readable by anon key" in t for t in titles), \
+            f"RLS probe should have caught the exposed 'users' table; got: {titles}"
+        # The CRITICAL should cite the specific table
+        crit = [f for f in findings if f["severity"] == "CRITICAL"]
+        assert crit and "users" in crit[0]["title"]
+
 
 class TestSubdomainEnum:
     @patch("scanner.app.run_cmd")

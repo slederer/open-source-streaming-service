@@ -7,93 +7,20 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from scanner.advanced import (
-    scan_target_ai_chain, scan_target_takeover, scan_target_js_cve,
+    scan_target_takeover, scan_target_js_cve,
     scan_target_github_org, scan_target_api_fuzz, scan_target_default_creds,
     scan_target_idor, scan_target_render, scan_target_email_deep,
     scan_target_nuclei_cve, scan_target_authenticated,
-    _extract_json, _extract_js_libs,
+    _extract_js_libs,
 )
+# Retired: scan_target_ai_chain, _extract_json. Replacement lives in
+# scanner/ai_triage.py — see test_ai_triage.py.
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def test_extract_json_handles_raw_object():
-    assert _extract_json('{"x": 1}') == {"x": 1}
-
-
-def test_extract_json_handles_prose_then_json():
-    assert _extract_json('Here are findings: {"findings": []} ok') == {"findings": []}
-
-
-def test_extract_json_handles_code_fences():
-    txt = "```json\n{\"findings\": [{\"severity\":\"HIGH\"}]}\n```"
-    assert _extract_json(txt).get("findings")[0]["severity"] == "HIGH"
-
-
-# ── Module 1: AI reasoning ─────────────────────────────────────────────────
-
-class TestAiChain:
-    SHARED_FINDINGS = {
-        "findings": [{
-            "severity": "CRITICAL",
-            "title": "IDOR via sequential user IDs",
-            "description": "Foo",
-            "evidence": "GET /api/users/2 returns other user's data",
-            "attack_chain": "1. login 2. swap id 3. profit",
-        }]
-    }
-
-    def test_emits_findings_from_single_model(self, monkeypatch):
-        """Single-model CRITICAL is now demoted to HIGH by the consensus gate
-        (need 2+ models agreeing for CRITICAL)."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        with patch("scanner.advanced._db_find_run_findings", return_value=[]), \
-             patch("scanner.advanced._curl", return_value=("200", "text/html", "<html>x</html>")), \
-             patch("scanner.advanced._ai_call_claude",
-                   return_value=json.dumps(self.SHARED_FINDINGS)):
-            findings = scan_target_ai_chain("r1", "x.com", "t")
-        assert findings
-        # Single-model CRITICAL → demoted to HIGH
-        assert findings[0]["severity"] == "HIGH"
-        assert findings[0]["tool"] == "ai-claude"
-        assert "IDOR" in findings[0]["title"]
-        assert "demoted" in findings[0]["title"].lower()
-
-    def test_consensus_tag_when_two_models_agree(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
-        monkeypatch.setenv("OPENAI_API_KEY", "dummy")
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        with patch("scanner.advanced._db_find_run_findings", return_value=[]), \
-             patch("scanner.advanced._curl", return_value=("200", "text/html", "")), \
-             patch("scanner.advanced._ai_call_claude",
-                   return_value=json.dumps(self.SHARED_FINDINGS)), \
-             patch("scanner.advanced._ai_call_openai",
-                   return_value=json.dumps(self.SHARED_FINDINGS)):
-            findings = scan_target_ai_chain("r1", "x.com", "t")
-        consensus = [f for f in findings if f["tool"] == "ai-consensus"]
-        assert consensus, f"two-model agreement should be tagged ai-consensus; got {[f['tool'] for f in findings]}"
-
-    def test_no_keys_no_op(self, monkeypatch):
-        for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
-            monkeypatch.delenv(k, raising=False)
-        assert scan_target_ai_chain("r1", "x.com", "t") == []
-
-    def test_severity_max_across_models(self, monkeypatch):
-        """If Claude says HIGH and OpenAI says CRITICAL for the same finding,
-        final severity = CRITICAL."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
-        monkeypatch.setenv("OPENAI_API_KEY", "dummy")
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        low = {"findings": [{"severity": "HIGH", "title": "Same title"}]}
-        high = {"findings": [{"severity": "CRITICAL", "title": "Same title"}]}
-        with patch("scanner.advanced._db_find_run_findings", return_value=[]), \
-             patch("scanner.advanced._curl", return_value=("200", "text/html", "")), \
-             patch("scanner.advanced._ai_call_claude", return_value=json.dumps(low)), \
-             patch("scanner.advanced._ai_call_openai", return_value=json.dumps(high)):
-            findings = scan_target_ai_chain("r1", "x.com", "t")
-        assert findings[0]["severity"] == "CRITICAL"
+# JSON-extraction tests moved to test_ai_triage.py (TestJsonParse).
+# AI-chain fan-out tests retired with the module.
 
 
 # ── Module 4: Takeover ─────────────────────────────────────────────────────
@@ -396,61 +323,9 @@ class TestGithubDorkOwnOrgFilter:
         assert hits[0]["severity"] == "HIGH"
 
 
-class TestAiConsensusGating:
-    """Fix 4 — single-model CRITICAL demoted to HIGH; noise phrases demote further."""
-
-    def _run_with_ais(self, monkeypatch, claude_findings=None, openai_findings=None,
-                       gemini_findings=None):
-        for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
-            monkeypatch.setenv(k, "dummy")
-        from scanner.advanced import scan_target_ai_chain
-        with patch("scanner.advanced._db_find_run_findings", return_value=[]), \
-             patch("scanner.advanced._curl", return_value=("200", "text/html", "<html>x</html>")), \
-             patch("scanner.advanced._ai_call_claude",
-                   return_value=json.dumps({"findings": claude_findings or []})), \
-             patch("scanner.advanced._ai_call_openai",
-                   return_value=json.dumps({"findings": openai_findings or []})), \
-             patch("scanner.advanced._ai_call_gemini",
-                   return_value=json.dumps({"findings": gemini_findings or []})):
-            return scan_target_ai_chain("r1", "target.com", "t")
-
-    def test_single_model_critical_demoted_to_high(self, monkeypatch):
-        findings = self._run_with_ais(monkeypatch, claude_findings=[
-            {"severity": "CRITICAL", "title": "Serious thing", "evidence": "legit"},
-        ])
-        assert findings
-        assert findings[0]["severity"] == "HIGH", f"got {findings[0]['severity']}"
-        assert "demoted" in findings[0]["title"].lower()
-
-    def test_consensus_keeps_critical(self, monkeypatch):
-        same_finding = {"severity": "CRITICAL", "title": "Shared bug", "evidence": "ok"}
-        findings = self._run_with_ais(monkeypatch,
-                                       claude_findings=[same_finding],
-                                       openai_findings=[same_finding])
-        consensus = [f for f in findings if f["tool"] == "ai-consensus"]
-        assert consensus
-        assert consensus[0]["severity"] == "CRITICAL"
-
-    def test_noise_phrase_demotes_single_model_finding(self, monkeypatch):
-        """Evidence containing 'no rate limiting' (known-FP signature from our
-        broken rate-limit module) demotes one notch."""
-        findings = self._run_with_ais(monkeypatch, claude_findings=[
-            {"severity": "HIGH", "title": "Unprotected port",
-             "evidence": "Scanner found no rate limiting on port 8080"},
-        ])
-        assert findings[0]["severity"] == "MEDIUM", \
-            f"noise-phrase demotion failed: {findings[0]}"
-
-    def test_own_org_github_url_demotes(self, monkeypatch):
-        """Evidence that cites a github.com/target/ URL AND contains the
-        'sdk-examples' noise phrase gets two demotions: noise → MEDIUM,
-        own-org → LOW."""
-        findings = self._run_with_ais(monkeypatch, claude_findings=[
-            {"severity": "HIGH", "title": "Leaked SDK",
-             "evidence": "https://github.com/target/target-sdk-examples/file.py"},
-        ])
-        # HIGH → MEDIUM (noise phrase 'sdk-examples') → LOW (own-org github.com/target/).
-        assert findings[0]["severity"] == "LOW"
+# TestAiConsensusGating retired along with the scan_target_ai_chain module.
+# The replacement (scanner/ai_triage.py) uses live-verify instead of
+# consensus-gate; its own tests live in test_ai_triage.py.
 
 
 class TestNucleiCve:

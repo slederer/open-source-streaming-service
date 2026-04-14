@@ -1812,11 +1812,15 @@ try:
         scan_target_crawl, scan_target_dorking, scan_target_wayback,
     )
     from scanner.advanced import (
-        scan_target_ai_chain, scan_target_subdomain_deep, scan_target_takeover,
+        scan_target_subdomain_deep, scan_target_takeover,
         scan_target_github_org, scan_target_default_creds, scan_target_js_cve,
         scan_target_idor, scan_target_render, scan_target_authenticated,
         scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
         scan_target_waf_gate,
+    )
+    from scanner.ai_triage import (
+        scan_target_ai_triage, scan_target_ai_openapi_deep,
+        scan_target_ai_js_analyze,
     )
 except ImportError:
     # Flat-file layout on EC2 — same namespace fix used for admin/security.
@@ -1824,11 +1828,15 @@ except ImportError:
         scan_target_crawl, scan_target_dorking, scan_target_wayback,
     )
     from scanner_advanced import (  # type: ignore
-        scan_target_ai_chain, scan_target_subdomain_deep, scan_target_takeover,
+        scan_target_subdomain_deep, scan_target_takeover,
         scan_target_github_org, scan_target_default_creds, scan_target_js_cve,
         scan_target_idor, scan_target_render, scan_target_authenticated,
         scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
         scan_target_waf_gate,
+    )
+    from scanner_ai_triage import (  # type: ignore
+        scan_target_ai_triage, scan_target_ai_openapi_deep,
+        scan_target_ai_js_analyze,
     )
 
 # Scan modules with human-readable descriptions
@@ -1868,8 +1876,16 @@ SCAN_MODULES = [
     ("s3_cloud",        "Cloud misconfiguration",           "scan_target_s3_cloud"),
     ("nuclei_cve",      "Nuclei CVE + takeover templates",  "scan_target_nuclei_cve"),
     ("accessibility",   "Privacy & compliance audit",       "scan_target_accessibility"),
-    # AI reasoning must run LAST — it reviews everything above.
-    ("ai_chain",        "AI reasoning (Claude+OpenAI+Gemini)","scan_target_ai_chain"),
+    # Structured AI modules (replaces the retired `ai_chain` fuzzy reasoner).
+    # Each has narrow structured I/O and live-verifies its own claims before
+    # emitting a finding.
+    ("ai_openapi",      "AI OpenAPI deep audit (verified)", "scan_target_ai_openapi_deep"),
+    ("ai_js",           "AI JS bundle analysis (verified)", "scan_target_ai_js_analyze"),
+    # Triage must run LAST — it reviews every HIGH/CRIT produced above,
+    # demotes the ones Sonnet classifies as false positive, and re-verifies
+    # the ones flagged as needs_verification. Never creates new findings,
+    # only mutates existing ones + emits a single INFO summary.
+    ("ai_triage",       "AI finding triage (demotes FPs)",  "scan_target_ai_triage"),
 ]
 
 

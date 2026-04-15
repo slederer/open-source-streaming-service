@@ -6798,20 +6798,45 @@ VIEWS.overview = async () => {
 
     <div class="card">
       <h2>Scanning capabilities</h2>
+      <div style="color:var(--text-muted);font-size:0.85rem;margin-bottom:16px;">40+ modules run on every scan, organized into 5 categories.</div>
       <div class="grid grid-cards" style="gap:12px;">
         ${[
-          ['&#128065;', 'Network', 'nmap, TLS, DNS'],
-          ['&#9993;', 'Email DNS', 'SPF, DMARC, CAA'],
-          ['&#128275;', 'Secrets', '22 provider patterns'],
-          ['&#128202;', 'Headers', 'CSP, CORS, HSTS'],
-          ['&#128279;', 'Endpoints', '/docs, /.env, /.git'],
-          ['&#129504;', 'LLM security', 'Prompt injection, jailbreak'],
-          ['&#128736;', 'BaaS audit', 'Supabase RLS, Firebase'],
-          ['&#127760;', 'Subdomains', 'CT log enumeration'],
-          ['&#128274;', 'JWT', 'Alg confusion, weak secrets'],
-          ['&#9999;', 'Rate limit', 'Brute force resistance'],
-          ['&#128269;', 'Exploit tests', 'SSRF, traversal, XSS (opt-in)'],
-          ['&#128187;', 'Code review', 'GitHub repo scan'],
+          // Network + transport
+          ['&#128065;', 'Network', 'nmap port scan, default-port DB probe (Redis/Mongo/ES/Kibana/CouchDB/Neo4j)'],
+          ['&#128274;', 'TLS', 'Cert chain, expiry, weak ciphers, SAN audit'],
+          ['&#128202;', 'Headers', 'HSTS, CSP, CORS, X-Frame, Referrer-Policy on :80 and :443'],
+          ['&#127760;', 'CDN / WAF fingerprint', 'Cloudflare, Akamai, CloudFront, Fastly, Vercel, Netlify, Imperva'],
+          // Application
+          ['&#128279;', 'Exposed endpoints', '/docs, /.env, /.git/config, /actuator/env, /terraform.tfstate (~25 paths)'],
+          ['&#128737;', 'OpenAPI audit', 'Spec parse + auth-bypass detection + dangerous-op classification'],
+          ['&#127919;', 'API fuzz', 'SQL/NoSQL/LDAP injection signatures'],
+          ['&#128737;&#65039;', 'GraphQL', 'Introspection probe, password-field detection, dangerous mutations'],
+          // Auth + session
+          ['&#128273;', 'JWT audit', 'Alg=none, kid injection, ~35 weak-secret crack list'],
+          ['&#128640;', 'OAuth', 'Open-redirect on redirect_uri, PKCE bypass'],
+          ['&#128683;', 'Session entropy', 'Shannon entropy + sequential-token detection on Set-Cookie'],
+          ['&#128737;', 'Auth probes', 'Username enum, weak-password acceptance'],
+          // Secrets + supply chain
+          ['&#128275;', 'Secret scan', '38 provider patterns: Anthropic, OpenAI, AWS, Stripe, Clerk, Supabase service_role, npm, PyPI, GCP/Azure, etc.'],
+          ['&#128105;&#8205;&#128187;', 'Supply chain', 'Vulnerable JS libs, typosquatted npm deps'],
+          // BaaS + cloud
+          ['&#128736;', 'Supabase deep-probe', 'JS-bundle table extraction → RLS audit + storage bucket LIST + edge-function enumeration'],
+          ['&#128293;', 'Firebase / Hasura', 'Firestore multi-collection probe, Hasura anonymous-role audit'],
+          ['&#9729;&#65039;', 'S3 / GCS', 'Bucket extraction from JS + LIST probe + dictionary attack'],
+          ['&#128274;', 'BaaS detection', 'Clerk, NextAuth — config + misuse audit'],
+          // OSINT + AI
+          ['&#127760;', 'Subdomain enum', 'Certificate Transparency + DNS brute + port check'],
+          ['&#128679;', 'Subdomain takeover', 'Vercel, Netlify, Unbounce, GitHub Pages, S3, Heroku CNAMEs'],
+          ['&#129504;', 'AI-assisted', 'Sonnet OpenAPI deep-audit, JS analyzer, finding triage'],
+          ['&#128172;', 'Prompt injection', 'Chat-endpoint compliance + system-prompt disclosure probes'],
+          ['&#128269;', 'IDOR / BOLA', 'ID-sweep on discovered endpoints + PII-leak detection'],
+          // Infrastructure + IaC
+          ['&#128640;', 'K8s / Docker', 'Unauth kubelet :10250, Docker API :2375'],
+          ['&#9888;&#65039;', 'CVE templates', 'Nuclei 8000+ templates'],
+          ['&#9993;&#65039;', 'Email DNS', 'SPF, DMARC, CAA, dangling-include detection'],
+          ['&#128241;', 'GitHub dorks', 'Secret hits near target domain'],
+          ['&#128190;', 'Code review', 'GitHub repo scan: secrets + npm-audit + IaC'],
+          ['&#128241;', 'Mobile apps', 'IPA / APK upload — secrets, ATS, cleartext, hardcoded keys'],
         ].map(([i, n, d]) => `<div class="card-sm" style="background:var(--sidebar);border:1px solid var(--border);border-radius:8px;padding:12px;"><div style="font-size:1.2rem;margin-bottom:4px;">${i}</div><div style="font-weight:600;font-size:0.85rem;">${n}</div><div style="color:var(--text-muted);font-size:0.75rem;margin-top:2px;">${d}</div></div>`).join('')}
       </div>
     </div>`;
@@ -7636,8 +7661,8 @@ VIEWS.integrations = async () => {
     <div class="grid grid-2">
       <div class="card">
         <h3>MCP Server</h3>
-        <h2 style="margin-bottom:6px;">Claude Code, Cursor, Cline, Windsurf</h2>
-        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">Add to <code>~/.claude/settings.json</code>:</p>
+        <h2 style="margin-bottom:6px;">Claude Code · Claude Desktop · Cursor · Cline · Windsurf</h2>
+        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">Add to <code>~/.claude/settings.json</code> (or your tool's MCP config):</p>
         <div class="copy-code" id="mcp-config">{
   "mcpServers": {
     "security-scanner": {
@@ -7647,7 +7672,7 @@ VIEWS.integrations = async () => {
     }
   }
 }<button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('mcp-config').innerText);this.textContent='Copied';">Copy</button></div>
-        <p style="color:var(--text-muted);font-size:0.8rem;margin-top:10px;">Then type <code>/security-scan</code> in Claude Code.</p>
+        <p style="color:var(--text-muted);font-size:0.8rem;margin-top:10px;">Then type <code>/security-scan</code> in Claude Code, or invoke the <code>security-scanner</code> tool from any MCP client.</p>
       </div>
       <div class="card">
         <h3>ChatGPT GPT</h3>
@@ -7655,17 +7680,19 @@ VIEWS.integrations = async () => {
         <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">We provide an OAuth flow so ChatGPT users can one-click connect.</p>
         <a class="btn btn-outline" href="/chatgpt-setup">Setup guide</a>
       </div>
-      <div class="card">
+      <div class="card" style="opacity:0.55;position:relative;">
+        <span style="position:absolute;top:12px;right:12px;background:var(--sidebar);border:1px solid var(--border);color:var(--text-muted);font-size:0.65rem;font-weight:600;padding:3px 8px;border-radius:4px;text-transform:uppercase;letter-spacing:0.04em;">Coming soon</span>
         <h3>GitHub Copilot</h3>
         <h2 style="margin-bottom:6px;">Scan from Copilot Chat</h2>
-        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">Install our Copilot Extension from the GitHub Marketplace, then use <code>@security-scanner scan https://myapp.com</code>.</p>
-        <a class="btn btn-outline" href="https://github.com/marketplace" target="_blank">GitHub Marketplace</a>
+        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">Backend ready (<code>/copilot</code> endpoint with the GitHub Copilot Extension protocol). Pending GitHub Marketplace approval; once listed, install and use <code>@security-scanner scan https://myapp.com</code>.</p>
+        <button class="btn btn-outline" disabled style="opacity:0.6;cursor:not-allowed;">Awaiting marketplace listing</button>
       </div>
-      <div class="card">
+      <div class="card" style="opacity:0.55;position:relative;">
+        <span style="position:absolute;top:12px;right:12px;background:var(--sidebar);border:1px solid var(--border);color:var(--text-muted);font-size:0.65rem;font-weight:600;padding:3px 8px;border-radius:4px;text-transform:uppercase;letter-spacing:0.04em;">Coming soon</span>
         <h3>Vercel</h3>
         <h2 style="margin-bottom:6px;">Auto-scan on deploy</h2>
-        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">Install our Vercel Integration to scan every deployment automatically.</p>
-        <a class="btn btn-outline" href="https://vercel.com/integrations" target="_blank">Vercel Marketplace</a>
+        <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:12px;">Backend ready (<code>/vercel/webhook</code> with HMAC signature verification). Pending Vercel Marketplace approval. In the meantime, you can configure the webhook manually — email <a href="mailto:stefan@securityscanner.dev" style="color:var(--brand);">stefan@securityscanner.dev</a>.</p>
+        <button class="btn btn-outline" disabled style="opacity:0.6;cursor:not-allowed;">Awaiting marketplace listing</button>
       </div>
     </div>
     <div class="card" style="margin-top:20px;">

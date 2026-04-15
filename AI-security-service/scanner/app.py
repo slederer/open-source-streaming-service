@@ -78,14 +78,20 @@ app.add_middleware(
 
 
 _CACHEABLE_PATH_PREFIXES = ("/blog", "/docs/api", "/docs")
-_CACHEABLE_EXACT = {"/", "/contact", "/privacy", "/terms"}
+_CACHEABLE_EXACT = {"/contact", "/privacy", "/terms"}
+# `/` is intentionally NOT cached — it returns the landing page for anon
+# users but the dashboard HTML for signed-in users. If we set Cache-Control
+# on the landing-page response, browsers happily serve it back to the same
+# user post-login, which then JS-redirects to /login on a stale session.
+# Observed 2026-04-15 — fix is just to never touch / with cache headers.
 
 
 @app.middleware("http")
 async def _public_page_cache_headers(request: Request, call_next):
     """Add Cache-Control to the public, read-only pages so Cloudflare can
     cache at the edge. Critical before HN launch — thousands of pageviews
-    hit origin uncached otherwise. Auth-gated pages are NOT cached."""
+    hit origin uncached otherwise. Auth-gated and personalized pages
+    (anything under `/`) are NOT cached."""
     response = await call_next(request)
     if request.method != "GET":
         return response
@@ -95,11 +101,7 @@ async def _public_page_cache_headers(request: Request, call_next):
     )
     # Skip if already set (e.g., the /health endpoint has no-cache)
     if is_cacheable and "cache-control" not in {k.lower() for k in response.headers}:
-        # Home dashboard returns personalized content when signed in —
-        # detect via the session cookie's presence and skip caching then.
-        has_session = "session" in request.cookies
-        if not (path == "/" and has_session):
-            response.headers["Cache-Control"] = "public, max-age=300, s-maxage=1800"
+        response.headers["Cache-Control"] = "public, max-age=300, s-maxage=1800"
     return response
 
 

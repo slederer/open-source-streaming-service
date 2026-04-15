@@ -5892,7 +5892,7 @@ await fetch("https://securityscanner.dev/v1/targets", {
 <p>All endpoints require a bearer token in the <code>Authorization</code> header. Generate keys at <a href="/keys">/keys</a>.</p>
 <pre><code>Authorization: Bearer sk-sec-YOUR_KEY</code></pre>
 <p>Keys are scoped to your account. Every scan you trigger counts against your plan. You can have multiple keys; revoke individually at <a href="/keys">/keys</a>.</p>
-<div class="tip">The same key works for: REST API, MCP server, ChatGPT Custom Actions, GitHub Copilot Extension, Vercel Integration.</div>
+<div class="tip">The same key works for: REST API, MCP server, ChatGPT Custom Actions. (GitHub Copilot Extension and Vercel Integration are coming once the marketplace listings are approved.)</div>
 
 <h2 id="scan">Start a scan</h2>
 <div class="endpoint">
@@ -6096,8 +6096,8 @@ targets:
 <ul>
   <li><strong>MCP server</strong> — drop <code>securityscanner</code> into your <code>.mcp.json</code>. Works with Claude Code, Claude Desktop, Cursor, Cline, Windsurf.</li>
   <li><strong>ChatGPT Custom GPT</strong> — import <a href="/v1/openapi.json">/v1/openapi.json</a> as Actions. See <a href="/chatgpt-setup">/chatgpt-setup</a>.</li>
-  <li><strong>GitHub Copilot Extension</strong> — <code>@security-scanner scan my.app</code> in any chat.</li>
-  <li><strong>Vercel Integration</strong> — auto-scans every production deploy.</li>
+  <li><strong>GitHub Copilot Extension</strong> <span style="background:#1f2937;color:#9ca3af;font-size:0.7rem;padding:2px 6px;border-radius:4px;text-transform:uppercase;letter-spacing:0.04em;margin-left:6px;">Coming soon</span> — backend ready (<code>/copilot</code> endpoint), pending GitHub Marketplace approval.</li>
+  <li><strong>Vercel Integration</strong> <span style="background:#1f2937;color:#9ca3af;font-size:0.7rem;padding:2px 6px;border-radius:4px;text-transform:uppercase;letter-spacing:0.04em;margin-left:6px;">Coming soon</span> — webhook endpoint live, pending Vercel Marketplace approval. Email <a href="mailto:stefan@securityscanner.dev">stefan@securityscanner.dev</a> for manual setup.</li>
   <li><strong>Python / TypeScript SDK</strong> — planned. For now use <code>httpx</code> or <code>fetch</code> directly — the API is 5 endpoints.</li>
 </ul>
 

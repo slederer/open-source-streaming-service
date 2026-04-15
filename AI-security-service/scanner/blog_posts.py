@@ -47,7 +47,7 @@ POSTS = [
         "date": "2026-03-22",
         "excerpt": "No marketing fluff — a direct walkthrough of every module we run.",
         "body": """
-<p>When you scan an app, we run 40+ modules organized into 5 categories. Here's each one, what it looks for, and what severity it can produce.</p>
+<p>When you scan an app, we run 50+ modules organized into 7 categories. Here's each one, what it looks for, and what severity it can produce.</p>
 
 <h2>1. Transport & network</h2>
 <ul>
@@ -68,30 +68,51 @@ POSTS = [
   <li><strong>GraphQL introspection</strong> — POST introspection query; flags <code>password</code> fields, dangerous mutations</li>
 </ul>
 
-<h2>3. Secrets & BaaS</h2>
+<h2>3. Secrets &amp; BaaS</h2>
 <ul>
-  <li><strong>Secret scanner</strong> — regex patterns for 20+ provider keys (Anthropic, OpenAI, AWS, Stripe, GitHub, Google, SendGrid, etc.); decodes JWTs to catch Supabase <code>service_role</code> keys specifically</li>
-  <li><strong>BaaS detection + audit</strong> — Supabase, Firebase, Clerk, NextAuth detection; Supabase RLS probe via anon key with real table names extracted from the JS bundle</li>
-  <li><strong>Supabase storage</strong> — tests bucket LIST endpoints for public enumeration</li>
+  <li><strong>Secret scanner</strong> — regex patterns for 38 provider keys (Anthropic <code>sk-ant-*</code>, OpenAI <code>sk-proj-*</code>, AWS <code>AKIA*</code>, Stripe <code>sk_live_*</code>, GitHub <code>ghp_*</code>, Google <code>AIza*</code>, GCP service-account JSON, Azure storage connection strings, Digital Ocean <code>dop_v1_*</code>, Vercel, Netlify, npm publish tokens, PyPI, LangSmith, Pinecone, Weaviate, Cloudflare, Heroku, Resend, SendGrid, Mailgun, Slack, etc.). Special: decodes JWTs to catch Supabase <code>service_role</code> keys (the catastrophic one).</li>
+  <li><strong>Supabase deep-probe</strong> — Detects Supabase from JS bundle, extracts the anon key + every <code>.from('table')</code> + <code>.rpc()</code> + <code>.storage.from('bucket')</code> + <code>.functions.invoke()</code> reference. Probes each table for RLS misconfig, lists each storage bucket, enumerates edge functions.</li>
+  <li><strong>Firebase + Firestore</strong> — Detects Firebase from JS, extracts <code>.collection('xyz')</code> names, probes each collection with the apiKey for Firestore rules misconfig. Also probes Realtime DB <code>/.json</code> root.</li>
+  <li><strong>Hasura</strong> — Detects Hasura GraphQL endpoints, tests <code>x-hasura-role: anonymous</code> introspection + sensitive-table queries.</li>
+  <li><strong>Clerk + NextAuth</strong> — detection + misconfig audit (NextAuth missing-secret, Clerk admin-key leaks).</li>
 </ul>
 
-<h2>4. AI-assisted modules</h2>
+<h2>4. Auth + session</h2>
 <ul>
-  <li><strong>AI OpenAPI deep audit</strong> — Sonnet classifies every endpoint in the spec as destructive/data_read/data_write/safe, then live-probes only the unauthed GETs to verify</li>
-  <li><strong>AI JS analyzer</strong> — extracts API endpoints + auth patterns from the bundle, probes each</li>
-  <li><strong>AI triage</strong> — post-processes AI-originated findings against known false-positive patterns (admin-subdomain login pages, NextAuth /api/auth/session, etc.)</li>
-  <li><strong>Prompt-injection probe</strong> — for chat/AI endpoints: tests compliance with injected canary instructions + system-prompt disclosure</li>
+  <li><strong>JWT audit</strong> — alg=none acceptance, kid injection, HS256 weak-secret crack against ~35 common values (local compute, no extra target traffic).</li>
+  <li><strong>OAuth audit</strong> — open-redirect probe on <code>redirect_uri</code> across 7 common OAuth paths.</li>
+  <li><strong>Session entropy</strong> — samples Set-Cookie across 5 requests; flags low-entropy or sequential-numeric session tokens.</li>
+  <li><strong>Auth probes</strong> — username enumeration via login-response delta; weak-password acceptance on signup.</li>
+  <li><strong>IDOR / BOLA</strong> — for ID-bearing endpoints discovered by the JS analyzer, sweeps IDs 1-3 and detects (a) distinct unauthenticated responses (BOLA pattern, HIGH) or (b) PII leaks in the body (CRITICAL).</li>
 </ul>
 
-<h2>5. OSINT & supply chain</h2>
+<h2>5. Cloud + infrastructure</h2>
 <ul>
-  <li><strong>Subdomain enumeration</strong> — Certificate Transparency logs</li>
-  <li><strong>Subdomain deep-scan</strong> — DNS brute + port check on discovered subdomains</li>
-  <li><strong>Takeover detection</strong> — CNAME chain analysis against known takeover fingerprints (Vercel, Netlify, Unbounce, GitHub Pages, S3, Heroku)</li>
-  <li><strong>JS library CVE</strong> — identifies vulnerable jQuery/lodash/moment versions by banner + @version syntax</li>
-  <li><strong>Nuclei CVE</strong> — 8000+ community templates (log4j, spring4shell, etc.)</li>
-  <li><strong>Google dork + GitHub dork</strong> — searches for secrets near the target's domain name</li>
-  <li><strong>Email deep-dive</strong> — SPF, DMARC, DKIM, DNS dangling-include check</li>
+  <li><strong>S3 + GCS bucket exposure</strong> — extracts bucket names from JS (<code>*.s3.amazonaws.com</code>, <code>storage.googleapis.com/&lt;bucket&gt;</code>) + dictionary attack from apex domain. Probes each for public LIST.</li>
+  <li><strong>Default-port DB / service probe</strong> — Redis :6379 (INFO), Memcached :11211 (stats), MongoDB :27017, Elasticsearch :9200, Kibana :5601, CouchDB :5984, Neo4j :7474, Jenkins, Portainer, Hadoop NameNode, RethinkDB. Skips private IPs.</li>
+  <li><strong>Infra-leak paths</strong> — 25 known-leaky paths: <code>/actuator/env</code>, <code>/_ignition/execute-solution</code>, <code>/_debugbar</code>, <code>/telescope</code>, <code>/server-status</code>, <code>/phpinfo.php</code>, <code>/.git/config</code>, <code>/terraform.tfstate</code>, <code>/docker-compose.yml</code>, <code>/.env</code> variants, <code>/wp-config.php.bak</code>, <code>/WEB-INF/web.xml</code>, etc. SPA-fallback guard prevents false positives.</li>
+  <li><strong>K8s + Docker unauth APIs</strong> — kubelet :10250 <code>/pods</code>, Docker Engine :2375 <code>/version</code>, Prometheus :9090 <code>/metrics</code>.</li>
+  <li><strong>WAF/CDN fingerprint</strong> — identifies Cloudflare, Akamai, CloudFront, Fastly, Vercel Edge, Netlify Edge, Imperva/Incapsula, Sucuri, F5 BIG-IP, Azure Front Door, Barracuda. Flags origins with no edge protection.</li>
+</ul>
+
+<h2>6. AI-assisted modules</h2>
+<ul>
+  <li><strong>AI OpenAPI deep audit</strong> — Sonnet classifies every endpoint in the spec as destructive/data_read/data_write/safe, then live-probes only the unauthed GETs to verify.</li>
+  <li><strong>AI JS analyzer</strong> — extracts API endpoints + auth patterns + secrets from the bundle, probes each.</li>
+  <li><strong>AI triage</strong> — post-processes AI-originated findings against known false-positive patterns. 180-second wall-clock budget per target.</li>
+  <li><strong>Prompt-injection probe</strong> — for chat/AI endpoints discovered in the JS bundle: tests compliance with injected canary instructions + system-prompt disclosure (max 2 short probes per endpoint, scanner-labeled).</li>
+</ul>
+
+<h2>7. OSINT &amp; supply chain</h2>
+<ul>
+  <li><strong>Subdomain enumeration</strong> — Certificate Transparency logs.</li>
+  <li><strong>Subdomain deep-scan</strong> — DNS brute + port check on discovered subdomains.</li>
+  <li><strong>Subdomain takeover</strong> — CNAME chain analysis against known takeover fingerprints (Vercel, Netlify, Unbounce, GitHub Pages, S3, Heroku, Tumblr, Tilda, etc.).</li>
+  <li><strong>JS library CVE</strong> — identifies vulnerable jQuery / lodash / moment versions by banner + <code>@version</code> syntax.</li>
+  <li><strong>Typosquatted deps</strong> — checks JS bundle for known-typosquatted npm package imports (<code>cross-env.js</code>, <code>discord.dll</code>, <code>babelcli</code>, etc.).</li>
+  <li><strong>Nuclei CVE</strong> — 8000+ community templates (log4j, spring4shell, etc.).</li>
+  <li><strong>Google dork + GitHub dork</strong> — searches for secrets near the target's domain name.</li>
+  <li><strong>Email deep-dive</strong> — SPF, DMARC, DKIM, DNS dangling-include check.</li>
 </ul>
 
 <h2>What we don't do (by design)</h2>

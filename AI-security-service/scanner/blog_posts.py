@@ -246,55 +246,96 @@ POSTS = [
             "hundreds of apps. Here's why."
         ),
         "body": """
-<p>If you've followed our batches, you've seen the pattern: we scan 28 Supabase-backed apps, 13 of them have at least one table readable by anyone. That's a 46% critical-rate on a single failure mode.</p>
+<p>If you've followed our scanning batches, you've seen the pattern. In our most recent run of 28 Supabase-backed apps (Lovable, Bolt, Replit), <strong>5 apps had at least one table readable by anyone holding the public anon key</strong>. The worst single app had 11 tables exposed. Across the cohort: 13 individual table-leak findings.</p>
 
-<p>RLS — Row Level Security — is the one Supabase setting that separates "toy app" from "production app". It's also the one new Supabase developers almost universally miss.</p>
+<p>That's 18% of apps with a critical RLS misconfiguration on a single failure mode. Not a long-tail bug — a recurring shape.</p>
 
 <h2>The model</h2>
 
-<p>Supabase gives you three ways to query your database from the client:</p>
+<p>Supabase exposes a single Postgres database via PostgREST. There are two keys:</p>
+
+<ul>
+  <li><strong><code>anon</code></strong> — a JWT with <code>role: anon</code>. Designed to ship to the browser. Every visitor of your app holds it.</li>
+  <li><strong><code>service_role</code></strong> — a JWT with <code>role: service_role</code>. <strong>Bypasses RLS entirely.</strong> Must stay server-side (any backend — Node, Python, Edge Function, etc.).</li>
+</ul>
+
+<p>Once a user logs in, their browser presents a third JWT signed by Supabase Auth that includes their <code>sub</code> (user ID). That's the value <code>auth.uid()</code> reads inside RLS policies.</p>
+
+<p>All requests hit the same PostgREST endpoint. What the database returns depends entirely on which JWT is presented and what RLS policies say about it.</p>
+
+<h2>What RLS actually controls</h2>
+
+<p>RLS = Row Level Security, a Postgres feature (not a Supabase invention). For each table you can:</p>
+
+<ul>
+  <li><strong>Disable RLS entirely</strong> — any role with <code>SELECT</code> grant on the table reads everything. The Supabase <code>anon</code> role has <code>SELECT</code> on everything in <code>public</code> by default.</li>
+  <li><strong>Enable RLS with no policies</strong> — the default-deny state. Even the table owner reads nothing through RLS. (<code>service_role</code> still bypasses.)</li>
+  <li><strong>Enable RLS + one or more policies</strong> — each policy is a SQL expression that filters rows visible to a given role/operation. Common: <code>CREATE POLICY "owner_read" ON x FOR SELECT USING (auth.uid() = owner_id);</code></li>
+</ul>
+
+<p>Two failure modes, both common:</p>
 
 <ol>
-  <li>Direct REST queries with the public <code>anon</code> key (<code>supabase.from('x').select('*')</code>)</li>
-  <li>Row-level queries scoped by <code>auth.uid()</code> (after login)</li>
-  <li>Server-side queries via an Edge Function with the <code>service_role</code> key</li>
+  <li><strong>RLS off.</strong> Every table row is anon-readable.</li>
+  <li><strong>RLS on, permissive policy</strong> like <code>USING (true)</code>. Same effect — every row is anon-readable.</li>
 </ol>
 
-<p>All three hit the same Postgres database. The difference is entirely about what the database is allowed to return. That control happens via RLS policies.</p>
+<h2>Why "the default" is more nuanced than you'd think</h2>
 
-<p>If a table has RLS disabled, the anon key can read everything. If a table has RLS enabled with a permissive policy (like <code>USING (true)</code>), the anon key can still read everything. If RLS is on and the policy says <code>USING (auth.uid() = user_id)</code>, only the logged-in user sees their own rows.</p>
+<p>Two ways to create a table in Supabase:</p>
 
-<h2>The default is wrong (for the common case)</h2>
+<ul>
+  <li><strong>Dashboard → Table Editor.</strong> The "Enable Row Level Security" checkbox defaults to <em>checked</em> (since 2024). You'll get RLS-on with no policies — table is locked by default until you add a policy. This is the safe path.</li>
+  <li><strong>SQL Editor / migrations / CLI <code>supabase db push</code>.</strong> Plain <code>CREATE TABLE</code> statements get RLS-off, like vanilla Postgres. The dashboard shows a yellow warning banner once it notices, but the table is exposed in the meantime.</li>
+</ul>
 
-<p>Supabase ships tables with RLS <em>disabled</em> by default. The reasoning is: you might want this for development speed, or for shared read-only tables, or for backend-only tables that the anon key never touches.</p>
-
-<p>The reality is: Lovable, Bolt, v0, Cursor, and every AI assistant that scaffolds a Supabase-connected app tends to create tables with <code>CREATE TABLE ...</code> and move on. RLS stays off. The anon key is in the client bundle. The app "works". Everyone moves on.</p>
-
-<p>Three months later, a scanner like ours finds 11 tables leaking user data.</p>
+<p>AI assistants — Lovable, Bolt, v0, Cursor with Supabase MCP — overwhelmingly go through the SQL path because that's what they're trained to write. So the apps we scan, which are predominantly AI-scaffolded, end up with the SQL-path default: RLS off.</p>
 
 <h2>The failure is per-table, not per-project</h2>
 
-<p>Most devs hit this once on the <code>profiles</code> table while following the first tutorial, enable RLS, write the first policy, and move on. They think RLS is now "on". It's not — it's on <em>for that table</em>. Every new table gets the default again.</p>
+<p>The pattern we see most often: a developer follows the official "build a Twitter clone" tutorial, enables RLS on the <code>profiles</code> table when prompted, writes a couple of policies. They internalize "I've configured RLS." Three months later they (or their AI assistant) add <code>invoices</code>, <code>customer_contacts</code>, <code>subscription_history</code> tables via SQL — RLS off, no policies, anon-readable.</p>
 
-<p>In our last batch we found an app where <code>profiles</code> was correctly RLS-gated but <code>invoices</code>, <code>customer_contacts</code>, and <code>subscription_history</code> were wide open. The first table was the tutorial table. The other three were added later.</p>
+<p>One real example from our last batch: an app with <code>profiles</code> RLS-gated correctly, but 11 other tables added later — all wide open. Customer emails, account passwords (in a literal column), booking requests with phone numbers, chat messages.</p>
 
 <h2>Three concrete fixes</h2>
 
 <h3>1. The "every new table" habit</h3>
 
-<p>Make <code>ALTER TABLE ... ENABLE ROW LEVEL SECURITY;</code> the first thing you type after <code>CREATE TABLE</code>. Then write the policies. Supabase SQL Editor snippets help here.</p>
+<p>If you write SQL by hand, make this the snippet you reach for:</p>
 
-<h3>2. A project-level RLS default</h3>
+<pre><code>CREATE TABLE x (id bigint primary key, owner_id uuid, ...);
 
-<p>Supabase recently added <code>CREATE TABLE ... SECURITY DEFINER</code> variants and project-level settings to force RLS-on for new tables. Check your project's Database → Policies settings.</p>
+ALTER TABLE x ENABLE ROW LEVEL SECURITY;
 
-<h3>3. Weekly RLS audit</h3>
+CREATE POLICY "owner_can_select" ON x
+  FOR SELECT USING (auth.uid() = owner_id);
+CREATE POLICY "owner_can_modify" ON x
+  FOR ALL USING (auth.uid() = owner_id);</code></pre>
 
-<p>If you can't change the default, run a scan. We do it for free on one target. Pro plan runs it weekly and emails you if anything new broke.</p>
+<p>The ALTER + 2 policies are the minimum viable scaffold. Adjust the predicate per table.</p>
+
+<h3>2. A pre-deploy lint</h3>
+
+<p>Add a CI check that fails the build if any public-schema table has RLS off. Run this against your migration's resulting state, not against prod:</p>
+
+<pre><code>SELECT n.nspname, c.relname
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'r'
+  AND n.nspname = 'public'
+  AND c.relrowsecurity = false;</code></pre>
+
+<p>Empty result = pass. Any rows = fail the build with the offending table names.</p>
+
+<h3>3. Continuous external scan</h3>
+
+<p>The CI check catches new tables before deploy. An external scan catches drift after deploy — schema migrations, manual SQL, third-party functions. We do this for free on one target; the paid plans run it weekly and email you if anything new broke.</p>
 
 <h2>The platform fix</h2>
 
-<p>If you're a Lovable / Bolt / Cursor template author: add a check. Running <code>SELECT relname FROM pg_class WHERE relrowsecurity = false</code> catches the problem in five milliseconds. Surface it in the UI. This alone would prevent more security disclosures than any other single change in the AI-tooling ecosystem right now.</p>
+<p>If you're a Lovable / Bolt / Cursor template author or work on the Supabase team: surface the check above when an AI scaffold creates a new table via SQL. Five milliseconds of work, would prevent more critical disclosures than any single change in the AI-tooling ecosystem right now. The friction is purely social — devs see a "Enable RLS now?" prompt, click yes, write a policy. Don't ship.</p>
+
+<p>The ecosystem will fix this eventually. Until then, scan before you launch.</p>
 """,
     },
     {

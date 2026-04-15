@@ -7785,8 +7785,11 @@ _LANDING_HTML = """<!DOCTYPE html>
   section .sub { color: #9ca3af; text-align: center; margin-bottom: 48px; font-size: 1rem; }
 
   .integrations { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
-  .integration { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; text-align: center; transition: border-color 0.2s; }
+  .integration { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; text-align: center; transition: border-color 0.2s; position: relative; }
   .integration:hover { border-color: #dc2626; }
+  .integration.soon { opacity: 0.45; }
+  .integration.soon:hover { border-color: #1f2937; }
+  .integration .soon-tag { position: absolute; top: 8px; right: 8px; background: #1f2937; color: #9ca3af; font-size: 0.62rem; font-weight: 600; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
   .integration .name { font-weight: 600; margin-bottom: 4px; }
   .integration .desc { color: #6b7280; font-size: 0.8rem; }
 
@@ -7850,8 +7853,8 @@ _LANDING_HTML = """<!DOCTYPE html>
       <div class="integration"><div class="name">Cline</div><div class="desc">VS Code extension</div></div>
       <div class="integration"><div class="name">Windsurf</div><div class="desc">Native MCP</div></div>
       <div class="integration"><div class="name">ChatGPT</div><div class="desc">Custom GPT + Actions</div></div>
-      <div class="integration"><div class="name">GitHub Copilot</div><div class="desc">@security-scanner</div></div>
-      <div class="integration"><div class="name">Vercel</div><div class="desc">Post-deploy auto-scan</div></div>
+      <div class="integration soon"><span class="soon-tag">Coming soon</span><div class="name">GitHub Copilot</div><div class="desc">@security-scanner</div></div>
+      <div class="integration soon"><span class="soon-tag">Coming soon</span><div class="name">Vercel</div><div class="desc">Post-deploy auto-scan</div></div>
     </div>
   </div>
 </section>

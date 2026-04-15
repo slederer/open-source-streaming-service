@@ -6901,16 +6901,16 @@ function _renderTargetCard(runId, target, findings, gradeFor, diff) {
       <div class="target-card-body">
         ${['CRITICAL','HIGH','MEDIUM','LOW','INFO'].map(sev =>
           findings.filter(f => f.severity === sev).map(f => `
-            <div class="finding" onclick="this.classList.toggle('open')">
-              <div class="finding-head">
+            <div class="finding">
+              <div class="finding-head" onclick="if(window.getSelection().toString().length===0)this.parentElement.classList.toggle('open')" style="cursor:pointer;user-select:none;">
                 <span class="badge ${f.severity}">${f.severity}</span>
                 <span class="finding-title">${esc(f.title)}</span>
                 <span class="finding-tool">${esc(f.tool)}</span>
                 <span class="finding-chev">&#9654;</span>
               </div>
-              <div class="finding-body">
+              <div class="finding-body" style="user-select:text;">
                 ${f.description ? `<dt>Description</dt><dd>${esc(f.description)}</dd>` : ''}
-                ${f.evidence ? `<dt>Evidence</dt><dd>${esc(f.evidence)}</dd>` : ''}
+                ${f.evidence ? `<dt>Evidence</dt><dd style="font-family:'SF Mono',Menlo,monospace;font-size:0.82rem;white-space:pre-wrap;word-break:break-all;background:#0a0e17;padding:8px 10px;border-radius:4px;border:1px solid #1f2937;">${esc(f.evidence)}</dd>` : ''}
                 <dt>Category</dt><dd>${esc(f.category)}</dd>
               </div>
             </div>`).join('')).join('')}
@@ -7363,16 +7363,16 @@ VIEWS.findings = async (targetHost) => {
             <thead><tr><th>Severity</th><th>Finding</th><th>Category</th><th>Tool</th></tr></thead>
             <tbody>
               ${d.findings.map((f, i) => `
-                <tr class="finding-row-${i}" onclick="document.getElementById('fbody-${i}').style.display=document.getElementById('fbody-${i}').style.display==='table-row'?'none':'table-row';" style="cursor:pointer;">
+                <tr class="finding-row-${i}" onclick="if(window.getSelection().toString().length===0){var b=document.getElementById('fbody-${i}');b.style.display=b.style.display==='table-row'?'none':'table-row';}" style="cursor:pointer;user-select:none;">
                   <td><span class="badge ${f.severity}">${f.severity}</span></td>
                   <td>${esc(f.title)}</td>
                   <td class="mono" style="font-size:0.75rem;color:var(--text-muted);">${esc(f.category)}</td>
                   <td class="mono" style="font-size:0.75rem;color:var(--text-muted);">${esc(f.tool)}</td>
                 </tr>
                 <tr id="fbody-${i}" style="display:none;background:var(--sidebar);">
-                  <td colspan="4" style="padding:14px 20px;font-size:0.82rem;color:var(--text-dim);">
-                    ${f.description ? `<div><strong style="color:var(--text-muted);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Description</strong><div style="margin-top:4px;margin-bottom:10px;">${esc(f.description)}</div></div>` : ''}
-                    ${f.evidence ? `<div><strong style="color:var(--text-muted);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Evidence</strong><div style="margin-top:4px;font-family:'SF Mono',monospace;word-break:break-all;">${esc(f.evidence)}</div></div>` : ''}
+                  <td colspan="4" style="padding:14px 20px;font-size:0.82rem;color:var(--text-dim);user-select:text;">
+                    ${f.description ? `<div><strong style="color:var(--text-muted);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Description</strong><div style="margin-top:4px;margin-bottom:10px;user-select:text;">${esc(f.description)}</div></div>` : ''}
+                    ${f.evidence ? `<div><strong style="color:var(--text-muted);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;">Evidence</strong><div style="margin-top:4px;font-family:'SF Mono',monospace;font-size:0.82rem;white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:8px 10px;border-radius:4px;border:1px solid var(--border);user-select:text;">${esc(f.evidence)}</div></div>` : ''}
                   </td>
                 </tr>`).join('')}
             </tbody>

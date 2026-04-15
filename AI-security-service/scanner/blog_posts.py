@@ -32,7 +32,7 @@ POSTS = [
 <p>Then we scanned everything we'd shipped with AI assistants over the previous year. The hit rate was noticeably higher.</p>
 
 <h2>What Security Scanner does</h2>
-<p>You point it at a URL. It runs 40+ modules against that URL in parallel — from classic ones like nmap + TLS audit + nuclei to the ones that matter for vibe-coded apps specifically:</p>
+<p>You point it at a URL. It runs 50+ modules against that URL in parallel — from classic ones like nmap + TLS audit + nuclei to the ones that matter for vibe-coded apps specifically:</p>
 
 <ul>
   <li>Extracts Supabase anon keys from JS bundles and probes every real table name for Row Level Security misconfigurations</li>
@@ -89,7 +89,7 @@ POSTS = [
 
 <h2>4. Auth + session</h2>
 <ul>
-  <li><strong>JWT audit</strong> — alg=none acceptance, kid injection, HS256 weak-secret crack against ~35 common values (local compute, no extra target traffic).</li>
+  <li><strong>JWT audit</strong> — alg=none acceptance check + HS256 weak-secret crack against ~35 common values (local compute, no extra target traffic).</li>
   <li><strong>OAuth audit</strong> — open-redirect probe on <code>redirect_uri</code> across 7 common OAuth paths.</li>
   <li><strong>Session entropy</strong> — samples Set-Cookie across 5 requests; flags low-entropy or sequential-numeric session tokens.</li>
   <li><strong>Auth probes</strong> — username enumeration via login-response delta; weak-password acceptance on signup.</li>
@@ -143,43 +143,52 @@ POSTS = [
         "date": "2026-03-29",
         "tag": "Findings",
         "excerpt": (
-            "We scanned 75 published Lovable apps. 17 had at least one Supabase table "
-            "readable by anyone. Here's the pattern."
+            "We scanned ~50 published Lovable apps. About 1 in 5 of the Supabase-backed ones "
+            "had at least one table readable by anyone. Here's the pattern."
         ),
         "body": """
-<p>Over the past two weeks we ran Security Scanner against 75+ apps published on <a href="https://lovable.dev">Lovable</a>. The Supabase + Lovable combination produces a specific and very consistent set of findings. Here are the top 5, ranked by how often they showed up.</p>
+<p>Over the past two weeks we ran Security Scanner against ~50 apps published on <a href="https://lovable.dev">Lovable</a>. About 28 of them used Supabase as the backend (we detected the Supabase URL + anon key in the JS bundle). Of those Supabase-backed apps, roughly 1 in 5 had at least one Supabase table readable by anyone holding the anon key.</p>
 
-<h2>1. Row Level Security disabled on app-specific tables (14% of apps)</h2>
+<p>Here are the top 5 issue patterns, ranked by how often they showed up.</p>
 
-<p>By far the most common critical finding. Lovable's onboarding teaches you to enable RLS on the <code>profiles</code> table. Every table you add after that is RLS-off by default.</p>
+<h2>1. Row Level Security disabled on app-specific tables (~18% of Supabase-backed apps)</h2>
 
-<p>We've found tables named <code>client_emails</code> (with a <code>password</code> column), <code>booking_requests</code> (customer emails + phone numbers), <code>client_accounts</code> (OAuth tokens), <code>chat_channels</code>, and <code>subscriptions</code> all readable by anyone holding the public anon key — which is any visitor of the app.</p>
+<p>By far the most common critical finding. RLS is per-table in Postgres, and if a table is created via plain <code>CREATE TABLE</code> in the Supabase SQL Editor (which is what most AI assistants do when they scaffold a new feature), RLS is off by default. The dashboard's Table Editor flips it on; SQL doesn't.</p>
 
-<p><strong>Fix:</strong> <code>ALTER TABLE &lt;table&gt; ENABLE ROW LEVEL SECURITY;</code> + a policy restricting SELECT to <code>auth.uid() = owner_id</code>.</p>
+<p>Tables we've found anon-readable across this cohort include: <code>client_emails</code> (with a literal <code>password</code> column), <code>booking_requests</code> (customer emails + phone numbers), <code>client_accounts</code> (a credential vault — service names, emails, passwords for things like Namecheap), <code>chat_channels</code>, <code>chat_messages</code>, <code>subscriptions</code>, <code>profiles</code>.</p>
 
-<h2>2. Supabase storage buckets publicly listable (8% of apps)</h2>
+<p><strong>Fix:</strong></p>
+<pre><code>ALTER TABLE &lt;table&gt; ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "owner_select" ON &lt;table&gt;
+  FOR SELECT USING (auth.uid() = owner_id);</code></pre>
 
-<p>If a table leaks, storage usually leaks too. We've seen every uploaded avatar, receipt, task attachment, and chat file enumerable via <code>POST /storage/v1/object/list/&lt;bucket&gt;</code> with the anon key.</p>
+<h2>2. Supabase storage buckets publicly listable</h2>
 
-<p><strong>Fix:</strong> Under Storage → Policies in the Supabase dashboard, scope the SELECT policy to authenticated users or the specific owner.</p>
+<p>If a table leaks, storage usually leaks too. The same anon key that can <code>SELECT</code> from an unprotected table can also <code>POST</code> to <code>/storage/v1/object/list/&lt;bucket&gt;</code> and enumerate every file in a bucket. On the worst app in our batch we found 8 buckets listable — user avatars, receipts, task attachments, chat files, business cover images, event attachments.</p>
 
-<h2>3. Supabase anon key mistaken for a secret (many apps)</h2>
+<p><strong>Fix:</strong> In the Supabase dashboard under Storage → Policies, scope the <code>SELECT</code> (and <code>UPDATE</code>/<code>DELETE</code>) policies to authenticated users or the specific owner. The default of "no policies + RLS-on" leaves the bucket inaccessible — the failure mode is a misconfigured "allow all" policy or RLS off on the storage tables.</p>
 
-<p>People see <code>SUPABASE_ANON_KEY</code> in the JS bundle, panic, and either rotate it repeatedly or try to hide it. The anon key is designed to be public — it's a JWT with <code>role: anon</code>, and RLS does the actual authorization. The only Supabase key that should never ship to the browser is <code>service_role</code> (role=service_role in the payload). We've seen that exact mistake twice in our batches.</p>
+<h2>3. Supabase anon key mistaken for a secret</h2>
 
-<p><strong>Fix:</strong> Keep the anon key client-side, enable RLS, and never ship the service_role key. If you ever pasted a service_role key into a Lovable environment variable, rotate it in the Supabase dashboard immediately.</p>
+<p>The opposite mistake: people see <code>SUPABASE_ANON_KEY</code> in the JS bundle, panic, and try to "hide" it (sometimes by rotating it repeatedly, sometimes by adding env-var indirection, sometimes by writing a server proxy to forward calls). The anon key is <em>designed</em> to be public — it's a JWT with <code>role: anon</code> in the payload, and RLS does the actual authorization.</p>
+
+<p>The Supabase key that should <em>never</em> ship to the browser is <code>service_role</code> — same JWT shape, but with <code>role: service_role</code> in the payload. <strong>That key bypasses RLS on every table.</strong> Decoding the middle segment of any <code>eyJ...</code> JWT and checking the <code>role</code> field disambiguates the two.</p>
+
+<p>We didn't observe a service_role leak in this Lovable cohort — but we've seen the pattern in adjacent ones, and our scanner now decodes JWT payloads to flag service_role specifically.</p>
+
+<p><strong>Fix:</strong> Keep the anon key client-side, enable RLS, and never paste a <code>service_role</code> key into any client-visible env var (including Lovable secrets that get baked into the bundle).</p>
 
 <h2>4. Missing security headers (every app)</h2>
 
-<p>Lovable's edge doesn't set HSTS, X-Frame-Options, CSP, or Referrer-Policy. Every single app we scanned has the same stack of MEDIUM findings for this. Browser-level clickjacking and MIME-confusion protections are disabled by default.</p>
+<p>Lovable's edge doesn't set HSTS, X-Frame-Options, CSP, or Referrer-Policy on its <code>*.lovable.app</code> subdomains. Every single app we scanned has the same stack of MEDIUM findings for this. Browser-level clickjacking and MIME-confusion protections aren't there by default.</p>
 
-<p><strong>Fix:</strong> This is really on Lovable. If you own the app, you can add headers via a server middleware if your Lovable scaffold supports it, but most don't.</p>
+<p><strong>Fix:</strong> Mostly on Lovable to set as platform defaults. If you've moved your app to a custom domain behind Cloudflare, set the headers there instead — Cloudflare → Rules → Transform Rules → Modify Response Header.</p>
 
-<h2>5. Debug/admin routes visible in the bundle (rare but nasty)</h2>
+<h2>5. Debug/admin routes visible in the bundle</h2>
 
-<p>In a few cases we found JS code branching on <code>if (user.is_admin)</code> where the admin UI was fully shipped to the browser — including its API calls. Disabling the admin UI client-side is not security; if the /api/admin/* endpoints don't check auth on the server, an attacker reads the bundle and calls them directly.</p>
+<p>Less common but high-impact. We've seen JS code branching on <code>if (user.is_admin)</code> where the admin UI was fully shipped to the browser — including the API calls it makes. Disabling the admin UI client-side is not security: an attacker reads the bundle, sees the <code>/api/admin/delete-user</code> call, and invokes it directly. If the endpoint doesn't recheck auth + role server-side, they're in.</p>
 
-<p><strong>Fix:</strong> Check <code>auth.uid()</code> + role inside every RPC function and RLS policy. Assume the client is hostile.</p>
+<p><strong>Fix:</strong> Check <code>auth.uid()</code> + role inside every Supabase RPC function and every RLS policy. Assume the client is hostile.</p>
 
 <h2>The meta-lesson</h2>
 
@@ -195,7 +204,7 @@ POSTS = [
         "tag": "Findings",
         "excerpt": "Replit's quick-deploy is great. It also makes it really easy to ship your API keys to the internet.",
         "body": """
-<p>Replit + Supabase or Replit + raw OpenAI/Anthropic calls is the other dominant vibe-coding combo. We scanned 50 Replit-deployed apps — here's what broke.</p>
+<p>Replit + Supabase or Replit + raw OpenAI/Anthropic calls is the other dominant vibe-coding combo. We scanned ~60 Replit-deployed apps across two batches — here's what broke.</p>
 
 <h2>1. Hardcoded AI provider keys in the JS bundle (real, observed)</h2>
 
@@ -217,17 +226,17 @@ POSTS = [
 
 <p><strong>Fix:</strong> Set <code>Strict-Transport-Security: max-age=31536000; includeSubDomains</code> in your app's response headers. One line in FastAPI / Flask / Express.</p>
 
-<h2>4. TLS cert expiring soon + self-signed (a few apps)</h2>
+<h2>4. TLS cert hygiene on custom domains</h2>
 
-<p>Replit handles TLS on their edge, so the managed domain is fine. But a few apps we scanned used custom domains where the cert was either self-signed or within 10 days of expiry with no auto-renewal configured.</p>
+<p>Replit handles TLS on their edge for the managed <code>*.replit.app</code> domain — those are fine. The risk surface is custom domains: if you point <code>app.example.com</code> at a Replit deploy, you're responsible for cert renewal and a missed renewal will quietly expire. The scanner flags certs within 30 days of expiry as a MEDIUM, anything self-signed as HIGH.</p>
 
-<p><strong>Fix:</strong> If you're on a custom domain, make sure Let's Encrypt auto-renew is running. Cloudflare in front is the easiest option.</p>
+<p><strong>Fix:</strong> If you're on a custom domain, put Cloudflare in front (free tier handles TLS termination + auto-renews their edge cert). Or run Caddy / a Let's Encrypt cron, but Cloudflare is one click.</p>
 
-<h2>5. /api/health and /api/debug leaking environment data</h2>
+<h2>5. Debug + admin endpoints exposed</h2>
 
-<p>A pattern we keep seeing: a <code>/api/health</code> endpoint that returns the full <code>process.env</code> for "debugging", or a <code>/api/debug</code> that was meant to be disabled in prod but isn't. We've seen these leak <code>DATABASE_URL</code>, <code>JWT_SECRET</code>, and in one case an entire <code>.env</code> file copy.</p>
+<p>The scanner probes ~25 known-leaky paths — <code>/actuator/env</code> (Spring Boot), <code>/_debugbar</code> (Laravel), <code>/server-status</code> (Apache), <code>/.git/config</code>, <code>/terraform.tfstate</code>, <code>/.env</code> variants, <code>/wp-config.php.bak</code>, <code>/_ignition/execute-solution</code> (Laravel RCE), and others. None of the Replit cohort happened to be running the relevant frameworks in this batch, but the canonical pattern that does show up on Replit specifically is a <code>/api/health</code> or <code>/api/debug</code> endpoint that returns more than it should — and AI assistants love writing those.</p>
 
-<p><strong>Fix:</strong> <code>/health</code> should return <code>{"status": "ok"}</code> and nothing else. Any debug endpoint should be gated behind <code>if (process.env.NODE_ENV !== 'production')</code> OR removed entirely before deploy.</p>
+<p><strong>Fix:</strong> <code>/health</code> should return <code>{"status": "ok"}</code> and nothing else. Any debug endpoint should be gated behind <code>if (process.env.NODE_ENV !== 'production')</code> OR removed entirely before deploy. If you're on Spring Boot, secure or disable the actuator endpoints (<code>management.endpoints.web.exposure.include=health</code>).</p>
 
 <h2>Why it keeps happening</h2>
 
@@ -372,7 +381,7 @@ WHERE c.relkind = 'r'
 
 <h2>How the scanner caught it</h2>
 
-<p>Our <code>secret-scan</code> module fetches the app's homepage, extracts <code>&lt;script src="..."&gt;</code> references (up to 3), downloads each bundle (up to 5 MB), and runs 20+ provider-specific regexes against the combined corpus. The Anthropic pattern is <code>sk-ant-api\\d+-[0-9A-Za-z_\\-]{80,}</code>. When it matches, severity is CRITICAL automatically.</p>
+<p>Our <code>secret-scan</code> module fetches the app's homepage, extracts <code>&lt;script src="..."&gt;</code> references (up to 3), downloads each bundle (up to 5 MB), and runs ~38 provider-specific regexes against the combined corpus. The Anthropic pattern is <code>sk-ant-api\\d+-[0-9A-Za-z_\\-]{80,}</code>. When it matches, severity is CRITICAL automatically.</p>
 
 <p>The bundle also happened to be Vite-minified, so the keys weren't even wrapped in a function call — they were literal top-level constants. The entire scan took 4 seconds.</p>
 

@@ -827,6 +827,40 @@ SECRET_PATTERNS = [
     (r"postgres://[^:]+:[^@]+@", "PostgreSQL connection string with password", "CRITICAL"),
     (r"mongodb(?:\+srv)?://[^:]+:[^@]+@", "MongoDB connection string with password", "CRITICAL"),
     (r"mysql://[^:]+:[^@]+@", "MySQL connection string with password", "CRITICAL"),
+    # GCP: service-account JSON with embedded private key
+    (r'"type"\s*:\s*"service_account"[^}]*"private_key"\s*:\s*"-----BEGIN',
+     "GCP service-account key JSON", "CRITICAL"),
+    (r"-----BEGIN PRIVATE KEY-----[A-Za-z0-9+/=\\n\s]+-----END PRIVATE KEY-----",
+     "PEM private key block", "CRITICAL"),
+    # Azure storage account key
+    (r"DefaultEndpointsProtocol=https?;AccountName=[A-Za-z0-9]+;AccountKey=",
+     "Azure Storage connection string", "CRITICAL"),
+    # Digital Ocean
+    (r"dop_v1_[a-f0-9]{64}", "Digital Ocean API token", "CRITICAL"),
+    # Vercel / Netlify deployment tokens (plaintext pattern often seen in CI configs)
+    (r"\bvrc_[A-Za-z0-9]{24,}", "Vercel deployment token", "HIGH"),
+    (r"\bnfp_[A-Za-z0-9]{24,}", "Netlify personal access token", "HIGH"),
+    # Package registry tokens
+    (r"npm_[A-Za-z0-9]{36}", "npm publish token", "CRITICAL"),
+    (r"pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]+", "PyPI upload token", "CRITICAL"),
+    # LangChain / LangSmith observability keys
+    (r"lsv2_(?:pt|sk)_[a-f0-9]{32}_[a-f0-9]{10}", "LangSmith API key", "HIGH"),
+    # Pinecone API key (UUID-format often appears next to 'pinecone' context)
+    (r'(?i)pinecone[_\-]?api[_\-]?key["\']?\s*[:=]\s*["\']([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
+     "Pinecone API key", "HIGH"),
+    # Weaviate API key (usually opaque; flagged only when named explicitly)
+    (r'(?i)weaviate[_\-]?api[_\-]?key["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})',
+     "Weaviate API key", "HIGH"),
+    # Clerk — secret key in bundle (client-side) is always wrong
+    (r"\bsk_live_clerk_[A-Za-z0-9]{32,}", "Clerk live secret key (must be server-only)", "CRITICAL"),
+    (r"\bsk_test_clerk_[A-Za-z0-9]{32,}", "Clerk test secret key (should not ship to browser)", "HIGH"),
+    (r"\bwhsec_[A-Za-z0-9]{32,}", "Webhook signing secret exposed", "CRITICAL"),
+    # Cloudflare API tokens (40-char opaque, appears after 'CF_API_TOKEN' or similar)
+    (r'(?i)cf[_\-]?api[_\-]?token["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{40})',
+     "Cloudflare API token", "CRITICAL"),
+    # Heroku (UUID-format after 'heroku_api_key' context)
+    (r'(?i)heroku[_\-]?api[_\-]?key["\']?\s*[:=]\s*["\']?[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}',
+     "Heroku API key", "HIGH"),
 ]
 
 
@@ -1461,19 +1495,64 @@ def scan_target_baas(run_id: str, ip: str, name: str):
                         "evidence": f"GET {db_url}/.json → {resp[:200]}",
                         "tool": "firebase-audit",
                     })
-            # Try Firestore unauthenticated read
-            resp = run_cmd([
-                "curl", "-sk", "-m", "5",
-                f"https://firestore.googleapis.com/v1/projects/{project}/databases/(default)/documents/users?key={firebase_match.group(1)}"
-            ], timeout=8)
-            if resp and '"documents"' in resp and '"name"' in resp:
+            # Firestore: extract REAL collection names from the JS bundle
+            # (the same upgrade we did for Supabase). Then probe each with the
+            # Firebase apiKey.
+            firestore_collections = set()
+            for m in re.finditer(
+                r"""\.collection\(\s*["']([a-zA-Z_][a-zA-Z0-9_\-]{1,60})["']""",
+                search_corpus,
+            ):
+                firestore_collections.add(m.group(1))
+            for m in re.finditer(
+                r"""collection\(\s*(?:db|firestore|getFirestore\(\))\s*,\s*["']([a-zA-Z_][a-zA-Z0-9_\-]{1,60})["']""",
+                search_corpus,
+            ):
+                firestore_collections.add(m.group(1))
+            # Generic fallback so we still probe common ones
+            firestore_collections.update(["users", "profiles", "accounts",
+                                          "messages", "posts", "admin",
+                                          "orders", "invoices"])
+            if any(c not in ("users", "profiles", "accounts", "messages",
+                              "posts", "admin", "orders", "invoices")
+                    for c in firestore_collections):
+                # We discovered app-specific collection names; worth an INFO.
+                disc = sorted(c for c in firestore_collections
+                              if c not in ("users", "profiles", "accounts",
+                                           "messages", "posts", "admin",
+                                           "orders", "invoices"))
                 findings.append({
-                    "target": ip, "severity": "CRITICAL", "category": "baas",
-                    "title": "Firestore 'users' collection readable without auth",
-                    "description": "Firestore security rules allow unauthenticated read on /users. Update rules.",
-                    "evidence": resp[:200],
-                    "tool": "firebase-audit",
+                    "target": ip, "severity": "INFO", "category": "baas",
+                    "title": f"Firestore collections discovered in bundle: {len(disc)}",
+                    "description": (
+                        "Extracted collection names from .collection() calls "
+                        "in the public JS bundle. Each of these will be probed "
+                        "with the Firebase API key in the next step; verify "
+                        "security rules are in place."
+                    ),
+                    "evidence": ", ".join(disc)[:400],
+                    "tool": "baas-detect",
                 })
+            for coll in list(firestore_collections)[:30]:
+                resp = run_cmd([
+                    "curl", "-sk", "-m", "5",
+                    f"https://firestore.googleapis.com/v1/projects/"
+                    f"{project}/databases/(default)/documents/{coll}"
+                    f"?key={firebase_match.group(1)}"
+                ], timeout=8)
+                if resp and '"documents"' in resp and '"name"' in resp:
+                    findings.append({
+                        "target": ip, "severity": "CRITICAL", "category": "baas",
+                        "title": f"Firestore collection '{coll}' readable without auth",
+                        "description": (
+                            f"Firestore security rules allow unauthenticated "
+                            f"read on /{coll}. Update rules in the Firebase "
+                            f"console → Firestore → Rules: "
+                            f"`match /{coll}/{{id}} {{ allow read: if request.auth != null; }}`"
+                        ),
+                        "evidence": f"GET /{coll} → {resp[:200]}",
+                        "tool": "firebase-audit",
+                    })
 
         # Detect Clerk
         if "clerk.accounts" in html or "clerk.dev" in html or "__clerk_" in html:
@@ -1999,6 +2078,172 @@ def scan_target_s3_cloud(run_id: str, ip: str, name: str):
     return findings
 
 
+# (path, expected-signature regex, severity, one-line description). A response
+# that returns 200 AND contains the signature is treated as the finding.
+_INFRA_LEAK_PROBES = [
+    # Spring Boot Actuator — often leaks env vars + secrets
+    ("/actuator/env", r'"(systemEnvironment|propertySources)"',
+     "CRITICAL", "Spring Boot Actuator /env exposed (env vars + secrets leaked)"),
+    ("/actuator/health", r'"status"\s*:\s*"(UP|DOWN)"',
+     "LOW", "Spring Boot Actuator /health exposed"),
+    ("/actuator/mappings", r'"mappings"\s*:',
+     "MEDIUM", "Spring Boot Actuator /mappings exposed (route enumeration)"),
+    ("/actuator/heapdump", r"HPROF|PROFILE",
+     "CRITICAL", "Spring Boot Actuator /heapdump downloadable (memory dump with secrets)"),
+    ("/actuator/loggers", r'"loggers"\s*:',
+     "MEDIUM", "Spring Boot Actuator /loggers exposed"),
+    # Laravel
+    ("/_ignition/execute-solution", r'ignition|Laravel',
+     "CRITICAL", "Laravel Ignition RCE endpoint exposed (CVE-2021-3129)"),
+    ("/_debugbar", r'phpdebugbar|Debug\s*Bar',
+     "HIGH", "Laravel Debugbar exposed in production"),
+    ("/telescope", r'(?i)laravel\s*telescope',
+     "HIGH", "Laravel Telescope exposed (request inspector)"),
+    # Apache / nginx / PHP
+    ("/server-status", r'(?i)apache\s*server\s*status',
+     "HIGH", "Apache mod_status exposed (/server-status)"),
+    ("/server-info", r'(?i)apache\s*server\s*info',
+     "HIGH", "Apache mod_info exposed (/server-info)"),
+    ("/nginx_status", r"Active\s*connections:\s*\d+",
+     "MEDIUM", "Nginx stub_status exposed"),
+    ("/phpinfo.php", r"PHP\s*Version\s*=>",
+     "HIGH", "phpinfo() page exposed (full PHP config + env)"),
+    # VCS / source-tree leaks
+    ("/.git/config", r"\[core\]",
+     "HIGH", "/.git/config readable (full repo reconstructable via git-dumper)"),
+    ("/.git/HEAD", r"^ref:\s*refs/",
+     "HIGH", "/.git/HEAD readable (git-tree exposure)"),
+    ("/.svn/entries", r"^\d+",
+     "HIGH", "Subversion /.svn/entries readable"),
+    ("/.hg/store/00manifest.i", r".",
+     "HIGH", "Mercurial /.hg store readable"),
+    ("/.DS_Store", r"^Bud1",
+     "MEDIUM", ".DS_Store exposed (directory listing leak)"),
+    # Config files
+    ("/docker-compose.yml", r"(?i)version\s*:\s*['\"]?\d",
+     "HIGH", "docker-compose.yml publicly served"),
+    ("/docker-compose.yaml", r"(?i)version\s*:\s*['\"]?\d",
+     "HIGH", "docker-compose.yaml publicly served"),
+    ("/terraform.tfstate", r'"version"\s*:\s*\d+.*"terraform_version"',
+     "CRITICAL", "Terraform state file exposed (AWS / GCP / etc. credentials)"),
+    ("/terraform.tfstate.backup", r'"terraform_version"',
+     "CRITICAL", "Terraform state backup exposed"),
+    ("/.env", r"(?im)^[A-Z_][A-Z0-9_]*\s*=\s*",
+     "CRITICAL", ".env file served from web root"),
+    ("/.env.local", r"(?im)^[A-Z_][A-Z0-9_]*\s*=\s*",
+     "CRITICAL", ".env.local file served from web root"),
+    ("/.env.production", r"(?im)^[A-Z_][A-Z0-9_]*\s*=\s*",
+     "CRITICAL", ".env.production file served from web root"),
+    ("/wp-config.php.bak", r"(?i)DB_PASSWORD",
+     "CRITICAL", "wp-config.php backup exposed (DB creds)"),
+    ("/config.yml", r"(?im)^(database|secret|api_key|password)\s*:",
+     "HIGH", "config.yml publicly served (likely app secrets)"),
+    ("/config.json", r"\"(password|api_key|secret|token)\"\s*:",
+     "HIGH", "config.json publicly served"),
+    # Java web apps
+    ("/WEB-INF/web.xml", r"<web-app",
+     "HIGH", "Java WEB-INF/web.xml readable"),
+    ("/WEB-INF/classes/application.properties", r"=",
+     "HIGH", "Java application.properties readable"),
+    # Next.js debug / dev endpoints that shouldn't ship
+    ("/__next/static/chunks/pages/_error.js", r"trace|stack",
+     "LOW", "Next.js error dev bundle reachable"),
+    # Swagger UI (not necessarily bad but discoverable)
+    # Already handled by scan_target_docs
+]
+
+
+_INFRA_LEAK_K8S_DOCKER = [
+    # These are port-specific; module will try on common ports.
+    # (port, path, expected-sig, severity, description)
+    (2375, "/version", r'"ApiVersion"\s*:',
+     "CRITICAL", "Docker Engine API exposed without TLS on :2375 (full RCE)"),
+    (2376, "/version", r'"ApiVersion"\s*:',
+     "HIGH", "Docker Engine API on :2376 (should require client cert)"),
+    (10250, "/pods", r'"kind"\s*:\s*"PodList"',
+     "CRITICAL", "Kubernetes kubelet /pods anonymous-readable on :10250"),
+    (10255, "/pods", r'"kind"\s*:\s*"PodList"',
+     "CRITICAL", "Kubernetes read-only kubelet exposed on :10255"),
+    (9090, "/metrics", r"# HELP\s+",
+     "MEDIUM", "Prometheus metrics endpoint exposed on :9090"),
+]
+
+
+def scan_target_infra_leaks(run_id: str, ip: str, name: str):
+    """Enumerate common leaked-configuration paths + unauth K8s/Docker APIs."""
+    findings = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        schemes = [(f"http://{ip}", 80), (f"https://{ip}", 443)]
+    else:
+        schemes = [(f"https://{ip}", 443), (f"http://{ip}", 80)]
+
+    # Phase 1 — HTTP path probes on 80/443
+    probed = 0
+    for base, _port in schemes:
+        for path, sig_re, sev, label in _INFRA_LEAK_PROBES:
+            if probed > 35:  # hard cap per target
+                break
+            url = base + path
+            status_out = run_cmd(
+                ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-m", "3", url], timeout=5,
+            ).strip()
+            probed += 1
+            if status_out != "200":
+                continue
+            body = run_cmd(
+                ["curl", "-sk", "-m", "4", "--max-filesize", "1000000", url],
+                timeout=6,
+            )
+            if not body or "[TIMEOUT" in body or "[ERROR" in body:
+                continue
+            if re.search(sig_re, body[:8000], re.MULTILINE):
+                findings.append({
+                    "target": ip, "severity": sev, "category": "disclosure",
+                    "title": label,
+                    "description": (
+                        f"Path {path} returned HTTP 200 with a signature "
+                        f"matching this leak pattern. Remove from web root "
+                        f"or gate behind auth."
+                    ),
+                    "evidence": f"GET {url} → 200\nbody (first 200 bytes): {body[:200]}",
+                    "tool": "infra-leak",
+                })
+        # Only probe one scheme to avoid doubling
+        if probed:
+            break
+
+    # Phase 2 — K8s / Docker unauth APIs on their specific ports
+    for port, path, sig_re, sev, label in _INFRA_LEAK_K8S_DOCKER:
+        # Try HTTP first (most of these are plain HTTP); fall back to HTTPS for kubelet
+        for scheme in ("http", "https"):
+            url = f"{scheme}://{ip}:{port}{path}"
+            status = run_cmd(
+                ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-m", "2", url], timeout=4,
+            ).strip()
+            if status not in ("200", "401"):  # 401 also noteworthy for kubelet
+                continue
+            body = run_cmd(
+                ["curl", "-sk", "-m", "3", "--max-filesize", "500000", url],
+                timeout=5,
+            )
+            if status == "200" and body and re.search(sig_re, body[:4000]):
+                findings.append({
+                    "target": ip, "severity": sev, "category": "cloud",
+                    "title": label,
+                    "description": (
+                        f"Port {port} path {path} responded with "
+                        f"characteristic unauthenticated content. This is a "
+                        f"container-platform exposure — treat as RCE-risk."
+                    ),
+                    "evidence": f"GET {scheme}://{ip}:{port}{path} → 200\n{body[:200]}",
+                    "tool": "infra-leak",
+                })
+                break
+    return findings
+
+
 # Minimal GraphQL introspection query — returns the schema's type names.
 _GRAPHQL_INTROSPECTION = (
     "{__schema{types{name fields{name}}mutationType{fields{name}}}}"
@@ -2355,6 +2600,10 @@ try:
         scan_target_idor, scan_target_render, scan_target_authenticated,
         scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
         scan_target_waf_gate, scan_target_prompt_injection,
+        scan_target_default_ports, scan_target_hasura,
+        scan_target_session_entropy, scan_target_jwt_weak_secret,
+        scan_target_oauth_redirect, scan_target_ssrf_fetch,
+        scan_target_typosquat_deps,
     )
     from scanner.ai_triage import (
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -2371,6 +2620,10 @@ except ImportError:
         scan_target_idor, scan_target_render, scan_target_authenticated,
         scan_target_email_deep, scan_target_nuclei_cve, scan_target_api_fuzz,
         scan_target_waf_gate, scan_target_prompt_injection,
+        scan_target_default_ports, scan_target_hasura,
+        scan_target_session_entropy, scan_target_jwt_weak_secret,
+        scan_target_oauth_redirect, scan_target_ssrf_fetch,
+        scan_target_typosquat_deps,
     )
     from scanner_ai_triage import (  # type: ignore
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -2415,6 +2668,14 @@ SCAN_MODULES = [
     ("authenticated",   "Authenticated re-scan (with creds)","scan_target_authenticated"),
     ("s3_cloud",        "S3 / GCS bucket exposure",         "scan_target_s3_cloud"),
     ("graphql",         "GraphQL introspection + audit",    "scan_target_graphql"),
+    ("infra_leaks",     "Actuator / debug / VCS / K8s leaks","scan_target_infra_leaks"),
+    ("default_ports",   "Default-port DB / service probe",  "scan_target_default_ports"),
+    ("hasura",          "Hasura anonymous-role probe",      "scan_target_hasura"),
+    ("ssrf_fetch",      "SSRF via fetch-URL endpoints",     "scan_target_ssrf_fetch"),
+    ("oauth_redirect",  "OAuth open-redirect probe",        "scan_target_oauth_redirect"),
+    ("session_entropy", "Session cookie entropy check",     "scan_target_session_entropy"),
+    ("jwt_weak_secret", "JWT HS256 weak-secret check",      "scan_target_jwt_weak_secret"),
+    ("typosquat_deps",  "Typosquatted npm deps",            "scan_target_typosquat_deps"),
     ("nuclei_cve",      "Nuclei CVE + takeover templates",  "scan_target_nuclei_cve"),
     ("accessibility",   "Privacy & compliance audit",       "scan_target_accessibility"),
     # Structured AI modules (replaces the retired `ai_chain` fuzzy reasoner).

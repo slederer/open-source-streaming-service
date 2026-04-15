@@ -129,6 +129,88 @@ class TestDnsEmail:
         assert findings == []
 
 
+class TestInfraLeaks:
+    @patch("scanner.app.run_cmd")
+    def test_terraform_state_critical(self, mock_cmd):
+        def se(cmd, timeout=300):
+            url = cmd[-1]
+            if "%{http_code}" in " ".join(cmd):
+                return "200" if "terraform.tfstate" in url else "404"
+            if "terraform.tfstate" in url:
+                return '{"version": 4, "terraform_version": "1.5.0", "serial": 10}'
+            return ""
+        mock_cmd.side_effect = se
+        from scanner.app import scan_target_infra_leaks
+        findings = scan_target_infra_leaks("r1", "example.com", "t")
+        crits = [f for f in findings if f["severity"] == "CRITICAL" and "Terraform" in f["title"]]
+        assert crits
+
+    @patch("scanner.app.run_cmd")
+    def test_actuator_env_critical(self, mock_cmd):
+        def se(cmd, timeout=300):
+            url = cmd[-1]
+            if "%{http_code}" in " ".join(cmd):
+                return "200" if "actuator/env" in url else "404"
+            if "actuator/env" in url:
+                return '{"propertySources": [{"name": "systemEnvironment", "properties": {}}]}'
+            return ""
+        mock_cmd.side_effect = se
+        from scanner.app import scan_target_infra_leaks
+        findings = scan_target_infra_leaks("r1", "example.com", "t")
+        assert any(f["severity"] == "CRITICAL" and "Actuator" in f["title"] for f in findings)
+
+    @patch("scanner.app.run_cmd")
+    def test_no_leaks_on_clean_site(self, mock_cmd):
+        mock_cmd.return_value = "404"
+        from scanner.app import scan_target_infra_leaks
+        findings = scan_target_infra_leaks("r1", "example.com", "t")
+        assert findings == []
+
+
+class TestExtendedSecrets:
+    def test_gcp_service_account_detected(self):
+        from scanner.app import SECRET_PATTERNS
+        import re
+        sample = ('{"type": "service_account", "project_id": "x", '
+                  '"private_key": "-----BEGIN PRIVATE KEY-----\\nMIIE..."}')
+        assert any(re.search(pat, sample) for pat, _, _ in SECRET_PATTERNS)
+
+    def test_npm_token_detected(self):
+        from scanner.app import SECRET_PATTERNS
+        import re
+        sample = "npm_" + "a" * 36
+        for pat, label, sev in SECRET_PATTERNS:
+            if re.search(pat, sample) and "npm" in label.lower():
+                assert sev == "CRITICAL"
+                return
+        assert False, "npm token not caught"
+
+    def test_pypi_token_detected(self):
+        from scanner.app import SECRET_PATTERNS
+        import re
+        sample = "pypi-AgEIcHlwaS5vcmc" + "x" * 50
+        for pat, label, _ in SECRET_PATTERNS:
+            if re.search(pat, sample) and "PyPI" in label:
+                return
+        assert False, "PyPI token not caught"
+
+    def test_langsmith_token(self):
+        from scanner.app import SECRET_PATTERNS
+        import re
+        sample = "lsv2_sk_" + "a" * 32 + "_" + "b" * 10
+        assert any(re.search(pat, sample) for pat, _, _ in SECRET_PATTERNS)
+
+    def test_clerk_secret_key_critical(self):
+        from scanner.app import SECRET_PATTERNS
+        import re
+        sample = "sk_live_clerk_" + "a" * 40
+        for pat, label, sev in SECRET_PATTERNS:
+            if re.search(pat, sample) and "Clerk" in label:
+                assert sev == "CRITICAL"
+                return
+        assert False, "Clerk secret key not caught as CRITICAL"
+
+
 class TestGraphQLProbe:
     @patch("scanner.app.subprocess.run")
     @patch("scanner.app.get_db")

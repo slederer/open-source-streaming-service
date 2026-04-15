@@ -1511,3 +1511,554 @@ def scan_target_api_fuzz(run_id: str, ip: str, name: str) -> list[dict]:
             "tool": "api-fuzz",
         })
     return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Default-port database / service exposure
+# ═════════════════════════════════════════════════════════════════════════════
+
+# (port, probe_type, payload or path, response-sig regex, severity, label)
+# probe_type: "tcp" sends raw bytes and reads response; "http" does GET
+_DEFAULT_PORT_PROBES = [
+    # Redis: INFO command returns banner with "# Server" and "redis_version"
+    (6379, "tcp", b"INFO\r\nQUIT\r\n", r"redis_version:",
+     "CRITICAL", "Redis exposed unauth on :6379 (INFO returned)"),
+    # Memcached: stats command returns STAT pid
+    (11211, "tcp", b"stats\r\nquit\r\n", r"STAT pid",
+     "CRITICAL", "Memcached exposed unauth on :11211 (stats returned)"),
+    # Elasticsearch: root JSON has "cluster_name" + "version"
+    (9200, "http", "/", r'"cluster_name"\s*:\s*"',
+     "CRITICAL", "Elasticsearch exposed unauth on :9200"),
+    # Kibana: /api/status or homepage
+    (5601, "http", "/api/status", r'"version"\s*:.*"number"',
+     "HIGH", "Kibana exposed on :5601 (version disclosure)"),
+    # CouchDB
+    (5984, "http", "/", r'"couchdb"\s*:\s*"Welcome"',
+     "CRITICAL", "CouchDB exposed unauth on :5984"),
+    # Neo4j browser + bolt
+    (7474, "http", "/", r"neo4j\s*version",
+     "HIGH", "Neo4j HTTP interface exposed on :7474"),
+    # Jenkins
+    (8080, "http", "/login", r"(?i)sign\s*in.*jenkins",
+     "MEDIUM", "Jenkins login page exposed on :8080"),
+    # Portainer
+    (9000, "http", "/api/status", r'"Version"\s*:',
+     "HIGH", "Portainer exposed on :9000"),
+    # Hadoop NameNode
+    (9870, "http", "/", r"Hadoop|NameNode",
+     "HIGH", "Hadoop NameNode exposed on :9870"),
+    # RethinkDB
+    (8081, "http", "/", r"RethinkDB\s*Administration",
+     "HIGH", "RethinkDB admin exposed on :8081"),
+]
+
+
+def _tcp_probe(host: str, port: int, payload: bytes, timeout: float = 4.0) -> Optional[str]:
+    """Send raw TCP bytes, read up to 8KB, return as text (or None on failure)."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            if payload:
+                s.sendall(payload)
+            buf = bytearray()
+            try:
+                while len(buf) < 8192:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    if len(buf) >= 8192:
+                        break
+            except socket.timeout:
+                pass
+            return buf.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def scan_target_default_ports(run_id: str, ip: str, name: str) -> list[dict]:
+    """Probe common database / management-service default ports for
+    unauthenticated exposure."""
+    findings: list[dict] = []
+    # Resolve the hostname ONCE so we don't SSRF the localhost.
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        host = ip
+    else:
+        host = ip  # socket will resolve
+    import socket
+    try:
+        resolved = socket.gethostbyname(host)
+    except Exception:
+        return findings
+    # SSRF guard — never probe private / loopback / link-local
+    try:
+        addr = ipaddress.ip_address(resolved)
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast:
+            return findings
+    except Exception:
+        return findings
+
+    for port, ptype, payload, sig, sev, label in _DEFAULT_PORT_PROBES:
+        if ptype == "tcp":
+            resp = _tcp_probe(host, port, payload or b"", timeout=3)
+            if resp and re.search(sig, resp, re.IGNORECASE):
+                findings.append({
+                    "target": ip, "severity": sev, "category": "network",
+                    "title": label,
+                    "description": (
+                        f"Port {port} responded to an unauthenticated probe "
+                        f"with a signature specific to this service. This is "
+                        f"a database / service directly reachable from the "
+                        f"internet — firewall it or require auth."
+                    ),
+                    "evidence": f"tcp://{host}:{port}\n{resp[:200]}",
+                    "tool": "port-probe",
+                })
+        else:  # http
+            url = f"http://{host}:{port}{payload}"
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "4", "-o", "/tmp/__dpp_body",
+                 "-w", "%{http_code}", url],
+                capture_output=True, text=True, timeout=6,
+            )
+            status = (r.stdout or "").strip()
+            if status != "200":
+                continue
+            try:
+                with open("/tmp/__dpp_body", "r", errors="replace") as f:
+                    body = f.read(8192)
+            except Exception:
+                body = ""
+            if re.search(sig, body, re.IGNORECASE):
+                findings.append({
+                    "target": ip, "severity": sev, "category": "network",
+                    "title": label,
+                    "description": (
+                        f"GET http://{host}:{port}{payload} returned 200 with "
+                        f"content matching this service's fingerprint. Firewall "
+                        f"the port or put auth in front."
+                    ),
+                    "evidence": f"GET http://{host}:{port}{payload}\n{body[:200]}",
+                    "tool": "port-probe",
+                })
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Hasura anonymous-role + GraphQL auth-bypass
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_hasura(run_id: str, ip: str, name: str) -> list[dict]:
+    """If target runs Hasura, check whether the `anonymous` role (or no role at
+    all) can query the schema + data."""
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    # Probe common Hasura paths
+    for path in ("/v1/graphql", "/v1alpha1/graphql", "/hasura/v1/graphql"):
+        url = f"https://{ip}{path}"
+        # First: detect Hasura by its characteristic error on a bad query
+        r = subprocess.run(
+            ["curl", "-sk", "-m", "6", "-X", "POST", url,
+             "-H", "content-type: application/json",
+             "-d", '{"query":"{ __typename }"}'],
+            capture_output=True, text=True, timeout=8,
+        )
+        body = (r.stdout or "")[:50_000]
+        if not body:
+            continue
+        is_hasura = (
+            "x-hasura" in body.lower()
+            or '"extensions":{"path"' in body  # Hasura error shape
+            or '"data":{"__typename":"query_root"}' in body
+        )
+        if not is_hasura:
+            continue
+
+        # Now attempt introspection with anonymous role
+        intro = subprocess.run(
+            ["curl", "-sk", "-m", "6", "-X", "POST", url,
+             "-H", "content-type: application/json",
+             "-H", "x-hasura-role: anonymous",
+             "-d", '{"query":"{ __schema { queryType { fields { name } } } }"}'],
+            capture_output=True, text=True, timeout=8,
+        )
+        intro_body = (intro.stdout or "")[:20_000]
+        if '"fields"' in intro_body and '"name"' in intro_body:
+            field_names = re.findall(r'"name"\s*:\s*"([a-zA-Z_][a-zA-Z0-9_]+)"', intro_body)
+            findings.append({
+                "target": ip, "severity": "HIGH", "category": "api",
+                "title": f"Hasura anonymous role can introspect schema at {path}",
+                "description": (
+                    "Hasura accepted a GraphQL introspection query with "
+                    "`x-hasura-role: anonymous`. Anyone can enumerate the "
+                    "full schema. Review Hasura's permissions: Console → "
+                    "Permissions → anonymous role — disable all table "
+                    "permissions unless explicitly needed for a public feed."
+                ),
+                "evidence": (
+                    f"POST {url} with role=anonymous\n"
+                    f"fields visible (first 10): {', '.join(field_names[:10])}"
+                ),
+                "tool": "hasura-audit",
+            })
+            # Try a sensitive-looking table
+            for candidate in ("users", "accounts", "admin", "secrets",
+                              "orders", "payments"):
+                if candidate not in field_names:
+                    continue
+                data = subprocess.run(
+                    ["curl", "-sk", "-m", "6", "-X", "POST", url,
+                     "-H", "content-type: application/json",
+                     "-H", "x-hasura-role: anonymous",
+                     "-d", f'{{"query":"{{ {candidate}(limit:1) {{ id }} }}"}}'],
+                    capture_output=True, text=True, timeout=8,
+                )
+                d = (data.stdout or "")[:4000]
+                if f'"{candidate}"' in d and '"id"' in d:
+                    findings.append({
+                        "target": ip, "severity": "CRITICAL", "category": "api",
+                        "title": f"Hasura anonymous role can read `{candidate}` table at {path}",
+                        "description": (
+                            f"Anonymous role returned row data from `{candidate}`. "
+                            "This is direct data exposure. Revoke the anonymous "
+                            f"SELECT permission on `{candidate}`."
+                        ),
+                        "evidence": f"query {{ {candidate}(limit:1) {{ id }} }} → {d[:150]}",
+                        "tool": "hasura-audit",
+                    })
+                    break
+        break
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Session token entropy check
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_session_entropy(run_id: str, ip: str, name: str) -> list[dict]:
+    """Sample Set-Cookie across several requests; flag weak session tokens."""
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    tokens: list[tuple[str, str]] = []  # (cookie_name, value)
+    for _ in range(5):
+        r = subprocess.run(
+            ["curl", "-skI", "-m", "5", "-A", _UA, f"https://{ip}/"],
+            capture_output=True, text=True, timeout=7,
+        )
+        hdrs = r.stdout or ""
+        for m in re.finditer(r"(?i)^set-cookie:\s*([^=]+)=([^;\s]+)", hdrs, re.MULTILINE):
+            name_c, val = m.group(1).strip(), m.group(2).strip()
+            if len(val) >= 12:
+                tokens.append((name_c, val))
+
+    if len(tokens) < 3:
+        return findings  # not enough samples
+
+    # Group by cookie name and analyze each
+    from collections import defaultdict
+    by_name = defaultdict(list)
+    for n, v in tokens:
+        by_name[n].append(v)
+
+    for cookie_name, values in by_name.items():
+        if len(values) < 3:
+            continue
+        # Shannon entropy of concatenated values
+        from math import log2
+        joined = "".join(values)
+        freq = {}
+        for c in joined:
+            freq[c] = freq.get(c, 0) + 1
+        total = len(joined)
+        entropy = -sum((f/total) * log2(f/total) for f in freq.values()) if total else 0
+
+        # Heuristic: sequential numeric or very low entropy
+        is_numeric_seq = all(v.isdigit() for v in values) and len(set(values)) == len(values) and all(
+            abs(int(values[i+1]) - int(values[i])) < 10 for i in range(len(values)-1)
+        )
+
+        if is_numeric_seq:
+            findings.append({
+                "target": ip, "severity": "HIGH", "category": "auth",
+                "title": f"Sequential numeric session token: {cookie_name}",
+                "description": (
+                    f"Cookie `{cookie_name}` assigns nearly-sequential "
+                    "numeric values to new sessions. An attacker can "
+                    "enumerate valid session IDs. Use a CSPRNG to generate "
+                    "session IDs (64+ bits of random entropy)."
+                ),
+                "evidence": f"samples: {values[:5]}",
+                "tool": "session-audit",
+            })
+        elif entropy < 3.0:
+            findings.append({
+                "target": ip, "severity": "MEDIUM", "category": "auth",
+                "title": f"Low-entropy session token: {cookie_name}",
+                "description": (
+                    f"Cookie `{cookie_name}` has Shannon entropy of "
+                    f"{entropy:.2f} bits per char — far below the "
+                    "~6 bits expected from a CSPRNG. This is often a timestamp + "
+                    "serial pattern; regenerate with `secrets.token_urlsafe(32)` "
+                    "or equivalent."
+                ),
+                "evidence": f"entropy={entropy:.2f}, sample={values[0][:30]}",
+                "tool": "session-audit",
+            })
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — JWT HS256 weak-secret check (local compute only, doesn't hit target)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_COMMON_JWT_SECRETS = [
+    "secret", "jwt", "jwtsecret", "your-256-bit-secret",
+    "your-secret-key", "supersecret", "mysecret", "jwt-secret",
+    "changeme", "admin", "password", "123456", "qwerty",
+    "test", "development", "staging", "production",
+    "s3cr3t", "Passw0rd!", "letmein", "trustno1",
+    "nextauth-secret", "NEXTAUTH_SECRET", "sessionsecret",
+    "django-insecure", "flask-secret", "expressjs",
+    "0123456789", "abcdefghijklmnop", "thisisntstrong",
+    # Reasonable default-tutorial values
+    "my-secret", "my_secret", "change-me", "please-change-me",
+    "dev-secret", "local", "testing",
+]
+
+
+def scan_target_jwt_weak_secret(run_id: str, ip: str, name: str) -> list[dict]:
+    """For any HMAC JWT found in target responses, try common secrets against
+    it locally. No extra requests to the target beyond one homepage fetch."""
+    findings: list[dict] = []
+    try:
+        import jwt as _jwt  # PyJWT
+    except ImportError:
+        return findings  # library not installed; silently skip
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    # Fetch headers + body once
+    r = subprocess.run(
+        ["curl", "-ski", "-m", "5", "-A", _UA, f"https://{ip}/"],
+        capture_output=True, text=True, timeout=7,
+    )
+    blob = (r.stdout or "")[:30_000]
+    seen: set[str] = set()
+    for m in re.finditer(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", blob):
+        token = m.group(0)
+        if token in seen:
+            continue
+        seen.add(token)
+        try:
+            header = _jwt.get_unverified_header(token)
+            alg = header.get("alg", "")
+            if not alg.startswith("HS"):
+                continue  # only HMAC is crackable via shared secret
+        except Exception:
+            continue
+        # Try each common secret
+        for secret in _COMMON_JWT_SECRETS:
+            try:
+                _jwt.decode(token, secret, algorithms=[alg])
+                findings.append({
+                    "target": ip, "severity": "CRITICAL", "category": "auth",
+                    "title": f"JWT signed with weak secret '{secret}'",
+                    "description": (
+                        "An HMAC-signed JWT served from the homepage was "
+                        f"verifiable with the secret `{secret}` (from a "
+                        "list of ~35 commonly-tried weak values). An attacker "
+                        "can forge any token. Rotate the secret immediately "
+                        "to `secrets.token_urlsafe(64)`-strength random."
+                    ),
+                    "evidence": f"alg={alg}, token prefix={token[:30]}..., secret='{secret}'",
+                    "tool": "jwt-crack",
+                })
+                break
+            except Exception:
+                continue
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — OAuth redirect_uri open-redirect probe
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_oauth_redirect(run_id: str, ip: str, name: str) -> list[dict]:
+    """Test whether OAuth endpoints blindly follow attacker-supplied
+    redirect_uri values (open-redirect → auth-code theft)."""
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+    evil = "https://evil.example.com/pwn"
+    paths = [
+        "/oauth/authorize", "/oauth/callback", "/auth/authorize",
+        "/login/oauth/authorize", "/api/auth/callback/google",
+        "/api/auth/callback/github", "/auth/callback",
+    ]
+    for path in paths:
+        url = (f"https://{ip}{path}?redirect_uri={evil}"
+               f"&client_id=test&response_type=code")
+        r = subprocess.run(
+            ["curl", "-sk", "-I", "-m", "5", "-A", _UA, url],
+            capture_output=True, text=True, timeout=7,
+        )
+        hdrs = r.stdout or ""
+        loc_match = re.search(r"(?i)^location:\s*(.+)$", hdrs, re.MULTILINE)
+        if not loc_match:
+            continue
+        location = loc_match.group(1).strip()
+        # The attacker wins if the redirect URL starts with evil.example.com
+        if re.search(r"^https?://evil\.example\.com", location):
+            findings.append({
+                "target": ip, "severity": "HIGH", "category": "auth",
+                "title": f"OAuth open-redirect at {path}",
+                "description": (
+                    "The OAuth endpoint blindly follows an attacker-supplied "
+                    "redirect_uri. Combined with a valid auth code, this "
+                    "enables account takeover by sending a victim to "
+                    f"{path}?redirect_uri=attacker-domain. Fix: validate "
+                    "redirect_uri against an allowlist of exact URLs before "
+                    "issuing any redirect."
+                ),
+                "evidence": f"Location: {location[:200]}",
+                "tool": "oauth-audit",
+            })
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — SSRF via "fetch URL" form fields
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_ssrf_fetch(run_id: str, ip: str, name: str) -> list[dict]:
+    """Detect endpoints that accept URLs and probe for SSRF against AWS
+    metadata. Best-effort — matches typical import-from-URL / avatar-from-URL
+    patterns."""
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    common = [
+        "/api/import", "/api/fetch", "/api/fetch-url", "/api/import-url",
+        "/api/avatar", "/api/upload-from-url", "/api/webhook",
+        "/api/screenshot", "/api/preview", "/api/og", "/api/embed",
+    ]
+    metadata_url = "http://169.254.169.254/latest/meta-data/"
+    ec2_sig = r"(?:ami-id|iam/security-credentials|instance-id)"
+
+    for path in common:
+        url = f"https://{ip}{path}"
+        # Try as GET query param
+        q = f"{url}?url={metadata_url}"
+        r = subprocess.run(
+            ["curl", "-sk", "-m", "7", "-A", _UA, q],
+            capture_output=True, text=True, timeout=10,
+        )
+        body_g = (r.stdout or "")[:6000]
+        if re.search(ec2_sig, body_g):
+            findings.append({
+                "target": ip, "severity": "CRITICAL", "category": "api",
+                "title": f"SSRF confirmed via {path}?url= — EC2 metadata reachable",
+                "description": (
+                    "The endpoint fetched http://169.254.169.254/ on our "
+                    "behalf and returned AWS instance metadata. An attacker "
+                    "can enumerate IAM credentials and pivot into your AWS "
+                    "account. Block RFC 1918 and 169.254/16 in the URL-fetching "
+                    "library (use a curl --resolve deny-list, or a "
+                    "request-aware HTTP client like Python's `urllib3` with "
+                    "a custom DNS resolver)."
+                ),
+                "evidence": f"GET {q}\n→ {body_g[:200]}",
+                "tool": "ssrf-probe",
+            })
+            continue
+        # Also try POST with {"url": ...}
+        r2 = subprocess.run(
+            ["curl", "-sk", "-m", "7", "-A", _UA, "-X", "POST",
+             "-H", "content-type: application/json",
+             "-d", f'{{"url": "{metadata_url}"}}', url],
+            capture_output=True, text=True, timeout=10,
+        )
+        body_p = (r2.stdout or "")[:6000]
+        if re.search(ec2_sig, body_p):
+            findings.append({
+                "target": ip, "severity": "CRITICAL", "category": "api",
+                "title": f"SSRF confirmed via POST {path} — EC2 metadata reachable",
+                "description": (
+                    "POST to this endpoint with a {\"url\": ...} body fetched "
+                    "AWS instance metadata and returned it to the client. "
+                    "Same fix as above — deny RFC-1918 and link-local targets."
+                ),
+                "evidence": f"POST {url} body={{\"url\":\"{metadata_url}\"}}\n→ {body_p[:200]}",
+                "tool": "ssrf-probe",
+            })
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Typosquatted npm dependency detection (via sourcemap / bundle)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# A curated slice of well-known typosquats. Keeping the list tight so we don't
+# false-positive on actual legit-but-uncommon packages.
+_TYPOSQUATTED_NPM = {
+    "crossenv": "cross-env (typosquat published malware)",
+    "cross-env.js": "cross-env (typosquat published malware)",
+    "node-fabric": "fabric (typosquat, 2020 malware)",
+    "babelcli": "babel-cli (typosquat)",
+    "jquery.js": "jquery (typosquat with variants exists)",
+    "mongose": "mongoose (typosquat)",
+    "discord.dll": "discord.js (data-stealer typosquat)",
+    "ffmepg": "ffmpeg (typosquat)",
+    "opencv.js": "opencv4nodejs (typosquat)",
+}
+
+
+def scan_target_typosquat_deps(run_id: str, ip: str, name: str) -> list[dict]:
+    """Look for imports of known-typosquatted npm packages in the JS bundle."""
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+    r = subprocess.run(
+        ["curl", "-sk", "-m", "6", "-A", _UA, f"https://{ip}/"],
+        capture_output=True, text=True, timeout=9,
+    )
+    html = r.stdout or ""
+    if not html:
+        return findings
+    js_srcs = re.findall(r'<script[^>]+src=["\']([^"\'\s>]+\.js[^"\'\s>]*)', html)[:3]
+    corpus = html
+    for src in js_srcs:
+        src_url = src if src.startswith("http") else f"https://{ip}{'' if src.startswith('/') else '/'}{src}"
+        r2 = subprocess.run(
+            ["curl", "-sk", "-m", "8", "--max-filesize", "5000000",
+             "-A", _UA, src_url.split("?", 1)[0]],
+            capture_output=True, text=True, timeout=12,
+        )
+        corpus += "\n" + (r2.stdout or "")
+
+    for pkg, note in _TYPOSQUATTED_NPM.items():
+        # Match `require('pkg')` or `from 'pkg'` — needs quote boundary to
+        # avoid matching substrings of other names.
+        pattern = (r"""(?:require\(|import\s+[\w{},*\s]+\s+from\s+)"""
+                   r"""['"]""" + re.escape(pkg) + r"""['"]""")
+        if re.search(pattern, corpus):
+            findings.append({
+                "target": ip, "severity": "HIGH", "category": "supply-chain",
+                "title": f"Typosquatted npm dependency in use: {pkg}",
+                "description": (
+                    f"The bundle imports `{pkg}`, a known-typosquatted "
+                    f"package ({note}). These packages have historically "
+                    f"contained data-stealing or wallet-draining malware. "
+                    f"Audit the package and replace with the intended "
+                    f"dependency name."
+                ),
+                "evidence": f"import/require of '{pkg}' found in bundle",
+                "tool": "supply-chain",
+            })
+    return findings

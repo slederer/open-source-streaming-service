@@ -19,7 +19,7 @@ from typing import Optional
 
 from authlib.integrations.starlette_client import OAuth
 from fastapi import FastAPI, BackgroundTasks, Request, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse, Response
 from starlette.middleware.sessions import SessionMiddleware
 
 DB_PATH = Path(os.getenv("SCANNER_DB", "/home/ec2-user/scanner.db"))
@@ -7783,6 +7783,17 @@ _LANDING_HTML = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Security Scanner — AI-native vulnerability scanning</title>
 <meta name="description" content="Scan any deployed web app for vulnerabilities. AI-powered fix instructions for Claude Code, ChatGPT, Cursor, and Copilot. Built for the vibe-coding era.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Security Scanner Blog" href="/blog/rss.xml">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://securityscanner.dev/">
+<meta property="og:title" content="Security Scanner — AI-native vulnerability scanning">
+<meta property="og:description" content="Scan any deployed web app. 50+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
+<meta property="og:image" content="https://securityscanner.dev/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Security Scanner — AI-native vulnerability scanning">
+<meta name="twitter:description" content="Scan any deployed web app. 50+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
+<meta name="twitter:image" content="https://securityscanner.dev/og.png">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.5; }
@@ -7862,6 +7873,7 @@ _LANDING_HTML = """<!DOCTYPE html>
     <a href="#how">How it works</a>
     <a href="#capabilities">What we check</a>
     <a href="#pricing">Pricing</a>
+    <a href="#faq">FAQ</a>
     <a href="/blog">Blog</a>
     <a href="/docs/api">API</a>
     <a href="/contact">Contact</a>
@@ -8070,17 +8082,85 @@ _LANDING_HTML = """<!DOCTYPE html>
   </div>
 </section>
 
+<section id="faq">
+  <div class="container" style="max-width:780px;">
+    <h2>FAQ</h2>
+    <p class="sub">The questions we get most.</p>
+    <div style="display:flex;flex-direction:column;gap:16px;">
+      <details style="background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px 22px;">
+        <summary style="cursor:pointer;font-weight:600;font-size:1rem;">Is it open source?</summary>
+        <p style="color:#9ca3af;margin-top:10px;font-size:0.92rem;line-height:1.6;">Not today. The scanner is a hosted product — the detection patterns are the product. We may release parts (the MCP server, the disclosure tooling) separately once the model stabilizes. In the meantime, every finding ships with exact detection methodology and a reproducible curl or SQL command so you can verify it yourself.</p>
+      </details>
+      <details style="background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px 22px;">
+        <summary style="cursor:pointer;font-weight:600;font-size:1rem;">Do you store my scan results?</summary>
+        <p style="color:#9ca3af;margin-top:10px;font-size:0.92rem;line-height:1.6;">Yes — findings are stored per-user in your dashboard so you can track trend and re-check after a fix. Only you and your team members see them. We never publish individual results or share them with third parties. Delete a target and its scans go with it.</p>
+      </details>
+      <details style="background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px 22px;">
+        <summary style="cursor:pointer;font-weight:600;font-size:1rem;">Can I scan apps I don't own?</summary>
+        <p style="color:#9ca3af;margin-top:10px;font-size:0.92rem;line-height:1.6;">Only if you have authorization. Our Terms require you to own or have explicit permission to scan any target you submit. We do only read-only, non-destructive probes — but running an unauthorized scan can still violate local laws and the target's ToS. If you find something on someone else's app, please disclose responsibly.</p>
+      </details>
+      <details style="background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px 22px;">
+        <summary style="cursor:pointer;font-weight:600;font-size:1rem;">How is this different from Snyk, Cobalt, or Burp?</summary>
+        <p style="color:#9ca3af;margin-top:10px;font-size:0.92rem;line-height:1.6;">Snyk scans dependencies in your repo. Burp is an interactive proxy you drive by hand. Cobalt is a human pentest engagement. We scan the <em>live, deployed</em> URL — what an attacker actually sees — and emit fix instructions formatted for your AI coding assistant to execute. Built for the developer who ships on Lovable / Replit / Bolt and wants a security pass in 3 minutes, not a 2-week engagement.</p>
+      </details>
+      <details style="background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px 22px;">
+        <summary style="cursor:pointer;font-weight:600;font-size:1rem;">What's the difference between Free and paid?</summary>
+        <p style="color:#9ca3af;margin-top:10px;font-size:0.92rem;line-height:1.6;">Free runs every detection module and shows you every finding, once. Paid plans add ongoing monitoring (weekly / daily re-scans), email alerts when a new CRIT appears, multi-target tracking, priority queue, API access for CI/CD, and the AI-generated <code>SECURITY-FIX.md</code> file your assistant can execute.</p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<section id="newsletter" style="padding:60px 0;">
+  <div class="container" style="max-width:560px;text-align:center;">
+    <h2 style="font-size:1.5rem;">Get the next research post</h2>
+    <p class="sub" style="margin-bottom:24px;">One email when we publish — batch scans of new platforms, disclosure write-ups, no marketing.</p>
+    <form id="nl-form" style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;" onsubmit="return nlSubmit(event);">
+      <input type="email" id="nl-email" required placeholder="you@example.com" style="flex:1;min-width:220px;background:#111827;border:1px solid #1f2937;color:#e5e7eb;padding:12px 14px;border-radius:8px;font-size:0.95rem;font-family:inherit;">
+      <button type="submit" class="btn btn-primary" style="padding:12px 22px;">Subscribe</button>
+    </form>
+    <div id="nl-msg" style="margin-top:14px;font-size:0.85rem;color:#9ca3af;min-height:18px;"></div>
+  </div>
+</section>
+<script>
+async function nlSubmit(e) {
+  e.preventDefault();
+  const email = document.getElementById('nl-email').value.trim();
+  const msg = document.getElementById('nl-msg');
+  msg.style.color = '#9ca3af'; msg.textContent = 'Subscribing...';
+  try {
+    const r = await fetch('/api/newsletter', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({email, source:'landing'})});
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      msg.style.color = '#22c55e';
+      msg.textContent = d.message || "Thanks — we'll let you know.";
+      document.getElementById('nl-email').value = '';
+    } else {
+      msg.style.color = '#dc2626';
+      msg.textContent = d.error || 'Something went wrong — try again?';
+    }
+  } catch (err) {
+    msg.style.color = '#dc2626';
+    msg.textContent = 'Network error — try again?';
+  }
+  return false;
+}
+</script>
 <footer>
   <div class="container">
     <div>Security Scanner &mdash; Built for the AI-native developer</div>
     <div style="margin-top:12px;">
       <a href="/blog">Blog</a>
+      <a href="/blog/rss.xml">RSS</a>
+      <a href="/changelog">Changelog</a>
+      <a href="/status">Status</a>
       <a href="/docs/api">API</a>
       <a href="/contact">Contact</a>
       <a href="/privacy">Privacy</a>
       <a href="/terms">Terms</a>
       <a href="/login">Sign in</a>
     </div>
+    <div style="margin-top:10px;color:#4b5563;font-size:0.8rem;">Not open source today &middot; Read-only probes &middot; <a href="/.well-known/security.txt" style="color:#6b7280;">security.txt</a></div>
   </div>
 </footer>
 </body></html>"""
@@ -8219,6 +8299,431 @@ async def security_txt_alias():
         content=_SECURITY_TXT,
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Favicon — inline SVG (modern browsers) + ICO fallback (browsers that insist)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Brand: red square + nothing else. Renders as a clean monogram in tabs.
+_FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" rx="12" fill="#0a0e17"/>
+<rect x="14" y="14" width="36" height="36" rx="4" fill="#dc2626"/>
+</svg>"""
+
+
+@app.get("/favicon.ico")
+async def favicon_ico():
+    # Many tools still request /favicon.ico — return our SVG; browsers
+    # accept image/svg+xml here. This avoids needing an actual ICO file.
+    return Response(
+        content=_FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/favicon.svg")
+async def favicon_svg():
+    return Response(
+        content=_FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# robots.txt — let everything index, point at sitemap
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/robots.txt")
+async def robots_txt():
+    txt = (
+        "User-agent: *\n"
+        "Allow: /\n"
+        "Disallow: /api/\n"
+        "Disallow: /v1/\n"
+        "Disallow: /admin\n"
+        "Disallow: /dashboard\n"
+        "Disallow: /billing\n"
+        "Disallow: /keys\n"
+        "Disallow: /verify\n"
+        "Disallow: /oauth/\n"
+        "\n"
+        "Sitemap: https://securityscanner.dev/sitemap.xml\n"
+    )
+    return PlainTextResponse(
+        content=txt,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# sitemap.xml — public surfaces only (landing, blog index, each post, docs)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/sitemap.xml")
+async def sitemap_xml():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    static_urls = [
+        ("https://securityscanner.dev/", "1.0", "weekly"),
+        ("https://securityscanner.dev/blog", "0.9", "weekly"),
+        ("https://securityscanner.dev/docs/api", "0.8", "monthly"),
+        ("https://securityscanner.dev/contact", "0.5", "yearly"),
+        ("https://securityscanner.dev/privacy", "0.3", "yearly"),
+        ("https://securityscanner.dev/terms", "0.3", "yearly"),
+        ("https://securityscanner.dev/changelog", "0.6", "weekly"),
+        ("https://securityscanner.dev/status", "0.4", "weekly"),
+    ]
+    posts_xml = "".join(
+        f"  <url><loc>https://securityscanner.dev/blog/{p['slug']}</loc>"
+        f"<lastmod>{p['date']}</lastmod>"
+        f"<changefreq>monthly</changefreq><priority>0.7</priority></url>\n"
+        for p in _blog_sorted()
+    )
+    static_xml = "".join(
+        f"  <url><loc>{u}</loc><lastmod>{today}</lastmod>"
+        f"<changefreq>{cf}</changefreq><priority>{pr}</priority></url>\n"
+        for u, pr, cf in static_urls
+    )
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"{static_xml}{posts_xml}"
+        '</urlset>\n'
+    )
+    return Response(
+        content=body, media_type="application/xml",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RSS feed for /blog
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/blog/rss.xml")
+async def blog_rss():
+    import html as _html
+    posts = _blog_sorted()
+    items = []
+    for p in posts:
+        # Convert YYYY-MM-DD to RFC 822 (RSS spec)
+        try:
+            dt = datetime.strptime(p["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            pub = dt.strftime("%a, %d %b %Y 09:00:00 +0000")
+        except Exception:
+            pub = ""
+        items.append(
+            f"  <item>\n"
+            f"    <title>{_html.escape(p['title'])}</title>\n"
+            f"    <link>https://securityscanner.dev/blog/{p['slug']}</link>\n"
+            f"    <guid isPermaLink=\"true\">https://securityscanner.dev/blog/{p['slug']}</guid>\n"
+            f"    <pubDate>{pub}</pubDate>\n"
+            f"    <description>{_html.escape(p['excerpt'])}</description>\n"
+            f"    <category>{_html.escape(p.get('tag', 'Post'))}</category>\n"
+            f"  </item>"
+        )
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">\n'
+        '  <channel>\n'
+        '    <title>Security Scanner Blog</title>\n'
+        '    <link>https://securityscanner.dev/blog</link>\n'
+        '    <atom:link href="https://securityscanner.dev/blog/rss.xml" rel="self" type="application/rss+xml" />\n'
+        '    <description>Findings, write-ups, and notes from scanning AI-built apps in the wild.</description>\n'
+        '    <language>en-us</language>\n'
+        f'    <lastBuildDate>{datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}</lastBuildDate>\n'
+        + "\n".join(items) + "\n"
+        '  </channel>\n'
+        '</rss>\n'
+    )
+    return Response(
+        content=body, media_type="application/rss+xml; charset=utf-8",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OG / Twitter card image — generated PNG, served from /og.png
+# ═════════════════════════════════════════════════════════════════════════════
+
+_OG_IMAGE_BYTES: Optional[bytes] = None
+
+
+def _generate_og_image() -> bytes:
+    """1200x630 PNG, brand colors + tagline. Generated once at startup."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return b""
+    W, H = 1200, 630
+    img = Image.new("RGB", (W, H), color=(10, 14, 23))  # #0a0e17
+    draw = ImageDraw.Draw(img)
+    # Top-left red square mark + brand
+    draw.rectangle([(60, 60), (110, 110)], fill=(220, 38, 38))  # #dc2626
+    # Title
+    try:
+        title_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 64)
+        sub_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 32)
+        tag_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 22)
+    except Exception:
+        try:
+            title_font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 64,
+            )
+            sub_font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32,
+            )
+            tag_font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22,
+            )
+        except Exception:
+            title_font = ImageFont.load_default()
+            sub_font = ImageFont.load_default()
+            tag_font = ImageFont.load_default()
+    draw.text((130, 70), "Security Scanner", fill=(229, 231, 235), font=tag_font)
+    draw.text((60, 200), "Security scans for the", fill=(156, 163, 175), font=sub_font)
+    draw.text((60, 240), "vibe-coding era.", fill=(220, 38, 38), font=title_font)
+    draw.text((60, 360), (
+        "Scan any deployed app. Supabase RLS, AI-key leak"
+    ), fill=(209, 213, 219), font=sub_font)
+    draw.text((60, 400), (
+        "detection, GraphQL audit, subdomain takeover,"
+    ), fill=(209, 213, 219), font=sub_font)
+    draw.text((60, 440), "and more — fix files for Claude / Cursor.",
+              fill=(209, 213, 219), font=sub_font)
+    draw.text((60, 540), "securityscanner.dev",
+              fill=(220, 38, 38), font=sub_font)
+    draw.text((60, 580), "50+ checks · MCP · Custom GPT · API",
+              fill=(107, 114, 128), font=tag_font)
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+@app.get("/og.png")
+async def og_image():
+    global _OG_IMAGE_BYTES
+    if _OG_IMAGE_BYTES is None:
+        _OG_IMAGE_BYTES = _generate_og_image()
+    if not _OG_IMAGE_BYTES:
+        # Fallback: 1×1 transparent PNG
+        return Response(
+            content=bytes.fromhex(
+                "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15"
+                "c4890000000d49444154789c63fcffff3f0300050001fe0bb6f4040000000049454e44ae426082"
+            ),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+    return Response(
+        content=_OG_IMAGE_BYTES,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# /changelog — public list of user-visible changes
+# ═════════════════════════════════════════════════════════════════════════════
+
+_CHANGELOG_ENTRIES = [
+    ("2026-04-15", [
+        "New: 'What we check' capabilities section on the homepage — 50+ modules across 7 categories",
+        "New: blog redesign with hero + card grid + tags + reading time",
+        "New: /.well-known/security.txt for responsible-disclosure researchers",
+        "New: per-user hourly scan rate-limit + email-verify gate + target-add flood detection",
+        "New: public /health endpoint with live scanner state",
+        "Fix: text selection in finding rows no longer collapses the row",
+        "Infra: scaled to t3.2xlarge for HN-launch traffic; CF cache + rate-limit rules deployed",
+        "Billing: Stripe production live (PAYG, Monthly, Pro all chargeable)",
+    ]),
+    ("2026-04-14", [
+        "New: 14 modules — GraphQL introspection, default-port DB probe, infra-leak paths, "
+        "S3/GCS bucket extraction, OAuth open-redirect, JWT weak-secret crack, session entropy, "
+        "Hasura anonymous-role audit, typosquat detection, K8s/Docker unauth API checks, "
+        "Supabase service_role JWT detection, plus 17 new secret patterns",
+        "Fix: ai-triage no longer over-demotes deterministic findings",
+        "Fix: Supabase deep-probe now scans JS bundles (was HTML-only) and probes real "
+        "table names extracted from .from() / .rpc() / .storage / .functions calls",
+    ]),
+    ("2026-04-13", [
+        "New: AI chat prompt-injection probe with 2 minimal canary probes per endpoint",
+        "New: IDOR / BOLA sweep with PII-leak detection in response bodies",
+        "New: WAF / CDN fingerprinting (Cloudflare, Akamai, Fastly, Vercel, Netlify, etc.)",
+    ]),
+    ("2026-04-12", [
+        "New: scan-diff UI — compare two runs for the same target, see what changed",
+        "New: per-scan email notifications (first-scan welcome, daily digest, CRIT/HIGH alerts)",
+        "Fix: scoping bug — UNIQUE(host) is now per-user, not global",
+    ]),
+]
+
+
+_CHANGELOG_HTML = ""
+
+
+def _build_changelog():
+    global _CHANGELOG_HTML
+    sections = []
+    for date, items in _CHANGELOG_ENTRIES:
+        items_html = "".join(f"<li>{it}</li>" for it in items)
+        sections.append(
+            f'<div class="cl-entry"><div class="cl-date">{date}</div>'
+            f'<ul>{items_html}</ul></div>'
+        )
+    _CHANGELOG_HTML = "".join(sections)
+
+
+_build_changelog()
+
+
+@app.get("/changelog", response_class=HTMLResponse)
+async def changelog_page():
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Changelog — Security Scanner</title>
+<meta name="description" content="What's shipped recently in Security Scanner.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>{_BLOG_CSS}
+  .cl-entry {{ padding: 24px 0; border-bottom: 1px solid #1f2937; }}
+  .cl-entry:last-child {{ border-bottom: 0; }}
+  .cl-date {{ color: #dc2626; font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 12px; }}
+  .cl-entry ul {{ margin-left: 22px; }}
+  .cl-entry li {{ margin-bottom: 8px; color: #d1d5db; font-size: 0.95rem; }}
+</style></head>
+<body>
+{_render_blog_nav()}
+<div class="post-wrap">
+  <a href="/" class="back-link">← Home</a>
+  <header class="post-header">
+    <div class="row">
+      <span class="meta-text">Updated continuously</span>
+    </div>
+    <h1 class="post-title">Changelog</h1>
+    <p class="lead">What's shipped recently. Subscribe to the <a href="/blog/rss.xml" style="color:#dc2626;">RSS feed</a> for the longer-form posts behind these.</p>
+  </header>
+  <article>
+    {_CHANGELOG_HTML}
+  </article>
+</div>
+</body></html>""")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# /status — operational status (reads /health internally)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/status", response_class=HTMLResponse)
+async def status_page():
+    # Reuse the /health endpoint logic
+    import os as _os
+    state = "ok"
+    db_size = "?"
+    scans_running = 0
+    scans_1h = 0
+    last_completed = "?"
+    try:
+        with get_db() as db:
+            scans_running = db.execute(
+                "SELECT COUNT(*) FROM scan_runs WHERE status='running'"
+            ).fetchone()[0]
+            scans_1h = db.execute(
+                "SELECT COUNT(*) FROM scan_runs WHERE started_at > datetime('now','-1 hour')"
+            ).fetchone()[0]
+            row = db.execute(
+                "SELECT MAX(finished_at) FROM scan_runs WHERE status='completed'"
+            ).fetchone()
+            if row and row[0]:
+                last_completed = row[0]
+        db_path = _os.getenv("SCANNER_DB_PATH", "/home/ec2-user/scanner.db")
+        try:
+            db_size = f"{round(_os.path.getsize(db_path) / (1024 * 1024), 1)} MB"
+        except Exception:
+            pass
+    except Exception:
+        state = "down"
+
+    pill_color = {"ok": "#22c55e", "degraded": "#eab308", "down": "#ef4444"}.get(state, "#6b7280")
+    pill_text = {"ok": "All systems operational", "degraded": "Degraded", "down": "Outage"}.get(state, "Unknown")
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Status — Security Scanner</title>
+<meta name="description" content="Live operational status of the Security Scanner.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>{_BLOG_CSS}
+  .status-pill {{ display: inline-flex; align-items: center; gap: 10px; padding: 10px 18px; border-radius: 30px; background: {pill_color}1a; border: 1px solid {pill_color}; color: {pill_color}; font-weight: 600; }}
+  .status-dot {{ width: 10px; height: 10px; border-radius: 50%; background: {pill_color}; box-shadow: 0 0 0 4px {pill_color}33; }}
+  .stat-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 36px; }}
+  .stat-card {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 18px 20px; }}
+  .stat-card .label {{ color: #9ca3af; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }}
+  .stat-card .val {{ color: white; font-size: 1.6rem; font-weight: 700; }}
+</style></head>
+<body>
+{_render_blog_nav()}
+<div class="post-wrap">
+  <a href="/" class="back-link">← Home</a>
+  <header class="post-header">
+    <h1 class="post-title">Status</h1>
+    <div style="margin-top:14px;"><span class="status-pill"><span class="status-dot"></span>{pill_text}</span></div>
+  </header>
+  <article>
+    <div class="stat-row">
+      <div class="stat-card"><div class="label">Scans running</div><div class="val">{scans_running}</div></div>
+      <div class="stat-card"><div class="label">Scans last hour</div><div class="val">{scans_1h}</div></div>
+      <div class="stat-card"><div class="label">DB size</div><div class="val">{db_size}</div></div>
+      <div class="stat-card"><div class="label">Last completed</div><div class="val" style="font-size:0.8rem;">{last_completed[:19] if last_completed != "?" else "?"}</div></div>
+    </div>
+    <p style="margin-top:32px;">Live JSON: <a href="/health" style="color:#dc2626;">/health</a></p>
+    <p style="color:#9ca3af;font-size:0.9rem;">Issue with the scanner? Email <a href="mailto:stefan@securityscanner.dev" style="color:#dc2626;">stefan@securityscanner.dev</a>.</p>
+  </article>
+</div>
+</body></html>""")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Newsletter signup — POST /api/newsletter
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _ensure_newsletter_table():
+    with get_db() as db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS newsletter_subscribers ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  email TEXT NOT NULL UNIQUE,"
+            "  source TEXT,"
+            "  ip TEXT,"
+            "  created_at TEXT DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+
+
+_ensure_newsletter_table()
+
+
+@app.post("/api/newsletter")
+async def newsletter_signup(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    email = (data.get("email") or "").strip().lower()[:240]
+    source = (data.get("source") or "landing")[:50]
+    if "@" not in email or "." not in email.split("@")[-1] or len(email) < 5:
+        return JSONResponse({"error": "Please enter a valid email address."}, status_code=400)
+    ip = (request.client.host if request.client else "")[:64]
+    try:
+        with get_db() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO newsletter_subscribers (email, source, ip) VALUES (?, ?, ?)",
+                (email, source, ip),
+            )
+    except Exception:
+        return JSONResponse({"error": "Could not save your email — please email stefan@securityscanner.dev directly."}, status_code=500)
+    return {"ok": True, "message": "Thanks — we'll let you know when we publish."}
 
 
 _LEGAL_CSS = """
@@ -9087,6 +9592,15 @@ async def blog_index():
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Blog — Security Scanner</title>
 <meta name="description" content="Findings, write-ups, and notes from scanning AI-built apps in the wild.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Security Scanner Blog" href="/blog/rss.xml">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://securityscanner.dev/blog">
+<meta property="og:title" content="Security Scanner Blog">
+<meta property="og:description" content="Findings, write-ups, and notes from scanning AI-built apps in the wild.">
+<meta property="og:image" content="https://securityscanner.dev/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://securityscanner.dev/og.png">
 <style>{_BLOG_CSS}</style></head>
 <body>
 {_render_blog_nav()}
@@ -9132,6 +9646,18 @@ async def blog_post(slug: str):
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{p['title']} — Security Scanner</title>
 <meta name="description" content="{p['excerpt']}">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="alternate" type="application/rss+xml" title="Security Scanner Blog" href="/blog/rss.xml">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://securityscanner.dev/blog/{p['slug']}">
+<meta property="og:title" content="{p['title']}">
+<meta property="og:description" content="{p['excerpt']}">
+<meta property="og:image" content="https://securityscanner.dev/og.png">
+<meta property="article:published_time" content="{p['date']}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{p['title']}">
+<meta name="twitter:description" content="{p['excerpt']}">
+<meta name="twitter:image" content="https://securityscanner.dev/og.png">
 <style>{_BLOG_CSS}</style></head>
 <body>
 {_render_blog_nav()}

@@ -1368,7 +1368,16 @@ def scan_target_baas(run_id: str, ip: str, name: str):
                 generic = {"users", "profiles", "accounts", "messages",
                            "posts", "admin", "sites", "pages", "orders",
                            "invoices", "tasks", "businesses"}
-                tables_to_probe = list(discovered | generic)[:40]
+                # IMPORTANT: sorted() + deterministic order. Previously used
+                # `list(discovered | generic)[:40]` — set-iteration order is
+                # non-deterministic between Python invocations, so when
+                # discovered+generic exceeded 40, different tables got dropped
+                # across runs. Observed on 2026-04-15 — same target produced
+                # different CRIT tables across consecutive scans. Sort both
+                # sets (discovered first so real tables always win the cap).
+                tables_to_probe = (
+                    sorted(discovered) + [t for t in sorted(generic) if t not in discovered]
+                )[:40]
                 if discovered:
                     findings.append({
                         "target": ip, "severity": "INFO", "category": "baas",
@@ -2109,14 +2118,16 @@ _INFRA_LEAK_PROBES = [
     ("/phpinfo.php", r"PHP\s*Version\s*=>",
      "HIGH", "phpinfo() page exposed (full PHP config + env)"),
     # VCS / source-tree leaks
-    ("/.git/config", r"\[core\]",
+    ("/.git/config", r"\[core\][^\]]*(?:repositoryformatversion|bare|filemode|logallrefupdates)",
      "HIGH", "/.git/config readable (full repo reconstructable via git-dumper)"),
-    ("/.git/HEAD", r"^ref:\s*refs/",
+    ("/.git/HEAD", r"^ref:\s*refs/heads/[a-zA-Z0-9_\-/.]+\s*$",
      "HIGH", "/.git/HEAD readable (git-tree exposure)"),
-    ("/.svn/entries", r"^\d+",
+    ("/.svn/entries", r"^\d+\s*\ndir\s*\n",
      "HIGH", "Subversion /.svn/entries readable"),
-    ("/.hg/store/00manifest.i", r".",
-     "HIGH", "Mercurial /.hg store readable"),
+    # /.hg/store/00manifest.i is a BINARY file. A `.` regex matched any
+    # non-empty HTML served by SPA fallbacks → 43 false positives per batch.
+    # Removed: too unreliable to fingerprint without downloading + parsing
+    # the binary manifest format.
     ("/.DS_Store", r"^Bud1",
      "MEDIUM", ".DS_Store exposed (directory listing leak)"),
     # Config files
@@ -2141,15 +2152,18 @@ _INFRA_LEAK_PROBES = [
     ("/config.json", r"\"(password|api_key|secret|token)\"\s*:",
      "HIGH", "config.json publicly served"),
     # Java web apps
-    ("/WEB-INF/web.xml", r"<web-app",
+    ("/WEB-INF/web.xml", r"<web-app[^>]*>.*<(?:servlet|filter|listener)",
      "HIGH", "Java WEB-INF/web.xml readable"),
-    ("/WEB-INF/classes/application.properties", r"=",
+    # /WEB-INF/classes/application.properties — old sig `=` matched every HTML
+    # page containing a <meta> tag. Tightened: require a Spring/Java property
+    # key-prefix on its own line.
+    ("/WEB-INF/classes/application.properties",
+     r"(?m)^(?:spring\.|server\.|logging\.|management\.|jdbc\.|jpa\.|hibernate\.)[\w.]+\s*=",
      "HIGH", "Java application.properties readable"),
-    # Next.js debug / dev endpoints that shouldn't ship
-    ("/__next/static/chunks/pages/_error.js", r"trace|stack",
-     "LOW", "Next.js error dev bundle reachable"),
     # Swagger UI (not necessarily bad but discoverable)
-    # Already handled by scan_target_docs
+    # Already handled by scan_target_docs.
+    # (Removed /__next/static/chunks/pages/_error.js — regex `trace|stack`
+    #  matched almost every JS file. Low-value even when correct.)
 ]
 
 
@@ -2170,12 +2184,30 @@ _INFRA_LEAK_K8S_DOCKER = [
 
 
 def scan_target_infra_leaks(run_id: str, ip: str, name: str):
-    """Enumerate common leaked-configuration paths + unauth K8s/Docker APIs."""
+    """Enumerate common leaked-configuration paths + unauth K8s/Docker APIs.
+
+    SPA-fallback guard: we first fetch the site's homepage and keep a hash
+    of the first 500 bytes. Any probe whose response matches that hash is
+    treated as a soft 404 (SPA serving index.html for every unknown route)
+    and skipped — this prevents false positives that plagued the 2026-04-15
+    batch where `/_hg/store` and `/WEB-INF/*.properties` matched the
+    Lovable/Bolt default SPA HTML."""
     findings = []
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         schemes = [(f"http://{ip}", 80), (f"https://{ip}", 443)]
     else:
         schemes = [(f"https://{ip}", 443), (f"http://{ip}", 80)]
+
+    # Fetch homepage once for SPA-fallback fingerprinting
+    import hashlib as _hashlib
+    spa_fingerprint: Optional[str] = None
+    spa_size: int = 0
+    for base, _ in schemes:
+        hp = run_cmd(["curl", "-sk", "-m", "5", base + "/"], timeout=8)
+        if hp and "[TIMEOUT" not in hp and "[ERROR" not in hp and len(hp) > 40:
+            spa_fingerprint = _hashlib.sha256(hp[:500].encode("utf-8", errors="replace")).hexdigest()
+            spa_size = len(hp)
+            break
 
     # Phase 1 — HTTP path probes on 80/443
     probed = 0
@@ -2197,6 +2229,16 @@ def scan_target_infra_leaks(run_id: str, ip: str, name: str):
             )
             if not body or "[TIMEOUT" in body or "[ERROR" in body:
                 continue
+            # SPA-fallback guard — if this response is (approximately) the
+            # homepage, the server is a SPA serving index.html for unknown
+            # routes. Skip regex matching to avoid chance signature hits.
+            if spa_fingerprint is not None:
+                body_fp = _hashlib.sha256(body[:500].encode("utf-8", errors="replace")).hexdigest()
+                if body_fp == spa_fingerprint:
+                    continue
+                # Also skip if size is within 10% of homepage AND body is HTML
+                if spa_size > 0 and abs(len(body) - spa_size) / max(spa_size, 1) < 0.10 and "<!DOCTYPE html" in body[:200].lower():
+                    continue
             if re.search(sig_re, body[:8000], re.MULTILINE):
                 findings.append({
                     "target": ip, "severity": sev, "category": "disclosure",

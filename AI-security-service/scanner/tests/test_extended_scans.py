@@ -166,6 +166,90 @@ class TestInfraLeaks:
         findings = scan_target_infra_leaks("r1", "example.com", "t")
         assert findings == []
 
+    @patch("scanner.app.run_cmd")
+    def test_spa_fallback_does_not_trigger_false_positives(self, mock_cmd):
+        """Regression for 2026-04-15 batch v2: Lovable/Bolt SPAs serve the
+        homepage HTML for every unknown route. The infra-leak probe used to
+        match those responses with overly-permissive regexes (e.g. `=`
+        matched any HTML containing a <meta> tag). New guard: hash the
+        homepage, skip any probe whose body hashes to the same fingerprint.
+        """
+        spa_html = (
+            "<!DOCTYPE html><html><head>"
+            "<meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width\">"
+            "<title>Lovable App</title>"
+            "<script src=\"/assets/index.js\"></script>"
+            "</head><body><div id=\"root\"></div></body></html>"
+        )
+        def se(cmd, timeout=300):
+            # %{http_code} probe for any URL → 200
+            if "%{http_code}" in " ".join(cmd):
+                return "200"
+            # All GETs return the same SPA HTML
+            return spa_html
+        mock_cmd.side_effect = se
+        from scanner.app import scan_target_infra_leaks
+        findings = scan_target_infra_leaks("r1", "example.com", "t")
+        # ZERO findings — every probe hit the SPA fallback, guard filtered.
+        assert findings == [], f"SPA fallback produced spurious findings: {findings}"
+
+
+class TestSupabaseTableProbeDeterminism:
+    """Regression for 2026-04-15 batch v2: set iteration order left the
+    first N tables probed non-deterministic when the discovered+generic
+    union exceeded the 40-table cap. Same target produced different CRITs
+    on consecutive scans. Fix: sort and prefer discovered tables first."""
+
+    @patch("scanner.app.run_cmd")
+    def test_probe_order_is_stable_across_runs(self, mock_cmd):
+        import json as _json
+        # Build a JS bundle with many app-specific tables — enough to push
+        # past the 40-table cap when combined with the generic set.
+        discovered_tables = [f"app_table_{i}" for i in range(35)]
+        js = "".join(f"sb.from('{t}').select('*');" for t in discovered_tables)
+        jwt = ("eyJhbGciOiJIUzI1NiJ9."
+               "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InByb2oiLCJyb2xlIjoiYW5vbiJ9."
+               "sig")
+        html = f'<script src="/a.js"></script><script>const k="{jwt}";const u="https://proj.supabase.co";</script>'
+        # Track order of tables probed
+        probed = []
+        def se(cmd, timeout=300):
+            url = cmd[-1]
+            if url.endswith("/"):
+                return html
+            if url.endswith(".js"):
+                return js
+            if "/rest/v1/" in url:
+                m = re.search(r"/rest/v1/([^?]+)", url)
+                if m:
+                    probed.append(m.group(1))
+                return "[]"  # no data → no CRIT, but we're just tracking order
+            return ""
+        import re
+        mock_cmd.side_effect = se
+        from scanner.app import scan_target_baas
+
+        # Run twice — order should match exactly
+        probed.clear()
+        scan_target_baas("r1", "example.com", "t")
+        first_order = list(probed)
+
+        probed.clear()
+        scan_target_baas("r2", "example.com", "t")
+        second_order = list(probed)
+
+        assert first_order == second_order, (
+            f"table probe order drifted between runs.\nfirst={first_order[:10]}\n"
+            f"second={second_order[:10]}"
+        )
+        # Discovered tables should appear before generic (priority ordering)
+        assert "app_table_0" in first_order
+        # First probed table should be a discovered one, not a generic one
+        assert first_order[0].startswith("app_table_"), (
+            f"Generic-list table probed before discovered: {first_order[0]}"
+        )
+
 
 class TestExtendedSecrets:
     def test_gcp_service_account_detected(self):

@@ -295,6 +295,43 @@ class TestExtendedSecrets:
         assert False, "Clerk secret key not caught as CRITICAL"
 
 
+class TestHNLaunchHardening:
+    """Verify Phase 2 changes wired in correctly."""
+
+    def test_bounded_run_full_scan_exists(self):
+        from scanner.app import _bounded_run_full_scan, _SCAN_SEM
+        assert callable(_bounded_run_full_scan)
+        import asyncio
+        assert isinstance(_SCAN_SEM, asyncio.Semaphore)
+
+    def test_require_verified_email_gates_email_signups(self):
+        from scanner.app import require_verified_email
+        # Google OAuth user (auto-verified in practice) — pass
+        ok, _ = require_verified_email({"auth_provider": "google", "email_verified": 1})
+        assert ok
+        # Email signup, unverified — block
+        ok, reason = require_verified_email({"auth_provider": "email", "email_verified": 0})
+        assert not ok and "verify your email" in reason.lower()
+        # Email signup, verified — pass
+        ok, _ = require_verified_email({"auth_provider": "email", "email_verified": 1})
+        assert ok
+
+    def test_check_target_add_flood_blocks_over_10(self, monkeypatch):
+        from scanner import app as scanner_app
+        class FakeCtx:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def execute(self, *a, **kw):
+                class R: pass
+                r = R()
+                # Simulate >10 targets added in last hour
+                r.fetchone = lambda: (11,)
+                return r
+        monkeypatch.setattr(scanner_app, "get_db", lambda: FakeCtx())
+        ok, reason = scanner_app.check_target_add_flood("u1")
+        assert not ok and "10/hour" in reason
+
+
 class TestGraphQLProbe:
     @patch("scanner.app.subprocess.run")
     @patch("scanner.app.get_db")

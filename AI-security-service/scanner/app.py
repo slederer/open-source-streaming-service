@@ -77,6 +77,32 @@ app.add_middleware(
 )
 
 
+_CACHEABLE_PATH_PREFIXES = ("/blog", "/docs/api", "/docs")
+_CACHEABLE_EXACT = {"/", "/contact", "/privacy", "/terms"}
+
+
+@app.middleware("http")
+async def _public_page_cache_headers(request: Request, call_next):
+    """Add Cache-Control to the public, read-only pages so Cloudflare can
+    cache at the edge. Critical before HN launch — thousands of pageviews
+    hit origin uncached otherwise. Auth-gated pages are NOT cached."""
+    response = await call_next(request)
+    if request.method != "GET":
+        return response
+    path = request.url.path
+    is_cacheable = path in _CACHEABLE_EXACT or any(
+        path.startswith(p) for p in _CACHEABLE_PATH_PREFIXES
+    )
+    # Skip if already set (e.g., the /health endpoint has no-cache)
+    if is_cacheable and "cache-control" not in {k.lower() for k in response.headers}:
+        # Home dashboard returns personalized content when signed in —
+        # detect via the session cookie's presence and skip caching then.
+        has_session = "session" in request.cookies
+        if not (path == "/" and has_session):
+            response.headers["Cache-Control"] = "public, max-age=300, s-maxage=1800"
+    return response
+
+
 @app.middleware("http")
 async def _force_secure_cookie(request: Request, call_next):
     """Guarantee the Secure attribute on Set-Cookie regardless of origin scheme.
@@ -3330,6 +3356,17 @@ def can_user_scan(user_id: str) -> tuple[bool, str]:
 
     with get_db() as db:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Per-hour burst limit (Free plan only) — stops HN-launch-style
+        # scripted abuse from a single account bursting through daily quota
+        # in seconds.
+        if plan == "free":
+            hour_count = db.execute(
+                "SELECT COUNT(*) FROM scan_runs WHERE user_id=? "
+                "AND started_at > datetime('now','-1 hour')",
+                (user_id,),
+            ).fetchone()[0]
+            if hour_count >= 3:
+                return False, "Rate limit: 3 scans per hour on Free plan. Wait or upgrade."
         # Daily limit
         if "scans_per_day" in limits and limits["scans_per_day"] is not None:
             today_count = db.execute(
@@ -3355,6 +3392,48 @@ def can_user_scan(user_id: str) -> tuple[bool, str]:
             return False, f"Target limit exceeded ({limits['max_targets']} for {plan} plan)"
 
     return True, ""
+
+
+def require_verified_email(user: dict) -> tuple[bool, str]:
+    """Free-tier abuse guard — Google-OAuth users are auto-verified; email
+    signups must click the verification link before any scan fires."""
+    provider = user.get("auth_provider", "email")
+    if provider == "email" and not user.get("email_verified"):
+        return False, (
+            "Please verify your email before scanning. "
+            "Check your inbox for the verification link."
+        )
+    return True, ""
+
+
+def check_target_add_flood(user_id: str) -> tuple[bool, str]:
+    """Reject if a user has added >10 targets in the last hour — signal of
+    scripted recon-as-a-service abuse."""
+    with get_db() as db:
+        recent = db.execute(
+            "SELECT COUNT(*) FROM targets WHERE user_id=? "
+            "AND added_at > datetime('now','-1 hour')",
+            (user_id,),
+        ).fetchone()[0]
+    if recent > 10:
+        return False, (
+            "Too many targets added recently (10/hour limit). "
+            "Wait an hour or email stefan@securityscanner.dev if legitimate."
+        )
+    return True, ""
+
+
+# Bounded-concurrency wrapper. The scanner spawns background tasks on every
+# /api/scan and /v1/scan. Without a cap, a HN-launch burst (hundreds of
+# near-simultaneous signups hitting Scan) would fork hundreds of threads +
+# overwhelm the AI-module API quotas. Semaphore caps in-flight at 12;
+# excess requests queue inside the process.
+_SCAN_SEM = asyncio.Semaphore(int(os.getenv("SCAN_CONCURRENCY_CAP", "12")))
+
+
+async def _bounded_run_full_scan(run_id: str, targets: list, user_id: Optional[str] = None):
+    async with _SCAN_SEM:
+        await asyncio.to_thread(run_full_scan, run_id, targets, user_id)
 
 
 def consume_scan_credit(user_id: str):
@@ -4113,20 +4192,41 @@ async def stripe_webhook(request: Request):
         except Exception:
             return JSONResponse({"error": "Invalid webhook signature"}, status_code=400)
 
-    event_type = event["type"] if isinstance(event, dict) else event.type
-    data = (event["data"]["object"] if isinstance(event, dict) else event.data.object)
+    # Normalize to plain dict. Stripe's StripeObject overrides __getattr__
+    # and __getitem__ in ways that raise AttributeError on missing keys,
+    # which broke the previous `.get()`-chaining approach on live webhook
+    # events (observed 2026-04-15 with sk_live — webhook returned 500 on
+    # every checkout.session.completed).
+    if isinstance(event, dict):
+        event_type = event.get("type", "")
+        data = event.get("data", {}).get("object", {}) or {}
+    else:
+        event_type = getattr(event, "type", "") or ""
+        _obj = getattr(getattr(event, "data", None), "object", None)
+        try:
+            data = _obj.to_dict_recursive() if _obj is not None and hasattr(_obj, "to_dict_recursive") else (dict(_obj) if _obj is not None else {})
+        except Exception:
+            data = {}
 
     if event_type == "checkout.session.completed":
-        user_id = (data.get("metadata") or {}).get("user_id")
-        plan = (data.get("metadata") or {}).get("plan", "payg")
+        metadata = data.get("metadata") or {}
+        user_id = metadata.get("user_id")
+        plan = metadata.get("plan", "payg")
+        customer_id = data.get("customer")
         if user_id:
             with get_db() as db:
                 if plan == "payg":
-                    db.execute("UPDATE users SET scan_credits = scan_credits + 1, plan='payg' WHERE id=?", (user_id,))
+                    db.execute(
+                        "UPDATE users SET scan_credits = COALESCE(scan_credits, 0) + 1, plan='payg', stripe_customer_id=COALESCE(stripe_customer_id, ?) WHERE id=?",
+                        (customer_id, user_id),
+                    )
                 else:
-                    # Subscription — set plan + expires_at ~ 31 days out (webhook will update)
+                    # Subscription — set plan + expires_at ~ 31 days out (invoice.paid will renew)
                     expires = (datetime.now(timezone.utc) + timedelta(days=31)).isoformat()
-                    db.execute("UPDATE users SET plan=?, plan_expires_at=? WHERE id=?", (plan, expires, user_id))
+                    db.execute(
+                        "UPDATE users SET plan=?, plan_expires_at=?, stripe_customer_id=COALESCE(stripe_customer_id, ?) WHERE id=?",
+                        (plan, expires, customer_id, user_id),
+                    )
 
     elif event_type == "invoice.paid":
         # Renewal — extend plan
@@ -4142,7 +4242,10 @@ async def stripe_webhook(request: Request):
         if customer_id:
             with get_db() as db:
                 if event_type == "customer.subscription.deleted" or status == "canceled":
-                    db.execute("UPDATE users SET plan='free', plan_expires_at=NULL WHERE stripe_customer_id=?", (customer_id,))
+                    db.execute(
+                        "UPDATE users SET plan='free', plan_expires_at=NULL WHERE stripe_customer_id=?",
+                        (customer_id,),
+                    )
 
     return {"received": True}
 
@@ -4593,6 +4696,11 @@ async def add_target(request: Request):
     if not ok:
         return JSONResponse({"error": f"Invalid target: {reason}"}, status_code=400)
 
+    # Target-add flood detection (rejects >10 new targets per hour per user)
+    ok_flood, flood_reason = check_target_add_flood(user["user_id"])
+    if not ok_flood:
+        return JSONResponse({"error": flood_reason}, status_code=429)
+
     # Enforce target limit per plan
     full_user = get_user_by_id(user["user_id"])
     plan = (full_user or {}).get("plan", "free")
@@ -4702,6 +4810,12 @@ async def start_scan(request: Request, background_tasks: BackgroundTasks, scan_t
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
+    # Block unverified email-signups from scanning (OAuth users are auto-verified)
+    full_user = get_user_by_id(user["user_id"]) or {}
+    verified, reason = require_verified_email(full_user)
+    if not verified:
+        return JSONResponse({"error": reason}, status_code=403)
+
     targets = parse_targets(user_id=user["user_id"])
     if not targets:
         return JSONResponse({"error": "No targets configured. Add a target first."}, status_code=400)
@@ -4725,7 +4839,7 @@ async def start_scan(request: Request, background_tasks: BackgroundTasks, scan_t
                 "INSERT INTO scan_runs (id, started_at, status, targets, target, scan_type, user_id) VALUES (?,?,?,?,?,?,?)",
                 (run_id, now, "running", json.dumps([t["ip"]]), t["ip"], scan_type, user["user_id"]),
             )
-        background_tasks.add_task(run_full_scan, run_id, [t], user["user_id"])
+        background_tasks.add_task(_bounded_run_full_scan, run_id, [t], user["user_id"])
         run_ids.append({"run_id": run_id, "target": t["ip"]})
 
     result = {"run_ids": run_ids, "count": len(run_ids), "status": "started"}
@@ -6071,6 +6185,12 @@ async def v1_scan(request: Request, background_tasks: BackgroundTasks):
     if not user:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
+    # Block unverified email-signups (OAuth users are auto-verified)
+    full_user = get_user_by_id(user["user_id"]) or {}
+    verified, vreason = require_verified_email(full_user)
+    if not verified:
+        return JSONResponse({"error": vreason}, status_code=403)
+
     allowed, reason = can_user_scan(user["user_id"])
     if not allowed:
         return JSONResponse({"error": reason, "upgrade_url": "https://securityscanner.dev/billing"}, status_code=402)
@@ -6121,7 +6241,7 @@ async def v1_scan(request: Request, background_tasks: BackgroundTasks):
         )
 
     single_target = [{"ip": host, "name": label}]
-    background_tasks.add_task(run_full_scan, run_id, single_target, user["user_id"])
+    background_tasks.add_task(_bounded_run_full_scan, run_id, single_target, user["user_id"])
     return {"run_id": run_id, "status": "started", "target": host, "check_status_url": f"https://securityscanner.dev/v1/scan/{run_id}"}
 
 
@@ -6276,6 +6396,15 @@ async def v1_add_target(request: Request):
     if not host:
         return JSONResponse({"error": "host is required"}, status_code=400)
     host = re.sub(r"^https?://", "", host).rstrip("/")
+    # SSRF / validity guard — reject private/loopback/metadata IPs + malformed hostnames.
+    ok, reason = validate_scan_target(host, allow_unresolvable=True)
+    if not ok:
+        return JSONResponse({"error": f"Invalid target: {reason}"}, status_code=400)
+
+    # Target-add flood detection
+    ok_flood, flood_reason = check_target_add_flood(user["user_id"])
+    if not ok_flood:
+        return JSONResponse({"error": flood_reason}, status_code=429)
 
     full_user = get_user_by_id(user["user_id"])
     plan = (full_user or {}).get("plan", "free")
@@ -7829,6 +7958,86 @@ async def home(request: Request):
         return HTMLResponse(_LANDING_HTML)
     # Authenticated users get the dashboard
     return await _render_dashboard(request, user)
+
+
+# Process-start timestamp for /health uptime computation
+_PROCESS_STARTED_AT = datetime.now(timezone.utc)
+
+
+@app.get("/health")
+async def health_endpoint():
+    """Public operational health check. No auth. Meant for UptimeRobot +
+    manual checks during launch. Returns:
+      status: ok | degraded | down
+      db_size_mb, scans_running, scans_queued_estimate,
+      semaphore_available, signups_last_hour, scans_last_hour,
+      last_scan_completed_at, uptime_s
+    """
+    import os as _os
+    out: dict = {"status": "ok"}
+    try:
+        # DB stats + counters
+        with get_db() as db:
+            scans_running = db.execute(
+                "SELECT COUNT(*) FROM scan_runs WHERE status='running'"
+            ).fetchone()[0]
+            signups_1h = db.execute(
+                "SELECT COUNT(*) FROM users WHERE created_at > datetime('now','-1 hour')"
+            ).fetchone()[0]
+            scans_1h = db.execute(
+                "SELECT COUNT(*) FROM scan_runs WHERE started_at > datetime('now','-1 hour')"
+            ).fetchone()[0]
+            last_scan_row = db.execute(
+                "SELECT MAX(finished_at) FROM scan_runs WHERE status='completed'"
+            ).fetchone()
+        last_scan_completed_at = last_scan_row[0] if last_scan_row else None
+
+        db_path = _os.getenv("SCANNER_DB_PATH", "/home/ec2-user/scanner.db")
+        try:
+            db_size_mb = round(_os.path.getsize(db_path) / (1024 * 1024), 2)
+        except Exception:
+            db_size_mb = None
+
+        sem_total = _SCAN_SEM._value if hasattr(_SCAN_SEM, "_value") else None
+        sem_cap = int(_os.getenv("SCAN_CONCURRENCY_CAP", "12"))
+        scans_queued_estimate = max(scans_running - sem_cap, 0)
+
+        uptime_s = int((datetime.now(timezone.utc) - _PROCESS_STARTED_AT).total_seconds())
+
+        out.update({
+            "db_path": db_path,
+            "db_size_mb": db_size_mb,
+            "scans_running": scans_running,
+            "scans_queued_estimate": scans_queued_estimate,
+            "semaphore_cap": sem_cap,
+            "semaphore_available": sem_total,
+            "signups_last_hour": signups_1h,
+            "scans_last_hour": scans_1h,
+            "last_scan_completed_at": last_scan_completed_at,
+            "uptime_s": uptime_s,
+        })
+
+        # Degraded if saturation + stuck scans or recent-scan age > 30 min
+        if scans_running > 0 and last_scan_completed_at:
+            try:
+                last_dt = datetime.fromisoformat(last_scan_completed_at.replace("Z", "+00:00"))
+                age_min = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+                if age_min > 30 and scans_running > 3:
+                    out["status"] = "degraded"
+                    out["degraded_reason"] = (
+                        f"No scan completed in {int(age_min)} min "
+                        f"but {scans_running} are 'running' — likely stuck."
+                    )
+            except Exception:
+                pass
+        if sem_total is not None and sem_total == 0 and scans_running >= sem_cap:
+            out["status"] = "degraded"
+            out["degraded_reason"] = "Scan concurrency at cap — requests queueing."
+    except Exception as e:
+        out = {"status": "down", "error": type(e).__name__}
+    # Never cache /health
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+    return JSONResponse(out, headers=headers)
 
 
 async def _render_dashboard(request: Request, user: dict):

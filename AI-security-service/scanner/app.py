@@ -8053,6 +8053,39 @@ async def _render_dashboard(request: Request, user: dict):
     return HTMLResponse(html)
 
 
+# RFC 9116 security.txt — researchers point our own scanner at us, they
+# look here. Expires field is mandatory; pick 1 year out and re-sign annually.
+_SECURITY_TXT = """\
+Contact: mailto:stefan@securityscanner.dev
+Contact: mailto:security@securityscanner.dev
+Expires: 2027-04-15T00:00:00Z
+Preferred-Languages: en
+Canonical: https://securityscanner.dev/.well-known/security.txt
+Policy: https://securityscanner.dev/contact
+Acknowledgments: https://securityscanner.dev/blog
+# We respond to all reports within 48 hours. Please include reproduction
+# steps and any evidence (URL + timestamps). For high-severity issues,
+# please email stefan@ directly. Thank you for keeping the scanner secure.
+"""
+
+
+@app.get("/.well-known/security.txt")
+async def security_txt():
+    return PlainTextResponse(
+        content=_SECURITY_TXT,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/security.txt")
+async def security_txt_alias():
+    """Older convention used /security.txt at the root before RFC 9116."""
+    return PlainTextResponse(
+        content=_SECURITY_TXT,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 _LEGAL_CSS = """
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.6; }

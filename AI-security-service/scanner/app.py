@@ -8618,31 +8618,10 @@ async def changelog_page():
 
 @app.get("/status", response_class=HTMLResponse)
 async def status_page():
-    # Reuse the /health endpoint logic
-    import os as _os
     state = "ok"
-    db_size = "?"
-    scans_running = 0
-    scans_1h = 0
-    last_completed = "?"
     try:
         with get_db() as db:
-            scans_running = db.execute(
-                "SELECT COUNT(*) FROM scan_runs WHERE status='running'"
-            ).fetchone()[0]
-            scans_1h = db.execute(
-                "SELECT COUNT(*) FROM scan_runs WHERE started_at > datetime('now','-1 hour')"
-            ).fetchone()[0]
-            row = db.execute(
-                "SELECT MAX(finished_at) FROM scan_runs WHERE status='completed'"
-            ).fetchone()
-            if row and row[0]:
-                last_completed = row[0]
-        db_path = _os.getenv("SCANNER_DB_PATH", "/home/ec2-user/scanner.db")
-        try:
-            db_size = f"{round(_os.path.getsize(db_path) / (1024 * 1024), 1)} MB"
-        except Exception:
-            pass
+            db.execute("SELECT 1").fetchone()
     except Exception:
         state = "down"
 
@@ -8657,10 +8636,6 @@ async def status_page():
 <style>{_BLOG_CSS}
   .status-pill {{ display: inline-flex; align-items: center; gap: 10px; padding: 10px 18px; border-radius: 30px; background: {pill_color}1a; border: 1px solid {pill_color}; color: {pill_color}; font-weight: 600; }}
   .status-dot {{ width: 10px; height: 10px; border-radius: 50%; background: {pill_color}; box-shadow: 0 0 0 4px {pill_color}33; }}
-  .stat-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 36px; }}
-  .stat-card {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 18px 20px; }}
-  .stat-card .label {{ color: #9ca3af; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }}
-  .stat-card .val {{ color: white; font-size: 1.6rem; font-weight: 700; }}
 </style></head>
 <body>
 {_render_blog_nav()}
@@ -8671,14 +8646,7 @@ async def status_page():
     <div style="margin-top:14px;"><span class="status-pill"><span class="status-dot"></span>{pill_text}</span></div>
   </header>
   <article>
-    <div class="stat-row">
-      <div class="stat-card"><div class="label">Scans running</div><div class="val">{scans_running}</div></div>
-      <div class="stat-card"><div class="label">Scans last hour</div><div class="val">{scans_1h}</div></div>
-      <div class="stat-card"><div class="label">DB size</div><div class="val">{db_size}</div></div>
-      <div class="stat-card"><div class="label">Last completed</div><div class="val" style="font-size:0.8rem;">{last_completed[:19] if last_completed != "?" else "?"}</div></div>
-    </div>
-    <p style="margin-top:32px;">Live JSON: <a href="/health" style="color:#dc2626;">/health</a></p>
-    <p style="color:#9ca3af;font-size:0.9rem;">Issue with the scanner? Email <a href="mailto:stefan@securityscanner.dev" style="color:#dc2626;">stefan@securityscanner.dev</a>.</p>
+    <p style="color:#9ca3af;font-size:0.95rem;">Issue with the scanner? Email <a href="mailto:stefan@securityscanner.dev" style="color:#dc2626;">stefan@securityscanner.dev</a>.</p>
   </article>
 </div>
 </body></html>""")

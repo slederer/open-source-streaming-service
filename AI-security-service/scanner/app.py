@@ -7811,6 +7811,17 @@ _LANDING_HTML = """<!DOCTYPE html>
   section h2 { font-size: 2rem; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 12px; text-align: center; }
   section .sub { color: #9ca3af; text-align: center; margin-bottom: 48px; font-size: 1rem; }
 
+  .caps { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; }
+  .cap { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 22px 22px 18px; transition: border-color 0.2s; }
+  .cap:hover { border-color: #4b5563; }
+  .cap .head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #1f2937; }
+  .cap .head .ic { width: 28px; height: 28px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.85rem; }
+  .cap .head .name { font-weight: 700; font-size: 0.95rem; letter-spacing: -0.01em; }
+  .cap ul { list-style: none; }
+  .cap li { padding: 6px 0; font-size: 0.85rem; color: #d1d5db; line-height: 1.5; }
+  .cap li strong { color: #e5e7eb; font-weight: 600; }
+  .cap li small { display: block; color: #6b7280; font-size: 0.75rem; margin-top: 2px; }
+
   .integrations { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
   .integration { background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; text-align: center; transition: border-color 0.2s; position: relative; }
   .integration:hover { border-color: #dc2626; }
@@ -7849,6 +7860,7 @@ _LANDING_HTML = """<!DOCTYPE html>
   <div class="logo"><span>&#9632;</span> Security Scanner</div>
   <div class="links">
     <a href="#how">How it works</a>
+    <a href="#capabilities">What we check</a>
     <a href="#pricing">Pricing</a>
     <a href="/blog">Blog</a>
     <a href="/docs/api">API</a>
@@ -7964,6 +7976,97 @@ _LANDING_HTML = """<!DOCTYPE html>
         <a href="/signup" class="btn btn-secondary" style="width:100%;display:block;text-align:center;">Subscribe</a>
       </div>
     </div>
+  </div>
+</section>
+
+<section id="capabilities">
+  <div class="container">
+    <h2>50+ checks on every scan</h2>
+    <p class="sub">Organized into 7 categories. <a href="/blog/what-security-scanner-actually-does" style="color:#dc2626;">Full module-level walkthrough →</a></p>
+    <div class="caps">
+
+      <div class="cap">
+        <div class="head"><span class="ic" style="background:#1e3a8a;color:#93c5fd;">&#128065;</span><span class="name">Network &amp; transport</span></div>
+        <ul>
+          <li><strong>nmap</strong><small>top 1000 ports + common DB ports</small></li>
+          <li><strong>TLS audit</strong><small>cert chain, expiry, weak ciphers, SAN</small></li>
+          <li><strong>Security headers</strong><small>HSTS, CSP, X-Frame, Referrer-Policy on :80 / :443</small></li>
+          <li><strong>WAF / CDN fingerprint</strong><small>Cloudflare, Akamai, CloudFront, Fastly, Vercel, Netlify, Imperva, Sucuri, BIG-IP, Azure</small></li>
+          <li><strong>Default-port DB probe</strong><small>Redis, Memcached, MongoDB, Elasticsearch, Kibana, CouchDB, Neo4j</small></li>
+        </ul>
+      </div>
+
+      <div class="cap">
+        <div class="head"><span class="ic" style="background:#14532d;color:#86efac;">&#128279;</span><span class="name">Application surface</span></div>
+        <ul>
+          <li><strong>Exposed endpoints</strong><small>/docs, /redoc, /.env, /.git, /actuator/env, /terraform.tfstate, /docker-compose.yml — 25 paths</small></li>
+          <li><strong>OpenAPI audit</strong><small>parses /openapi.json, flags missing security on every operation</small></li>
+          <li><strong>API fuzz</strong><small>SQL / NoSQL / LDAP injection signatures</small></li>
+          <li><strong>GraphQL probe</strong><small>introspection + password-field detection + dangerous mutations + Hasura anonymous-role audit</small></li>
+          <li><strong>CORS + CSP audit</strong><small>wildcard-origin + credentials, unsafe-eval / unsafe-inline</small></li>
+          <li><strong>Rate limit probe</strong><small>brute-force resistance check on auth paths</small></li>
+        </ul>
+      </div>
+
+      <div class="cap">
+        <div class="head"><span class="ic" style="background:#7c2d12;color:#fdba74;">&#128273;</span><span class="name">Auth &amp; session</span></div>
+        <ul>
+          <li><strong>JWT audit</strong><small>alg=none acceptance, HS256 weak-secret crack against ~35 common values</small></li>
+          <li><strong>OAuth probe</strong><small>open-redirect on redirect_uri across 7 common paths</small></li>
+          <li><strong>Session entropy</strong><small>Shannon entropy + sequential-token detection on Set-Cookie</small></li>
+          <li><strong>Auth probes</strong><small>username enumeration, weak-password acceptance</small></li>
+          <li><strong>IDOR / BOLA sweep</strong><small>3-ID sweep on discovered endpoints, PII-leak detection in response bodies</small></li>
+        </ul>
+      </div>
+
+      <div class="cap">
+        <div class="head"><span class="ic" style="background:#7f1d1d;color:#fca5a5;">&#128275;</span><span class="name">Secrets in client bundles</span></div>
+        <ul>
+          <li><strong>38 provider patterns</strong><small>Anthropic <code>sk-ant-*</code>, OpenAI <code>sk-proj-*</code>, AWS <code>AKIA*</code>, Stripe <code>sk_live_*</code>, GitHub <code>ghp_*</code>, Google <code>AIza*</code>, Clerk, Pinecone, Weaviate, LangSmith, Supabase, npm, PyPI, Vercel, Netlify, Cloudflare, Heroku, Digital Ocean, Azure, GCP service-account JSON</small></li>
+          <li><strong>Supabase service_role detection</strong><small>decodes JWT payload to flag the catastrophic admin key (regex can't tell it apart from anon)</small></li>
+          <li><strong>Hardcoded passwords + private keys</strong><small>PEM blocks, DB connection strings with embedded credentials</small></li>
+        </ul>
+      </div>
+
+      <div class="cap">
+        <div class="head"><span class="ic" style="background:#581c87;color:#d8b4fe;">&#128736;</span><span class="name">BaaS deep-probe</span></div>
+        <ul>
+          <li><strong>Supabase RLS</strong><small>extracts every <code>.from('table')</code> + <code>.rpc()</code> from the JS bundle, probes each with the anon key for Row Level Security misconfigs</small></li>
+          <li><strong>Supabase storage</strong><small>extracts <code>.storage.from('bucket')</code> refs, lists each — flags publicly listable buckets</small></li>
+          <li><strong>Supabase edge functions</strong><small>enumerates <code>.functions.invoke()</code> references</small></li>
+          <li><strong>Firestore</strong><small>extracts <code>.collection()</code> names, probes each with Firebase apiKey</small></li>
+          <li><strong>Firebase Realtime DB</strong><small>checks <code>/.json</code> root for unauthenticated read</small></li>
+          <li><strong>NextAuth + Clerk</strong><small>config + missing-secret audit</small></li>
+        </ul>
+      </div>
+
+      <div class="cap">
+        <div class="head"><span class="ic" style="background:#1e3a8a;color:#93c5fd;">&#9729;</span><span class="name">Cloud &amp; infrastructure</span></div>
+        <ul>
+          <li><strong>S3 + GCS bucket exposure</strong><small>extracts bucket names from JS + dictionary attack from apex; LIST probe</small></li>
+          <li><strong>Subdomain takeover</strong><small>CNAME chain analysis vs known fingerprints (Vercel, Netlify, Unbounce, GitHub Pages, S3, Heroku, Tumblr, Tilda)</small></li>
+          <li><strong>Subdomain enumeration</strong><small>Certificate Transparency logs + DNS brute + port check</small></li>
+          <li><strong>K8s + Docker unauth APIs</strong><small>kubelet :10250 /pods, Docker Engine :2375 /version, Prometheus :9090</small></li>
+          <li><strong>Email DNS</strong><small>SPF, DMARC, DKIM, DNS dangling-include detection</small></li>
+        </ul>
+      </div>
+
+      <div class="cap">
+        <div class="head"><span class="ic" style="background:#312e81;color:#a5b4fc;">&#129504;</span><span class="name">AI-assisted modules</span></div>
+        <ul>
+          <li><strong>OpenAPI deep-audit</strong><small>Sonnet classifies every endpoint, scanner live-probes only the unauthed GETs</small></li>
+          <li><strong>JS analyzer</strong><small>extracts API endpoints + auth patterns + secrets from the bundle, probes each</small></li>
+          <li><strong>Finding triage</strong><small>post-processes AI-originated findings against known false-positive patterns (180-second budget per target)</small></li>
+          <li><strong>Prompt-injection probe</strong><small>2 minimal canary probes per discovered chat endpoint, scanner-labeled</small></li>
+          <li><strong>Nuclei CVE templates</strong><small>8000+ community templates (log4j, spring4shell, etc.)</small></li>
+          <li><strong>JS library CVE</strong><small>vulnerable jQuery / lodash / moment versions by banner + @version</small></li>
+          <li><strong>Typosquat npm deps</strong><small>known-typosquatted package imports in the bundle</small></li>
+          <li><strong>OSINT dorks</strong><small>Google + GitHub searches for secrets near the target's domain</small></li>
+        </ul>
+      </div>
+
+    </div>
+    <p class="sub" style="margin-top:36px;font-size:0.9rem;">No exploitation. No destructive mutations. Read-only probes with bounded payload sizes. <a href="/.well-known/security.txt" style="color:#9ca3af;">security.txt</a> · <a href="/blog/what-security-scanner-actually-does" style="color:#9ca3af;">What we don't do →</a></p>
   </div>
 </section>
 

@@ -8789,38 +8789,123 @@ code {{ background: #111827; padding: 2px 6px; border-radius: 4px; font-family: 
 
 try:
     from scanner.blog_posts import POSTS as _BLOG_POSTS, get_post as _blog_get
-    from scanner.blog_posts import get_posts_sorted as _blog_sorted
+    from scanner.blog_posts import get_posts_sorted as _blog_sorted, reading_time as _blog_rt
 except ImportError:
     from scanner_blog_posts import POSTS as _BLOG_POSTS, get_post as _blog_get  # type: ignore
     from scanner_blog_posts import get_posts_sorted as _blog_sorted  # type: ignore
+    from scanner_blog_posts import reading_time as _blog_rt  # type: ignore
+
+
+# Per-tag accent color (used for tag pill + featured-card border accent)
+_TAG_COLORS = {
+    "Findings":   "#dc2626",  # brand red — biggest signal posts
+    "Case study": "#f59e0b",  # amber — concrete narratives
+    "Analysis":   "#3b82f6",  # blue — opinion / explainer
+    "Product":    "#8b5cf6",  # violet — product-shaped content
+}
+
+
+def _tag_color(tag: str) -> str:
+    return _TAG_COLORS.get(tag, "#6b7280")
 
 
 _BLOG_CSS = """
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.7; }
-  nav { padding: 16px 24px; border-bottom: 1px solid #1f2937; max-width: 1100px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }
-  nav .logo { color: #e5e7eb; font-weight: 700; text-decoration: none; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.7; -webkit-font-smoothing: antialiased; }
+  a { text-decoration: none; }
+
+  /* Nav */
+  nav { padding: 18px 24px; border-bottom: 1px solid #1f2937; max-width: 1180px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }
+  nav .logo { color: #e5e7eb; font-weight: 700; font-size: 1rem; letter-spacing: -0.01em; }
   nav .logo span { color: #dc2626; }
-  nav .links a { color: #9ca3af; text-decoration: none; font-size: 0.85rem; margin-left: 20px; }
+  nav .links { display: flex; gap: 22px; align-items: center; }
+  nav .links a { color: #9ca3af; font-size: 0.85rem; transition: color .15s; }
   nav .links a:hover { color: #e5e7eb; }
-  .container { max-width: 760px; margin: 0 auto; padding: 50px 24px 80px; }
-  h1 { font-size: 2.4rem; letter-spacing: -0.03em; margin-bottom: 8px; font-weight: 700; }
-  h2 { font-size: 1.4rem; margin-top: 36px; margin-bottom: 14px; letter-spacing: -0.01em; font-weight: 600; }
-  h3 { font-size: 1.1rem; margin-top: 24px; margin-bottom: 10px; font-weight: 600; color: #e5e7eb; }
-  p { color: #d1d5db; margin-bottom: 16px; font-size: 0.97rem; }
-  ul, ol { color: #d1d5db; margin: 0 0 16px 24px; }
-  li { margin-bottom: 6px; }
-  code { font-family: 'SF Mono', Menlo, monospace; background: #111827; padding: 1px 6px; border-radius: 4px; font-size: 0.87em; color: #fde047; border: 1px solid #1f2937; }
-  a { color: #dc2626; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .meta { color: #6b7280; font-size: 0.85rem; margin-bottom: 36px; }
-  .post-card { padding: 20px 0; border-bottom: 1px solid #1f2937; }
-  .post-card:last-child { border-bottom: 0; }
-  .post-card h3 { margin: 0 0 6px 0; font-size: 1.25rem; }
+  nav .links .cta { background: #dc2626; color: white; padding: 8px 16px; border-radius: 6px; font-weight: 600; }
+  nav .links .cta:hover { background: #b91c1c; color: white; }
+
+  /* Index page */
+  .index-wrap { max-width: 1100px; margin: 0 auto; padding: 56px 24px 96px; }
+  .index-hero { padding-bottom: 30px; border-bottom: 1px solid #1f2937; margin-bottom: 32px; }
+  .index-hero .kicker { color: #dc2626; font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 12px; }
+  .index-hero h1 { font-size: 3rem; letter-spacing: -0.035em; line-height: 1.05; margin-bottom: 14px; font-weight: 800; }
+  .index-hero p { font-size: 1.05rem; color: #9ca3af; max-width: 620px; margin: 0; }
+
+  /* Featured (most recent) post */
+  .featured { display: grid; grid-template-columns: 1fr; gap: 0; background: linear-gradient(135deg, #111827 0%, #0a0e17 80%); border: 1px solid #1f2937; border-radius: 14px; padding: 36px 36px 32px; margin-bottom: 36px; transition: border-color .2s, transform .2s; cursor: pointer; }
+  .featured:hover { border-color: #dc2626; transform: translateY(-2px); }
+  .featured .row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .featured .featured-pill { background: #dc2626; color: white; font-size: 0.65rem; font-weight: 700; padding: 3px 10px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .featured h2 { font-size: 1.9rem; letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 10px; font-weight: 700; }
+  .featured h2 a { color: white; }
+  .featured p.lead { font-size: 1.05rem; color: #d1d5db; margin-bottom: 18px; }
+  .featured .read { color: #dc2626; font-size: 0.9rem; font-weight: 600; }
+
+  /* Card grid */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 22px; }
+  .post-card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 24px 24px 22px; transition: border-color .2s, transform .2s; cursor: pointer; display: flex; flex-direction: column; min-height: 180px; }
+  .post-card:hover { border-color: #4b5563; transform: translateY(-2px); }
+  .post-card .row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .post-card h3 { font-size: 1.15rem; line-height: 1.3; letter-spacing: -0.015em; font-weight: 700; margin-bottom: 8px; }
   .post-card h3 a { color: #e5e7eb; }
-  .post-card .date { color: #6b7280; font-size: 0.82rem; margin-bottom: 10px; }
-  .post-card p { margin: 0; color: #9ca3af; font-size: 0.95rem; }
-  .back { color: #9ca3af; font-size: 0.85rem; text-decoration: none; margin-bottom: 30px; display: inline-block; }
+  .post-card .excerpt { color: #9ca3af; font-size: 0.92rem; flex-grow: 1; }
+  .post-card .read { color: #6b7280; font-size: 0.78rem; margin-top: 14px; }
+
+  /* Tag pill (shared) */
+  .tag-pill { display: inline-block; font-size: 0.65rem; font-weight: 700; padding: 3px 8px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .meta-dot { color: #4b5563; }
+  .meta-text { color: #6b7280; font-size: 0.78rem; }
+
+  /* Post page */
+  .post-wrap { max-width: 720px; margin: 0 auto; padding: 56px 24px 80px; }
+  .back-link { display: inline-flex; align-items: center; gap: 6px; color: #9ca3af; font-size: 0.85rem; margin-bottom: 30px; transition: color .15s; }
+  .back-link:hover { color: #e5e7eb; }
+  .post-header { padding-bottom: 28px; border-bottom: 1px solid #1f2937; margin-bottom: 32px; }
+  .post-header .row { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+  h1.post-title { font-size: 2.5rem; letter-spacing: -0.03em; line-height: 1.1; margin-bottom: 14px; font-weight: 800; }
+  p.lead { font-size: 1.15rem; color: #9ca3af; line-height: 1.55; margin-bottom: 0; }
+
+  /* Article body */
+  article h2 { font-size: 1.55rem; margin: 44px 0 16px; letter-spacing: -0.015em; font-weight: 700; line-height: 1.25; }
+  article h3 { font-size: 1.2rem; margin: 28px 0 12px; font-weight: 700; line-height: 1.3; }
+  article h4 { font-size: 0.78rem; color: #9ca3af; margin: 22px 0 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; }
+  article p { color: #d1d5db; margin-bottom: 18px; font-size: 1rem; line-height: 1.75; }
+  article ul, article ol { color: #d1d5db; margin: 0 0 20px 28px; }
+  article li { margin-bottom: 8px; line-height: 1.7; }
+  article code { font-family: 'SF Mono', Menlo, Consolas, monospace; background: #111827; padding: 2px 7px; border-radius: 4px; font-size: 0.86em; color: #fde047; border: 1px solid #1f2937; }
+  article pre { background: #0d1220; border: 1px solid #1f2937; border-radius: 8px; padding: 18px; overflow-x: auto; margin: 20px 0 24px; font-size: 0.84rem; line-height: 1.6; }
+  article pre code { background: none; border: 0; padding: 0; font-size: inherit; color: #d1d5db; }
+  article a { color: #f87171; border-bottom: 1px solid rgba(248,113,113,0.3); }
+  article a:hover { border-bottom-color: #f87171; }
+  article strong { color: #e5e7eb; }
+  article blockquote { border-left: 3px solid #dc2626; padding: 4px 0 4px 18px; margin: 22px 0; color: #e5e7eb; font-style: italic; }
+  article table { width: 100%; border-collapse: collapse; margin: 22px 0; font-size: 0.92rem; }
+  article th, article td { padding: 10px 14px; text-align: left; border-bottom: 1px solid #1f2937; }
+  article th { color: #9ca3af; font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; background: #0d1220; }
+
+  /* Post footer / CTA */
+  .post-cta { margin-top: 56px; padding: 28px 28px 26px; background: linear-gradient(135deg, #1e1b4b 0%, #0a0e17 100%); border: 1px solid #1f2937; border-radius: 12px; text-align: center; }
+  .post-cta h3 { font-size: 1.2rem; margin-bottom: 8px; color: white; }
+  .post-cta p { color: #d1d5db; font-size: 0.92rem; margin-bottom: 16px; }
+  .post-cta .btn { display: inline-block; background: #dc2626; color: white; padding: 10px 22px; border-radius: 6px; font-weight: 600; font-size: 0.92rem; transition: background .15s; }
+  .post-cta .btn:hover { background: #b91c1c; }
+
+  .more-posts { margin-top: 60px; padding-top: 32px; border-top: 1px solid #1f2937; }
+  .more-posts h3 { font-size: 0.78rem; color: #9ca3af; margin-bottom: 18px; text-transform: uppercase; letter-spacing: 0.07em; font-weight: 700; }
+  .more-posts .more-list { display: grid; gap: 14px; }
+  .more-posts a.more-link { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; background: #111827; border: 1px solid #1f2937; border-radius: 8px; transition: border-color .15s, transform .15s; }
+  .more-posts a.more-link:hover { border-color: #4b5563; transform: translateX(2px); }
+  .more-posts .ml-title { color: #e5e7eb; font-size: 0.92rem; font-weight: 500; }
+  .more-posts .ml-meta { color: #6b7280; font-size: 0.78rem; }
+
+  @media (max-width: 720px) {
+    .index-hero h1 { font-size: 2rem; }
+    .featured { padding: 24px 22px; }
+    .featured h2 { font-size: 1.4rem; }
+    h1.post-title { font-size: 1.8rem; }
+    .post-wrap, .index-wrap { padding-top: 36px; padding-bottom: 60px; }
+    article p { font-size: 0.96rem; }
+  }
 """
 
 
@@ -8831,32 +8916,87 @@ def _render_blog_nav():
     <a href="/blog">Blog</a>
     <a href="/docs/api">API</a>
     <a href="/contact">Contact</a>
-    <a href="/signup">Start free</a>
+    <a href="/signup" class="cta">Start free</a>
   </div>
 </nav>"""
+
+
+def _fmt_date(iso_date: str) -> str:
+    """2026-04-12 → Apr 12, 2026."""
+    from datetime import datetime as _dt
+    try:
+        return _dt.strptime(iso_date, "%Y-%m-%d").strftime("%b %-d, %Y")
+    except Exception:
+        return iso_date
+
+
+def _tag_pill_html(tag: str) -> str:
+    color = _tag_color(tag)
+    return (
+        f'<span class="tag-pill" style="background:{color}1a;color:{color};'
+        f'border:1px solid {color}33;">{tag}</span>'
+    )
 
 
 @app.get("/blog", response_class=HTMLResponse)
 async def blog_index():
     posts = _blog_sorted()
-    cards = "".join(
-        f"""<div class="post-card">
-  <h3><a href="/blog/{p['slug']}">{p['title']}</a></h3>
-  <div class="date">{p['date']}</div>
-  <p>{p['excerpt']}</p>
-</div>"""
-        for p in posts
+    if not posts:
+        return HTMLResponse(
+            f"""<!DOCTYPE html><html><head><style>{_BLOG_CSS}</style></head>
+<body>{_render_blog_nav()}<div class="index-wrap"><h1>No posts yet.</h1></div></body></html>"""
+        )
+    featured = posts[0]
+    rest = posts[1:]
+    feat_rt = _blog_rt(featured["body"])
+    featured_html = f"""
+    <a href="/blog/{featured['slug']}" style="color:inherit;">
+      <div class="featured">
+        <div class="row">
+          <span class="featured-pill">Latest</span>
+          {_tag_pill_html(featured.get('tag', 'Post'))}
+          <span class="meta-text">{_fmt_date(featured['date'])}</span>
+          <span class="meta-dot">·</span>
+          <span class="meta-text">{feat_rt} min read</span>
+        </div>
+        <h2><a href="/blog/{featured['slug']}">{featured['title']}</a></h2>
+        <p class="lead">{featured['excerpt']}</p>
+        <div class="read">Read the post →</div>
+      </div>
+    </a>"""
+
+    cards_html = "".join(
+        f"""<a href="/blog/{p['slug']}" style="color:inherit;">
+      <div class="post-card">
+        <div class="row">
+          {_tag_pill_html(p.get('tag', 'Post'))}
+          <span class="meta-text">{_fmt_date(p['date'])}</span>
+        </div>
+        <h3><a href="/blog/{p['slug']}">{p['title']}</a></h3>
+        <p class="excerpt">{p['excerpt']}</p>
+        <div class="read">{_blog_rt(p['body'])} min read</div>
+      </div>
+    </a>"""
+        for p in rest
     )
+
     return HTMLResponse(f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Blog — Security Scanner</title>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Blog — Security Scanner</title>
 <meta name="description" content="Findings, write-ups, and notes from scanning AI-built apps in the wild.">
 <style>{_BLOG_CSS}</style></head>
 <body>
 {_render_blog_nav()}
-<div class="container">
-<h1>Blog</h1>
-<p class="meta">Findings, write-ups, and notes from scanning AI-built apps in the wild.</p>
-{cards}
+<div class="index-wrap">
+  <div class="index-hero">
+    <div class="kicker">The Security Scanner Blog</div>
+    <h1>Findings, write-ups, and notes from scanning AI-built apps in the wild.</h1>
+    <p>What we find when we point the scanner at apps built with Cursor, Lovable, Replit, Bolt, v0 — plus the occasional opinion on why it keeps happening.</p>
+  </div>
+  {featured_html}
+  <div class="grid">
+    {cards_html}
+  </div>
 </div>
 </body></html>""")
 
@@ -8867,28 +9007,52 @@ async def blog_post(slug: str):
     if not p:
         return HTMLResponse(
             f"""<!DOCTYPE html><html><head><style>{_BLOG_CSS}</style></head>
-<body>{_render_blog_nav()}<div class="container">
-<a href="/blog" class="back">← Back to blog</a>
-<h1>Post not found</h1><p>That post doesn't exist.</p></div></body></html>""",
+<body>{_render_blog_nav()}<div class="post-wrap">
+<a href="/blog" class="back-link">← Back to blog</a>
+<h1 class="post-title">Post not found</h1><p>That post doesn't exist.</p></div></body></html>""",
             status_code=404,
         )
+    rt = _blog_rt(p["body"])
+    others = [q for q in _blog_sorted() if q["slug"] != p["slug"]][:3]
+    more_html = "".join(
+        f"""<a class="more-link" href="/blog/{q['slug']}">
+      <span class="ml-title">{q['title']}</span>
+      <span class="ml-meta">{_fmt_date(q['date'])} · {_blog_rt(q['body'])} min</span>
+    </a>"""
+        for q in others
+    )
+    more_section = (
+        f'<div class="more-posts"><h3>More posts</h3><div class="more-list">{more_html}</div></div>'
+        if others else ""
+    )
     return HTMLResponse(f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{p['title']} — Security Scanner</title>
 <meta name="description" content="{p['excerpt']}">
 <style>{_BLOG_CSS}</style></head>
 <body>
 {_render_blog_nav()}
-<div class="container">
-<a href="/blog" class="back">← Back to blog</a>
-<h1>{p['title']}</h1>
-<div class="meta">{p['date']} · Security Scanner</div>
-{p['body']}
-<hr style="border:0;border-top:1px solid #1f2937;margin:48px 0 24px;">
-<p style="color:#9ca3af;font-size:0.9rem;">
-Scan your own app at <a href="/signup">securityscanner.dev</a>.
-Questions? <a href="mailto:stefan@securityscanner.dev">stefan@securityscanner.dev</a>.
-</p>
+<div class="post-wrap">
+  <a href="/blog" class="back-link">← Back to blog</a>
+  <header class="post-header">
+    <div class="row">
+      {_tag_pill_html(p.get('tag', 'Post'))}
+      <span class="meta-text">{_fmt_date(p['date'])}</span>
+      <span class="meta-dot">·</span>
+      <span class="meta-text">{rt} min read</span>
+    </div>
+    <h1 class="post-title">{p['title']}</h1>
+    <p class="lead">{p['excerpt']}</p>
+  </header>
+  <article>
+    {p['body']}
+  </article>
+  <div class="post-cta">
+    <h3>Run the same scan on your app</h3>
+    <p>One free scan, no credit card. Works with any URL or IP — finds the issues from this post and more.</p>
+    <a href="/signup" class="btn">Start free</a>
+  </div>
+  {more_section}
 </div>
 </body></html>""")
 

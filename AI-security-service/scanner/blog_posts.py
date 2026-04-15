@@ -1,8 +1,16 @@
 """Blog posts for securityscanner.dev/blog.
 
-Each post is a dict with: slug, title, date (YYYY-MM-DD), excerpt, body (HTML).
-Dates are back-dated to stagger the publishing cadence in the past.
+Each post is a dict with:
+  slug, title, date (YYYY-MM-DD), excerpt, body (HTML), tag.
 """
+
+
+def _reading_time(html: str) -> int:
+    """Rough reading time in minutes (~220 words/min, ignoring HTML tags)."""
+    import re
+    text = re.sub(r"<[^>]+>", " ", html)
+    words = len(text.split())
+    return max(1, round(words / 220))
 
 
 POSTS = [
@@ -10,6 +18,7 @@ POSTS = [
         "slug": "we-are-live",
         "title": "We're live: Security Scanner for the vibe-coding era",
         "date": "2026-03-18",
+        "tag": "Product",
         "excerpt": (
             "After months of scanning our own infrastructure and finding one hole too many, "
             "we're opening Security Scanner to everyone."
@@ -45,6 +54,7 @@ POSTS = [
         "slug": "what-security-scanner-actually-does",
         "title": "What Security Scanner actually does (and what it doesn't)",
         "date": "2026-03-22",
+        "tag": "Product",
         "excerpt": "No marketing fluff — a direct walkthrough of every module we run.",
         "body": """
 <p>When you scan an app, we run 50+ modules organized into 7 categories. Here's each one, what it looks for, and what severity it can produce.</p>
@@ -131,6 +141,7 @@ POSTS = [
         "slug": "top-5-supabase-rls-mistakes-on-lovable-apps",
         "title": "Top 5 security issues we found on Lovable apps",
         "date": "2026-03-29",
+        "tag": "Findings",
         "excerpt": (
             "We scanned 75 published Lovable apps. 17 had at least one Supabase table "
             "readable by anyone. Here's the pattern."
@@ -181,6 +192,7 @@ POSTS = [
         "slug": "top-5-security-issues-on-replit-apps",
         "title": "Top 5 security issues on Replit apps",
         "date": "2026-04-02",
+        "tag": "Findings",
         "excerpt": "Replit's quick-deploy is great. It also makes it really easy to ship your API keys to the internet.",
         "body": """
 <p>Replit + Supabase or Replit + raw OpenAI/Anthropic calls is the other dominant vibe-coding combo. We scanned 50 Replit-deployed apps — here's what broke.</p>
@@ -228,6 +240,7 @@ POSTS = [
         "slug": "why-supabase-rls-is-the-top-vibe-coding-mistake",
         "title": "Why Supabase RLS is the #1 vibe-coding mistake",
         "date": "2026-04-07",
+        "tag": "Analysis",
         "excerpt": (
             "One setting. Disabled by default. Exposes every user's data. Repeated across "
             "hundreds of apps. Here's why."
@@ -288,6 +301,7 @@ POSTS = [
         "slug": "anthropic-key-leaked-case-study",
         "title": "When your Anthropic key leaks: a case study",
         "date": "2026-04-12",
+        "tag": "Case study",
         "excerpt": (
             "We found a live Anthropic + OpenAI + Google key trio in the same JS bundle. "
             "Here's what it looked like, how we found it, and what happens next."
@@ -361,3 +375,8 @@ def get_post(slug: str):
 def get_posts_sorted():
     """Newest first."""
     return sorted(POSTS, key=lambda p: p["date"], reverse=True)
+
+
+def reading_time(html: str) -> int:
+    """Public alias of _reading_time."""
+    return _reading_time(html)

@@ -95,11 +95,11 @@ def send_summary_email(email: str, name: str, summaries: list):
             {target_blocks}
 
             <div style="margin-top:28px;text-align:center;">
-                <a href="https://security.slederer.com" style="display:inline-block;background:#dc2626;color:white;padding:10px 24px;border-radius:8px;text-decoration:none;font-weight:600;">View full report</a>
+                <a href="https://securityscanner.dev" style="display:inline-block;background:#dc2626;color:white;padding:10px 24px;border-radius:8px;text-decoration:none;font-weight:600;">View full report</a>
             </div>
 
             <p style="margin-top:32px;color:#9ca3af;font-size:0.75rem;text-align:center;">
-                You're on the Monthly plan. <a href="https://security.slederer.com/billing" style="color:#9ca3af;">Manage subscription</a>
+                You're on the Monthly plan. <a href="https://securityscanner.dev/billing" style="color:#9ca3af;">Manage subscription</a>
             </p>
         </div>
         """

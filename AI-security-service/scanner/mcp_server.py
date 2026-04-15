@@ -27,13 +27,13 @@ except ImportError:
     print("mcp package not installed. Run: pip install mcp", file=sys.stderr)
     sys.exit(1)
 
-API_URL = os.environ.get("SECURITY_SCANNER_URL", "https://security.slederer.com")
+API_URL = os.environ.get("SECURITY_SCANNER_URL", "https://securityscanner.dev")
 API_KEY = os.environ.get("SECURITY_SCANNER_API_KEY", "")
 
 if not API_KEY:
     print(
         "ERROR: SECURITY_SCANNER_API_KEY not set.\n"
-        "Get your API key at https://security.slederer.com/dashboard/keys",
+        "Get your API key at https://securityscanner.dev/dashboard/keys",
         file=sys.stderr,
     )
     sys.exit(1)

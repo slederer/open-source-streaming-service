@@ -1835,7 +1835,7 @@ def scan_target_auth(run_id: str, ip: str, name: str):
         for sp in signup_paths:
             t = run_cmd(["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-m", "3", base + sp], timeout=5).strip()
             if t in ("200", "400", "405"):
-                test_email = f"scan_probe_{secrets.token_hex(4)}@security.slederer.com"
+                test_email = f"scan_probe_{secrets.token_hex(4)}@securityscanner.dev"
                 r = run_cmd([
                     "curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
                     "-X", "POST", "-H", "Content-Type: application/json",
@@ -2688,7 +2688,7 @@ REQUIRED STRUCTURE:
 ```markdown
 ---
 format: security-fix/v1
-scanner: security.slederer.com
+scanner: securityscanner.dev
 scan_id: <run_id>
 scan_date: <YYYY-MM-DD>
 targets:
@@ -2824,7 +2824,7 @@ def _fallback_fix_markdown(run_id: str, findings: list[dict], targets_info: dict
 
     md = ["---"]
     md.append("format: security-fix/v1")
-    md.append(f"scanner: security.slederer.com")
+    md.append(f"scanner: securityscanner.dev")
     md.append(f"scan_id: {run_id}")
     md.append(f'scan_date: "{scan_date}"')
     md.append("targets:")
@@ -3509,7 +3509,7 @@ def send_verification_email(email: str, token: str, base_url: Optional[str] = No
     request.url._url's scheme+netloc (or PUBLIC_BASE_URL env override) so the
     link points back to the host the user actually signed up on — was a real
     bug when a user signed up via securityscanner.dev but got a verification
-    link to security.slederer.com.
+    link to securityscanner.dev.
     """
     try:
         import resend as resend_mod
@@ -3567,7 +3567,7 @@ async def signup(request: Request):
         )
 
     # Build the user-facing base URL from the original request — covers
-    # securityscanner.dev, security.slederer.com, and any future custom domains
+    # securityscanner.dev, securityscanner.dev, and any future custom domains
     # without needing code changes per host.
     proxied_proto = request.headers.get("x-forwarded-proto", "")
     scheme = proxied_proto or request.url.scheme or "https"
@@ -3753,8 +3753,8 @@ async def create_checkout(request: Request):
         customer=customer_id,
         mode=mode,
         line_items=[{"price": price_id, "quantity": 1}],
-        success_url="https://security.slederer.com/billing?success=1",
-        cancel_url="https://security.slederer.com/billing?cancel=1",
+        success_url="https://securityscanner.dev/billing?success=1",
+        cancel_url="https://securityscanner.dev/billing?cancel=1",
         metadata={"user_id": user["user_id"], "plan": plan},
     )
     return {"url": session.url, "session_id": session.id}
@@ -3778,7 +3778,7 @@ async def billing_portal(request: Request):
 
     portal = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url="https://security.slederer.com/billing",
+        return_url="https://securityscanner.dev/billing",
     )
     return {"url": portal.url}
 
@@ -5156,125 +5156,373 @@ async def mobile_scan(request: Request):
 
 # ── Public /v1/ API (API-key authenticated) ─────────────────────────────────
 
+_API_DOCS_CSS = """
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.6; font-size: 15px; }
+  .container { max-width: 1000px; margin: 0 auto; padding: 40px 24px 80px; }
+  nav { padding: 16px 24px; border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; max-width: 1200px; margin: 0 auto; align-items: center; }
+  nav a { color: #9ca3af; text-decoration: none; font-size: 0.85rem; }
+  nav a.logo { color: #e5e7eb; font-weight: 700; }
+  nav a.logo span { color: #dc2626; }
+  nav .links { display: flex; gap: 20px; }
+  h1 { font-size: 2.2rem; margin-bottom: 8px; letter-spacing: -0.02em; font-weight: 700; }
+  .subtitle { color: #9ca3af; font-size: 1rem; margin-bottom: 40px; }
+  h2 { font-size: 1.5rem; margin-top: 56px; margin-bottom: 16px; letter-spacing: -0.01em; padding-top: 24px; border-top: 1px solid #1f2937; font-weight: 700; }
+  h2:first-of-type { border-top: 0; padding-top: 0; margin-top: 24px; }
+  h3 { font-size: 1.1rem; margin-top: 28px; margin-bottom: 12px; color: #e5e7eb; font-weight: 600; }
+  h4 { font-size: 0.82rem; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.06em; margin-top: 16px; margin-bottom: 8px; font-weight: 600; }
+  p { color: #d1d5db; margin-bottom: 14px; }
+  code { font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 0.87em; background: #111827; border: 1px solid #1f2937; padding: 1px 6px; border-radius: 4px; color: #fde047; }
+  pre { background: #0d1220; border: 1px solid #1f2937; border-radius: 8px; padding: 16px; overflow-x: auto; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 0.82rem; color: #d1d5db; margin-bottom: 16px; line-height: 1.55; position: relative; }
+  pre code { background: none; border: 0; padding: 0; color: inherit; font-size: inherit; }
+  .tabs { display: flex; gap: 2px; border-bottom: 1px solid #1f2937; margin-top: 10px; margin-bottom: 0; }
+  .tab { padding: 8px 14px; font-size: 0.82rem; color: #9ca3af; cursor: pointer; border: 0; background: none; font-family: inherit; border-bottom: 2px solid transparent; }
+  .tab.active { color: #e5e7eb; border-bottom-color: #dc2626; }
+  .tab:hover { color: #e5e7eb; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .tab-panel pre { border-top-left-radius: 0; border-top-right-radius: 0; margin-top: 0; }
+  .endpoint { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+  .method-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .method { display: inline-block; padding: 3px 10px; border-radius: 4px; font-family: 'SF Mono', monospace; font-size: 0.75rem; font-weight: 700; }
+  .method.GET { background: #172554; color: #93c5fd; }
+  .method.POST { background: #14532d; color: #86efac; }
+  .method.DELETE { background: #450a0a; color: #fca5a5; }
+  .method.PATCH { background: #422006; color: #fde047; }
+  .path { font-family: 'SF Mono', monospace; font-size: 0.95rem; color: #e5e7eb; }
+  .tag { display: inline-block; padding: 2px 8px; background: #1f2937; color: #9ca3af; border-radius: 4px; font-size: 0.72rem; }
+  .tag.async { background: #1e3a8a; color: #bfdbfe; }
+  .tag.paid { background: #78350f; color: #fbbf24; }
+  ul, ol { color: #d1d5db; margin: 0 0 14px 24px; }
+  li { margin-bottom: 6px; }
+  a { color: #dc2626; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .tip { background: #0f1a2e; border-left: 3px solid #3b82f6; padding: 12px 16px; margin: 14px 0; border-radius: 4px; color: #bfdbfe; font-size: 0.9rem; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid #1f2937; font-size: 0.88rem; vertical-align: top; }
+  th { font-weight: 600; color: #9ca3af; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; background: #0d1220; }
+  .toc { background: #0f1420; border: 1px solid #1f2937; border-radius: 8px; padding: 18px 22px; margin-bottom: 40px; columns: 2; column-gap: 32px; }
+  .toc h4 { font-size: 0.75rem; color: #9ca3af; text-transform: uppercase; margin-bottom: 10px; font-weight: 600; letter-spacing: 0.06em; column-span: all; }
+  .toc ul { list-style: none; margin: 0; }
+  .toc li { margin-bottom: 6px; font-size: 0.9rem; }
+  .toc a { color: #e5e7eb; }
+  .hero-bar { background: linear-gradient(90deg, #1e1b4b 0%, #0a0e17 100%); border: 1px solid #1f2937; border-radius: 10px; padding: 20px 24px; margin-bottom: 32px; display: flex; justify-content: space-between; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .hero-bar .text { font-size: 0.93rem; color: #d1d5db; }
+  .hero-bar .text strong { color: white; }
+  .hero-bar a { display: inline-block; background: #dc2626; color: white; padding: 8px 16px; border-radius: 6px; font-size: 0.88rem; font-weight: 600; white-space: nowrap; }
+  .hero-bar a:hover { background: #b91c1c; text-decoration: none; }
+  @media (max-width: 700px) { .toc { columns: 1; } }
+"""
+
+
+_API_DOCS_JS = """
+function switchTab(group, lang) {
+  document.querySelectorAll('[data-tab-group="' + group + '"]').forEach(function(el) {
+    el.classList.toggle('active', el.dataset.lang === lang);
+  });
+  document.querySelectorAll('[data-panel-group="' + group + '"]').forEach(function(el) {
+    el.classList.toggle('active', el.dataset.lang === lang);
+  });
+}
+document.addEventListener('DOMContentLoaded', function() {
+  // Init each tab group's default to curl
+  var groups = {};
+  document.querySelectorAll('[data-tab-group]').forEach(function(el) { groups[el.dataset.tabGroup] = true; });
+  Object.keys(groups).forEach(function(g) { switchTab(g, 'curl'); });
+});
+"""
+
+
+def _api_tabs(group: str, curl_code: str, python_code: str, js_code: str) -> str:
+    """Render a 3-tab code example block."""
+    import html as _html
+    def esc(s): return _html.escape(s)
+    return (
+        f'<div class="tabs">'
+        f'<button class="tab" data-tab-group="{group}" data-lang="curl" onclick="switchTab(\'{group}\',\'curl\')">curl</button>'
+        f'<button class="tab" data-tab-group="{group}" data-lang="python" onclick="switchTab(\'{group}\',\'python\')">Python</button>'
+        f'<button class="tab" data-tab-group="{group}" data-lang="js" onclick="switchTab(\'{group}\',\'js\')">JavaScript</button>'
+        f'</div>'
+        f'<div class="tab-panel" data-panel-group="{group}" data-lang="curl"><pre><code>{esc(curl_code)}</code></pre></div>'
+        f'<div class="tab-panel" data-panel-group="{group}" data-lang="python"><pre><code>{esc(python_code)}</code></pre></div>'
+        f'<div class="tab-panel" data-panel-group="{group}" data-lang="js"><pre><code>{esc(js_code)}</code></pre></div>'
+    )
+
+
 @app.get("/docs/api", response_class=HTMLResponse)
 async def api_docs_page(request: Request):
-    """Human-readable API reference."""
+    """Developer-friendly API reference with curl / Python / JavaScript examples."""
+    # Build the code blocks separately so the HTML template stays readable.
+    QUICKSTART_CURL = """# 1. Trigger a scan
+curl -X POST https://securityscanner.dev/v1/scan \\
+  -H "Authorization: Bearer sk-sec-YOUR_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"host": "https://myapp.com"}'
+
+# Response:
+# {"run_id": "abc12345", "status": "started", ...}
+
+# 2. Poll for results (scan takes 2-5 minutes)
+curl https://securityscanner.dev/v1/scan/abc12345 \\
+  -H "Authorization: Bearer sk-sec-YOUR_KEY"
+
+# 3. Download the fix file
+curl https://securityscanner.dev/v1/scan/abc12345/fix \\
+  -H "Authorization: Bearer sk-sec-YOUR_KEY" \\
+  -o SECURITY-FIX.md"""
+
+    QUICKSTART_PY = """import httpx, time
+
+API = "https://securityscanner.dev"
+KEY = "sk-sec-YOUR_KEY"
+HEADERS = {"Authorization": f"Bearer {KEY}"}
+
+# 1. Trigger
+r = httpx.post(f"{API}/v1/scan", headers=HEADERS,
+               json={"host": "https://myapp.com"})
+run_id = r.json()["run_id"]
+
+# 2. Poll
+while True:
+    status = httpx.get(f"{API}/v1/scan/{run_id}", headers=HEADERS).json()
+    if status["status"] == "completed":
+        break
+    time.sleep(10)
+
+print(f"Found {status['summary']['total']} findings")
+for f in status["findings"]:
+    print(f"  [{f['severity']}] {f['title']}")
+
+# 3. Fix file
+fix = httpx.get(f"{API}/v1/scan/{run_id}/fix", headers=HEADERS).text
+open("SECURITY-FIX.md", "w").write(fix)"""
+
+    QUICKSTART_JS = """const API = "https://securityscanner.dev";
+const KEY = "sk-sec-YOUR_KEY";
+const H = { Authorization: `Bearer ${KEY}` };
+
+// 1. Trigger
+const started = await fetch(`${API}/v1/scan`, {
+  method: "POST",
+  headers: { ...H, "Content-Type": "application/json" },
+  body: JSON.stringify({ host: "https://myapp.com" }),
+}).then(r => r.json());
+
+const runId = started.run_id;
+
+// 2. Poll
+let status;
+while (true) {
+  status = await fetch(`${API}/v1/scan/${runId}`, { headers: H }).then(r => r.json());
+  if (status.status === "completed") break;
+  await new Promise(r => setTimeout(r, 10000));
+}
+
+console.log(`Found ${status.summary.total} findings`);
+for (const f of status.findings) {
+  console.log(`  [${f.severity}] ${f.title}`);
+}
+
+// 3. Fix file
+const fix = await fetch(`${API}/v1/scan/${runId}/fix`, { headers: H }).then(r => r.text());
+require("fs").writeFileSync("SECURITY-FIX.md", fix);"""
+
+    SCAN_CURL = """curl -X POST https://securityscanner.dev/v1/scan \\
+  -H "Authorization: Bearer sk-sec-YOUR_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"host": "https://myapp.com", "label": "production"}'"""
+
+    SCAN_PY = """import httpx
+r = httpx.post(
+    "https://securityscanner.dev/v1/scan",
+    headers={"Authorization": "Bearer sk-sec-YOUR_KEY"},
+    json={"host": "https://myapp.com", "label": "production"},
+)
+print(r.json())"""
+
+    SCAN_JS = """const r = await fetch("https://securityscanner.dev/v1/scan", {
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer sk-sec-YOUR_KEY",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({ host: "https://myapp.com", label: "production" }),
+});
+console.log(await r.json());"""
+
+    GET_SCAN_CURL = """curl https://securityscanner.dev/v1/scan/abc12345 \\
+  -H "Authorization: Bearer sk-sec-YOUR_KEY" """
+
+    GET_SCAN_PY = """import httpx
+r = httpx.get(
+    "https://securityscanner.dev/v1/scan/abc12345",
+    headers={"Authorization": "Bearer sk-sec-YOUR_KEY"},
+)
+print(r.json())"""
+
+    GET_SCAN_JS = """const r = await fetch("https://securityscanner.dev/v1/scan/abc12345", {
+  headers: { "Authorization": "Bearer sk-sec-YOUR_KEY" },
+});
+console.log(await r.json());"""
+
+    LIST_CURL = """curl https://securityscanner.dev/v1/runs \\
+  -H "Authorization: Bearer sk-sec-YOUR_KEY" """
+
+    LIST_PY = """import httpx
+runs = httpx.get(
+    "https://securityscanner.dev/v1/runs",
+    headers={"Authorization": "Bearer sk-sec-YOUR_KEY"},
+).json()
+for r in runs["runs"]:
+    print(r["id"], r["target"], r["summary"]["total"])"""
+
+    LIST_JS = """const data = await fetch("https://securityscanner.dev/v1/runs", {
+  headers: { "Authorization": "Bearer sk-sec-YOUR_KEY" },
+}).then(r => r.json());
+data.runs.forEach(r => console.log(r.id, r.target, r.summary.total));"""
+
+    TARGETS_CURL = """# List all targets
+curl https://securityscanner.dev/v1/targets \\
+  -H "Authorization: Bearer sk-sec-YOUR_KEY"
+
+# Add a new target
+curl -X POST https://securityscanner.dev/v1/targets \\
+  -H "Authorization: Bearer sk-sec-YOUR_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"host": "https://staging.myapp.com", "label": "staging"}' """
+
+    TARGETS_PY = """import httpx
+h = {"Authorization": "Bearer sk-sec-YOUR_KEY"}
+
+# List
+targets = httpx.get("https://securityscanner.dev/v1/targets", headers=h).json()
+
+# Add
+httpx.post("https://securityscanner.dev/v1/targets", headers=h,
+           json={"host": "https://staging.myapp.com", "label": "staging"})"""
+
+    TARGETS_JS = """const h = { "Authorization": "Bearer sk-sec-YOUR_KEY" };
+
+// List
+const targets = await fetch("https://securityscanner.dev/v1/targets", { headers: h }).then(r => r.json());
+
+// Add
+await fetch("https://securityscanner.dev/v1/targets", {
+  method: "POST",
+  headers: { ...h, "Content-Type": "application/json" },
+  body: JSON.stringify({ host: "https://staging.myapp.com", label: "staging" }),
+});"""
+
+    tabs_quickstart = _api_tabs("qs", QUICKSTART_CURL, QUICKSTART_PY, QUICKSTART_JS)
+    tabs_scan = _api_tabs("scan", SCAN_CURL, SCAN_PY, SCAN_JS)
+    tabs_get = _api_tabs("get", GET_SCAN_CURL, GET_SCAN_PY, GET_SCAN_JS)
+    tabs_list = _api_tabs("list", LIST_CURL, LIST_PY, LIST_JS)
+    tabs_targets = _api_tabs("targets", TARGETS_CURL, TARGETS_PY, TARGETS_JS)
+
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>API Documentation — Security Scanner</title>
-<style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.6; font-size: 15px; }}
-  .container {{ max-width: 900px; margin: 0 auto; padding: 40px 24px 80px; }}
-  nav {{ padding: 16px 24px; border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; max-width: 1200px; margin: 0 auto; align-items: center; }}
-  nav a {{ color: #9ca3af; text-decoration: none; font-size: 0.85rem; }}
-  nav a.logo {{ color: #e5e7eb; font-weight: 700; }}
-  nav a.logo span {{ color: #dc2626; }}
-  nav .links {{ display: flex; gap: 20px; }}
-  h1 {{ font-size: 2.2rem; margin-bottom: 8px; letter-spacing: -0.02em; font-weight: 700; }}
-  .subtitle {{ color: #9ca3af; font-size: 1rem; margin-bottom: 40px; }}
-  h2 {{ font-size: 1.4rem; margin-top: 48px; margin-bottom: 16px; letter-spacing: -0.01em; padding-top: 16px; border-top: 1px solid #1f2937; }}
-  h3 {{ font-size: 1.05rem; margin-top: 28px; margin-bottom: 10px; color: #e5e7eb; }}
-  p {{ color: #d1d5db; margin-bottom: 14px; }}
-  code {{ font-family: 'SF Mono', Menlo, monospace; font-size: 0.85em; background: #111827; border: 1px solid #1f2937; padding: 1px 6px; border-radius: 4px; color: #fde047; }}
-  pre {{ background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 16px; overflow-x: auto; font-family: 'SF Mono', Menlo, monospace; font-size: 0.8rem; color: #d1d5db; margin-bottom: 20px; line-height: 1.5; position: relative; }}
-  pre code {{ background: none; border: none; padding: 0; color: inherit; font-size: inherit; }}
-  .endpoint {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; margin-bottom: 20px; }}
-  .method {{ display: inline-block; padding: 3px 10px; border-radius: 4px; font-family: 'SF Mono', monospace; font-size: 0.75rem; font-weight: 700; margin-right: 10px; }}
-  .method.GET {{ background: #172554; color: #93c5fd; }}
-  .method.POST {{ background: #14532d; color: #86efac; }}
-  .method.DELETE {{ background: #450a0a; color: #fca5a5; }}
-  .method.PATCH {{ background: #422006; color: #fde047; }}
-  .path {{ font-family: 'SF Mono', monospace; font-size: 0.95rem; }}
-  .tag {{ display: inline-block; padding: 2px 8px; background: #1f2937; color: #9ca3af; border-radius: 4px; font-size: 0.7rem; margin-left: 8px; }}
-  ul, ol {{ color: #d1d5db; margin-left: 24px; margin-bottom: 14px; }}
-  li {{ margin-bottom: 4px; }}
-  a {{ color: #dc2626; text-decoration: none; }}
-  a:hover {{ text-decoration: underline; }}
-  .tip {{ background: #0f1a2e; border-left: 3px solid #3b82f6; padding: 12px 16px; margin: 16px 0; border-radius: 4px; color: #bfdbfe; font-size: 0.88rem; }}
-  table {{ width: 100%; border-collapse: collapse; margin: 14px 0; }}
-  th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #1f2937; font-size: 0.85rem; }}
-  th {{ font-weight: 600; color: #9ca3af; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }}
-  .toc {{ background: #0f1420; border: 1px solid #1f2937; border-radius: 8px; padding: 16px 20px; margin-bottom: 32px; }}
-  .toc h4 {{ font-size: 0.8rem; color: #9ca3af; text-transform: uppercase; margin-bottom: 8px; font-weight: 600; letter-spacing: 0.05em; }}
-  .toc ul {{ list-style: none; margin: 0; }}
-  .toc li {{ margin-bottom: 6px; font-size: 0.9rem; }}
-  .toc a {{ color: #e5e7eb; }}
-</style></head>
+<meta name="description" content="REST API for programmatic security scanning. curl, Python, and JavaScript examples.">
+<style>{_API_DOCS_CSS}</style></head>
 <body>
 <nav>
   <a href="/" class="logo"><span>&#9632;</span> Security Scanner</a>
   <div class="links">
-    <a href="/">Dashboard</a>
+    <a href="/blog">Blog</a>
+    <a href="/contact">Contact</a>
     <a href="/v1/openapi.json">OpenAPI JSON</a>
-    <a href="/login">Sign in</a>
+    <a href="/keys">Get an API key</a>
   </div>
 </nav>
 
 <div class="container">
 <h1>API Documentation</h1>
-<div class="subtitle">REST API for programmatic scanning. Use the same <code>sk-sec-</code> API key across all clients.</div>
+<div class="subtitle">REST API for programmatic scanning. The same <code>sk-sec-</code> key works across curl, Python, JavaScript, MCP, ChatGPT Actions, and GitHub Copilot.</div>
+
+<div class="hero-bar">
+  <div class="text"><strong>Don't have a key yet?</strong> Sign up (free) and generate one in under 30 seconds. Your first scan is on us.</div>
+  <a href="/signup">Get an API key →</a>
+</div>
 
 <div class="toc">
   <h4>Contents</h4>
   <ul>
+    <li><a href="#quickstart">Quickstart — scan to fix in 3 calls</a></li>
     <li><a href="#auth">Authentication</a></li>
     <li><a href="#scan">POST /v1/scan — Start a scan</a></li>
-    <li><a href="#get-scan">GET /v1/scan/{{run_id}} — Get scan status + findings</a></li>
-    <li><a href="#fix">GET /v1/scan/{{run_id}}/fix — Download fix file</a></li>
+    <li><a href="#get-scan">GET /v1/scan/{{run_id}} — Status + findings</a></li>
+    <li><a href="#fix">GET /v1/scan/{{run_id}}/fix — Fix file</a></li>
     <li><a href="#analyze">POST /v1/scan/{{run_id}}/analyze — AI analysis</a></li>
-    <li><a href="#targets">GET/POST /v1/targets — Manage targets</a></li>
-    <li><a href="#runs">GET /v1/runs — List scan history</a></li>
-    <li><a href="#monitors">POST /api/monitors — Schedule recurring scans</a></li>
-    <li><a href="#code">POST /api/github/scan — GitHub repo scan</a></li>
+    <li><a href="#targets">GET/POST /v1/targets</a></li>
+    <li><a href="#runs">GET /v1/runs — Scan history</a></li>
+    <li><a href="#monitors">POST /api/monitors — Recurring scans</a></li>
+    <li><a href="#code">POST /api/github/scan — Repo scan</a></li>
     <li><a href="#mobile">POST /api/mobile/scan — Mobile app scan</a></li>
     <li><a href="#errors">Error codes</a></li>
-    <li><a href="#rate">Rate limits &amp; plans</a></li>
+    <li><a href="#rate">Plans &amp; rate limits</a></li>
+    <li><a href="#sdks">SDKs &amp; integrations</a></li>
   </ul>
 </div>
 
+<h2 id="quickstart">Quickstart — scan to fix in 3 calls</h2>
+<p>The common flow: trigger a scan, poll for completion, download the fix file. Takes 2-5 minutes end to end.</p>
+{tabs_quickstart}
+<div class="tip">The response of <code>GET /v1/scan/{{run_id}}</code> streams partial results while the scan runs — you can start displaying findings before the scan finishes.</div>
+
 <h2 id="auth">Authentication</h2>
-<p>All <code>/v1/</code> and <code>/api/</code> endpoints require a Bearer API key. Generate one at <a href="/keys">/keys</a>.</p>
-<pre><code>Authorization: Bearer sk-sec-your-key-here</code></pre>
-<p>Keys are scoped to your account. Every scan you trigger is billed/counted against your plan.</p>
-<div class="tip">The same API key works for the MCP server, ChatGPT Actions, GitHub Copilot Extension, Vercel Integration, and direct API calls.</div>
+<p>All endpoints require a bearer token in the <code>Authorization</code> header. Generate keys at <a href="/keys">/keys</a>.</p>
+<pre><code>Authorization: Bearer sk-sec-YOUR_KEY</code></pre>
+<p>Keys are scoped to your account. Every scan you trigger counts against your plan. You can have multiple keys; revoke individually at <a href="/keys">/keys</a>.</p>
+<div class="tip">The same key works for: REST API, MCP server, ChatGPT Custom Actions, GitHub Copilot Extension, Vercel Integration.</div>
 
 <h2 id="scan">Start a scan</h2>
 <div class="endpoint">
-  <span class="method POST">POST</span><span class="path">/v1/scan</span><span class="tag">Async</span>
-  <p style="margin-top:14px;">Scans a single URL or IP. Auto-creates the target if it doesn't exist. Returns a <code>run_id</code> immediately; scan runs in background (2-5 minutes).</p>
+  <div class="method-row">
+    <span class="method POST">POST</span><span class="path">/v1/scan</span>
+    <span class="tag async">Async · returns immediately</span>
+  </div>
+  <p>Scans a single URL or IP. Auto-creates the target if it doesn't exist. Returns a <code>run_id</code>; the scan runs in the background (2-5 minutes).</p>
 
-  <h3>Request</h3>
-  <pre><code>curl -H "Authorization: Bearer sk-sec-..." \\
-     -H "Content-Type: application/json" \\
-     -X POST https://security.slederer.com/v1/scan \\
-     -d '{{"host": "https://myapp.com", "label": "production"}}'</code></pre>
+  <h4>Request body</h4>
+  <table>
+    <tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+    <tr><td><code>host</code></td><td>string</td><td>yes</td><td>URL or hostname (with or without scheme)</td></tr>
+    <tr><td><code>label</code></td><td>string</td><td>no</td><td>Free-text label (e.g. "production")</td></tr>
+  </table>
 
-  <h3>Response</h3>
-  <pre><code>{{
+  <h4>Example</h4>
+  {tabs_scan}
+
+  <h4>Response (201)</h4>
+<pre><code>{{
   "run_id": "abc12345",
   "status": "started",
   "target": "myapp.com",
-  "check_status_url": "https://security.slederer.com/v1/scan/abc12345"
+  "check_status_url": "https://securityscanner.dev/v1/scan/abc12345"
 }}</code></pre>
 </div>
 
 <h2 id="get-scan">Get scan status &amp; findings</h2>
 <div class="endpoint">
-  <span class="method GET">GET</span><span class="path">/v1/scan/{{run_id}}</span>
-  <p style="margin-top:14px;">Returns status (<code>running</code>, <code>completed</code>, <code>aborted</code>), summary counts, and all findings once complete.</p>
+  <div class="method-row">
+    <span class="method GET">GET</span><span class="path">/v1/scan/{{run_id}}</span>
+  </div>
+  <p>Returns status (<code>running</code>, <code>completed</code>, <code>aborted</code>, <code>failed</code>), summary counts, and every finding emitted so far.</p>
 
-  <h3>Response (while running)</h3>
-  <pre><code>{{
+  <h4>Example</h4>
+  {tabs_get}
+
+  <h4>Response (while running)</h4>
+<pre><code>{{
   "run_id": "abc12345",
   "status": "running",
   "started_at": "2026-04-12T10:00:00+00:00",
   "summary": {{"total": 5, "critical": 1, "high": 2, "medium": 2}},
-  "findings": [...partial results so far...]
+  "findings": [ ... partial results ... ]
 }}</code></pre>
 
-  <h3>Response (completed)</h3>
-  <pre><code>{{
+  <h4>Response (completed)</h4>
+<pre><code>{{
   "run_id": "abc12345",
   "status": "completed",
   "started_at": "2026-04-12T10:00:00+00:00",
@@ -5287,30 +5535,41 @@ async def api_docs_page(request: Request):
       "category": "secrets",
       "title": "Anthropic API key exposed at /main.js",
       "description": "Secret pattern matched. Rotate immediately.",
-      "evidence": "Found: sk-ant-api03-..."",
+      "evidence": "Found: sk-ant-api03-...",
       "tool": "secret-scan"
     }}
   ],
-  "fix_url": "https://security.slederer.com/v1/scan/abc12345/fix"
+  "fix_url": "https://securityscanner.dev/v1/scan/abc12345/fix"
 }}</code></pre>
+
+  <h4>Finding fields</h4>
+  <table>
+    <tr><th>Field</th><th>Description</th></tr>
+    <tr><td><code>severity</code></td><td>CRITICAL / HIGH / MEDIUM / LOW / INFO</td></tr>
+    <tr><td><code>category</code></td><td>secrets, auth, baas, api, cloud, network, tls, dns, edge-infra, privacy, disclosure, ai-safety</td></tr>
+    <tr><td><code>tool</code></td><td>Module that produced the finding — useful for filtering and deduplication</td></tr>
+    <tr><td><code>evidence</code></td><td>Raw evidence snippet. Truncated to 200-500 bytes per finding.</td></tr>
+  </table>
 </div>
 
-<h2 id="fix">Download fix file (Markdown)</h2>
+<h2 id="fix">Download fix file</h2>
 <div class="endpoint">
-  <span class="method GET">GET</span><span class="path">/v1/scan/{{run_id}}/fix</span>
-  <p style="margin-top:14px;">Returns a <code>SECURITY-FIX.md</code> document with YAML frontmatter and numbered fix instructions, designed to be dropped into a project for Claude Code to execute.</p>
+  <div class="method-row">
+    <span class="method GET">GET</span><span class="path">/v1/scan/{{run_id}}/fix</span>
+  </div>
+  <p>Returns a <code>SECURITY-FIX.md</code> with YAML frontmatter and numbered fix instructions. Drop it into your repo; Claude Code, Cursor, and Cline will read it and apply fixes.</p>
 
-  <h3>Query params</h3>
+  <h4>Query params</h4>
   <table>
     <tr><th>Name</th><th>Type</th><th>Description</th></tr>
-    <tr><td><code>target</code></td><td>string</td><td>Filter to one target's findings</td></tr>
-    <tr><td><code>format</code></td><td>auto | legacy</td><td>Fallback format choice</td></tr>
+    <tr><td><code>target</code></td><td>string</td><td>Filter to one target's findings (multi-target runs)</td></tr>
+    <tr><td><code>format</code></td><td>auto | legacy</td><td>Default is <code>auto</code> (security-fix/v1 frontmatter)</td></tr>
   </table>
 
-  <h3>Response format</h3>
-  <pre><code>---
+  <h4>Response format</h4>
+<pre><code>---
 format: security-fix/v1
-scanner: security.slederer.com
+scanner: securityscanner.dev
 scan_id: abc12345
 scan_date: "2026-04-12"
 targets:
@@ -5325,44 +5584,44 @@ targets:
 ...</code></pre>
 </div>
 
-<h2 id="analyze">AI Analysis (Claude)</h2>
+<h2 id="analyze">AI analysis</h2>
 <div class="endpoint">
-  <span class="method POST">POST</span><span class="path">/v1/scan/{{run_id}}/analyze</span><span class="tag">Requires PAYG+</span>
-  <p style="margin-top:14px;">Triggers Claude Sonnet analysis: executive summary, attack chains, risk score, prioritized remediation. Cached per run.</p>
-
-  <h3>Response</h3>
-  <pre><code>{{
+  <div class="method-row">
+    <span class="method POST">POST</span><span class="path">/v1/scan/{{run_id}}/analyze</span>
+    <span class="tag paid">PAYG+</span>
+  </div>
+  <p>Triggers a structured Sonnet analysis over the run: executive summary, attack chains, risk score (0-100), and prioritized remediation. Cached per run.</p>
+<pre><code>{{
   "content": "# Security Assessment\\n\\n## Executive Summary\\n...",
-  "model": "claude-sonnet-4-5-20250929",
+  "model": "claude-sonnet-4-6",
+  "risk_score": 74,
   "cached": false
 }}</code></pre>
 </div>
 
 <h2 id="targets">Manage targets</h2>
-<div class="endpoint">
-  <span class="method GET">GET</span><span class="path">/v1/targets</span>
-  <p style="margin-top:14px;">List all configured scan targets.</p>
-</div>
-<div class="endpoint">
-  <span class="method POST">POST</span><span class="path">/v1/targets</span>
-  <p style="margin-top:14px;">Add a new target. Body: <code>{{"host": "...", "label": "..."}}</code></p>
-</div>
-<div class="endpoint">
-  <span class="method DELETE">DELETE</span><span class="path">/api/targets/{{id}}</span>
-</div>
+{tabs_targets}
+<p><code>POST /v1/targets</code> body: <code>{{"host": "...", "label": "..."}}</code>. <code>DELETE /api/targets/{{id}}</code> removes one.</p>
 
 <h2 id="runs">List scan history</h2>
 <div class="endpoint">
-  <span class="method GET">GET</span><span class="path">/v1/runs</span>
-  <p style="margin-top:14px;">Returns last 50 runs, most recent first.</p>
+  <div class="method-row">
+    <span class="method GET">GET</span><span class="path">/v1/runs</span>
+  </div>
+  <p>Returns up to the last 50 runs, most recent first. Each item includes run_id, target, status, started_at, finished_at, and summary counts.</p>
+  {tabs_list}
 </div>
 
-<h2 id="monitors">Schedule recurring scans (Monthly+ plan)</h2>
+<h2 id="monitors">Schedule recurring scans</h2>
 <div class="endpoint">
-  <span class="method POST">POST</span><span class="path">/api/monitors</span>
-  <pre><code>{{
+  <div class="method-row">
+    <span class="method POST">POST</span><span class="path">/api/monitors</span>
+    <span class="tag paid">Monthly+</span>
+  </div>
+  <p>Automate scans on a schedule. Supports email + webhook alerts on CRITICAL/HIGH findings and certificate-expiry warnings.</p>
+<pre><code>{{
   "target": "https://myapp.com",
-  "frequency": "weekly",
+  "frequency": "daily|weekly",
   "alert_email": "you@example.com",
   "alert_webhook": "https://hooks.slack.com/...",
   "alert_on_cert_expiry_days": 30
@@ -5371,44 +5630,62 @@ targets:
 
 <h2 id="code">GitHub repo scan</h2>
 <div class="endpoint">
-  <span class="method POST">POST</span><span class="path">/api/github/scan</span><span class="tag">Requires paid plan</span>
-  <p style="margin-top:14px;">Clones a GitHub repo (shallow) and scans for secrets + npm-audit + pip-audit + Terraform IaC issues.</p>
-  <pre><code>{{"repo_url": "https://github.com/owner/repo", "github_token": "ghp_..."}}</code></pre>
+  <div class="method-row">
+    <span class="method POST">POST</span><span class="path">/api/github/scan</span>
+    <span class="tag paid">Paid plan</span>
+  </div>
+  <p>Shallow-clones a repo and scans for secrets + dependency CVEs (npm-audit, pip-audit) + Terraform IaC misconfigs.</p>
+<pre><code>{{"repo_url": "https://github.com/owner/repo", "github_token": "ghp_..."}}</code></pre>
 </div>
 
 <h2 id="mobile">Mobile app scan</h2>
 <div class="endpoint">
-  <span class="method POST">POST</span><span class="path">/api/mobile/scan</span><span class="tag">Requires paid plan</span>
-  <p style="margin-top:14px;">Upload an IPA or APK (max 200MB, multipart/form-data). Scans for hardcoded secrets, cleartext traffic, ATS bypass.</p>
-  <pre><code>curl -H "Authorization: Bearer sk-sec-..." \\
+  <div class="method-row">
+    <span class="method POST">POST</span><span class="path">/api/mobile/scan</span>
+    <span class="tag paid">Paid plan</span>
+  </div>
+  <p>Upload an IPA or APK (max 200 MB, multipart/form-data). Scans for hardcoded secrets, cleartext traffic, ATS bypass, exposed API endpoints.</p>
+<pre><code>curl -H "Authorization: Bearer sk-sec-YOUR_KEY" \\
      -F "file=@myapp.ipa" \\
-     https://security.slederer.com/api/mobile/scan</code></pre>
+     https://securityscanner.dev/api/mobile/scan</code></pre>
 </div>
 
 <h2 id="errors">Error codes</h2>
 <table>
-  <tr><th>Status</th><th>Meaning</th></tr>
-  <tr><td>200</td><td>OK</td></tr>
-  <tr><td>400</td><td>Bad request — invalid input</td></tr>
-  <tr><td>401</td><td>Missing or invalid API key</td></tr>
-  <tr><td>402</td><td>Plan limit reached — upgrade required (check <code>upgrade_url</code> in body)</td></tr>
-  <tr><td>404</td><td>Not found / not your resource</td></tr>
-  <tr><td>409</td><td>Conflict — e.g. target already exists</td></tr>
-  <tr><td>429</td><td>Rate limit</td></tr>
+  <tr><th>Status</th><th>When</th><th>Response shape</th></tr>
+  <tr><td>200 / 201</td><td>OK</td><td>Endpoint-specific</td></tr>
+  <tr><td>400</td><td>Invalid input (missing field, bad URL)</td><td><code>{{"error": "..."}}</code></td></tr>
+  <tr><td>401</td><td>Missing or invalid API key</td><td><code>{{"error": "unauthorized"}}</code></td></tr>
+  <tr><td>402</td><td>Plan limit reached</td><td><code>{{"error": "...", "upgrade_url": "https://securityscanner.dev/billing"}}</code></td></tr>
+  <tr><td>404</td><td>Not found, or not your resource</td><td><code>{{"error": "not found"}}</code></td></tr>
+  <tr><td>409</td><td>Target already exists</td><td><code>{{"error": "target exists", "target_id": "..."}}</code></td></tr>
+  <tr><td>429</td><td>Rate limit</td><td><code>{{"error": "rate limit", "retry_after": 60}}</code></td></tr>
+  <tr><td>500</td><td>Scanner-internal error</td><td><code>{{"error": "internal"}}</code> — email support@securityscanner.dev with the run_id</td></tr>
 </table>
 
-<h2 id="rate">Rate limits &amp; plans</h2>
+<h2 id="rate">Plans &amp; rate limits</h2>
 <table>
-  <tr><th>Plan</th><th>Targets</th><th>Scans</th><th>AI analysis</th></tr>
-  <tr><td>Free</td><td>1</td><td>1 lifetime</td><td>✗</td></tr>
-  <tr><td>PAYG $9/scan</td><td>5</td><td>per credit</td><td>✓</td></tr>
-  <tr><td>Monthly $29</td><td>1</td><td>5/week</td><td>✓</td></tr>
-  <tr><td>Pro $99</td><td>10</td><td>50/day</td><td>✓</td></tr>
+  <tr><th>Plan</th><th>Price</th><th>Targets</th><th>Scans</th><th>AI analysis</th><th>Monitors</th></tr>
+  <tr><td>Free</td><td>$0</td><td>1</td><td>1 lifetime</td><td>—</td><td>—</td></tr>
+  <tr><td>Pay-as-you-go</td><td>$9 / scan</td><td>5</td><td>per credit</td><td>✓</td><td>—</td></tr>
+  <tr><td>Monthly</td><td>$29 / month</td><td>1</td><td>5 per week</td><td>✓</td><td>✓</td></tr>
+  <tr><td>Pro</td><td>$99 / month</td><td>10</td><td>50 per day</td><td>✓</td><td>✓</td></tr>
 </table>
+<p>Rate limit responses include a <code>retry_after</code> (seconds). The scanner batches gracefully — if you need higher throughput for a one-time backfill, email <a href="mailto:stefan@securityscanner.dev">stefan@securityscanner.dev</a>.</p>
 
-<div class="tip"><strong>Tip:</strong> For complete interactive documentation, import <code>/v1/openapi.json</code> into Postman, Insomnia, or any OpenAPI viewer.</div>
+<h2 id="sdks">SDKs &amp; integrations</h2>
+<ul>
+  <li><strong>MCP server</strong> — drop <code>securityscanner</code> into your <code>.mcp.json</code>. Works with Claude Code, Claude Desktop, Cursor, Cline, Windsurf.</li>
+  <li><strong>ChatGPT Custom GPT</strong> — import <a href="/v1/openapi.json">/v1/openapi.json</a> as Actions. See <a href="/chatgpt-setup">/chatgpt-setup</a>.</li>
+  <li><strong>GitHub Copilot Extension</strong> — <code>@security-scanner scan my.app</code> in any chat.</li>
+  <li><strong>Vercel Integration</strong> — auto-scans every production deploy.</li>
+  <li><strong>Python / TypeScript SDK</strong> — planned. For now use <code>httpx</code> or <code>fetch</code> directly — the API is 5 endpoints.</li>
+</ul>
+
+<div class="tip"><strong>Tip:</strong> For interactive exploration, import <code><a href="/v1/openapi.json">/v1/openapi.json</a></code> into Postman, Insomnia, Bruno, or any OpenAPI viewer.</div>
 
 </div>
+<script>{_API_DOCS_JS}</script>
 </body></html>""")
 
 
@@ -5421,9 +5698,9 @@ async def v1_openapi():
             "title": "Security Scanner API",
             "description": "Scan deployed web apps for security vulnerabilities. Get AI-powered fix instructions.",
             "version": "1.0.0",
-            "contact": {"name": "Security Scanner", "url": "https://security.slederer.com"},
+            "contact": {"name": "Security Scanner", "url": "https://securityscanner.dev"},
         },
-        "servers": [{"url": "https://security.slederer.com"}],
+        "servers": [{"url": "https://securityscanner.dev"}],
         "paths": {
             "/v1/scan": {
                 "post": {
@@ -5493,7 +5770,7 @@ async def v1_scan(request: Request, background_tasks: BackgroundTasks):
 
     allowed, reason = can_user_scan(user["user_id"])
     if not allowed:
-        return JSONResponse({"error": reason, "upgrade_url": "https://security.slederer.com/billing"}, status_code=402)
+        return JSONResponse({"error": reason, "upgrade_url": "https://securityscanner.dev/billing"}, status_code=402)
 
     body = await request.json()
     host = (body.get("host") or "").strip()
@@ -5542,7 +5819,7 @@ async def v1_scan(request: Request, background_tasks: BackgroundTasks):
 
     single_target = [{"ip": host, "name": label}]
     background_tasks.add_task(run_full_scan, run_id, single_target, user["user_id"])
-    return {"run_id": run_id, "status": "started", "target": host, "check_status_url": f"https://security.slederer.com/v1/scan/{run_id}"}
+    return {"run_id": run_id, "status": "started", "target": host, "check_status_url": f"https://securityscanner.dev/v1/scan/{run_id}"}
 
 
 @app.get("/v1/scan/{run_id}")
@@ -5565,7 +5842,7 @@ async def v1_get_scan(request: Request, run_id: str):
         "finished_at": run["finished_at"],
         "summary": json.loads(run["summary_json"]) if run["summary_json"] else None,
         "findings": [dict(f) for f in findings],
-        "fix_url": f"https://security.slederer.com/v1/scan/{run_id}/fix",
+        "fix_url": f"https://securityscanner.dev/v1/scan/{run_id}/fix",
     }
 
 
@@ -5628,7 +5905,7 @@ async def v1_analyze(request: Request, run_id: str):
     if not PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["ai_analysis"]:
         return JSONResponse({
             "error": "AI analysis requires PAYG or higher plan. Upgrade at /billing",
-            "upgrade_url": "https://security.slederer.com/billing",
+            "upgrade_url": "https://securityscanner.dev/billing",
         }, status_code=402)
 
     # Return cached analysis if already generated
@@ -6962,7 +7239,7 @@ VIEWS.integrations = async () => {
       <h2 style="margin-bottom:6px;">Use our /v1/ API from anywhere</h2>
       <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:10px;">Full reference: <a href="/docs/api" target="_blank" style="color:var(--brand);">/docs/api</a> · OpenAPI JSON: <a href="/v1/openapi.json" target="_blank" style="color:var(--brand);">/v1/openapi.json</a></p>
       <div class="copy-code">curl -H "Authorization: Bearer sk-sec-..." \\
-  -X POST https://security.slederer.com/v1/scan \\
+  -X POST https://securityscanner.dev/v1/scan \\
   -d '{"host":"https://myapp.com"}'</div>
       <p style="margin-top:10px;"><a class="btn btn-outline btn-sm" href="/docs/api" target="_blank">Read API docs</a></p>
     </div>`;
@@ -7109,6 +7386,9 @@ _LANDING_HTML = """<!DOCTYPE html>
   <div class="links">
     <a href="#how">How it works</a>
     <a href="#pricing">Pricing</a>
+    <a href="/blog">Blog</a>
+    <a href="/docs/api">API</a>
+    <a href="/contact">Contact</a>
     <a href="/login">Sign in</a>
     <a href="/signup" class="cta">Get started</a>
   </div>
@@ -7117,7 +7397,7 @@ _LANDING_HTML = """<!DOCTYPE html>
 <section class="hero">
   <div class="container">
     <h1>Security scans for the<br><span>vibe-coding</span> era.</h1>
-    <p>Scan any deployed app. Get AI-powered fix instructions your coding assistant can execute directly. Works with Claude Code, ChatGPT, Cursor, Cline, and GitHub Copilot.</p>
+    <p>Scan any deployed app. 40+ modules: Supabase RLS probe, AI-key detection, GraphQL audit, subdomain takeover, prompt-injection probing, WAF fingerprint, nuclei CVE, and more. Fix instructions your AI assistant can execute directly.</p>
     <div class="btns">
       <a href="/signup" class="btn btn-primary">Start free — 1 scan, no card</a>
       <a href="#how" class="btn btn-secondary">See how it works</a>
@@ -7154,8 +7434,8 @@ _LANDING_HTML = """<!DOCTYPE html>
       </div>
       <div class="step">
         <div class="num">STEP 2</div>
-        <h3>We scan with 6 engines</h3>
-        <p>nmap, TLS audit, security headers, exposed endpoints (/docs, /.env, /.git), rate limit probing, and nuclei (8k+ CVE templates).</p>
+        <h3>We run 40+ modules</h3>
+        <p>Transport &amp; headers, Supabase RLS probe with real table names from your JS bundle, GraphQL introspection audit, AI-key leak detection (Anthropic, OpenAI, AWS, Stripe), subdomain takeover (Vercel, Netlify, Unbounce), CORS / CSP / TLS / nuclei 8k+ CVE templates, prompt-injection probing, and more.</p>
       </div>
       <div class="step">
         <div class="num">STEP 3</div>
@@ -7227,9 +7507,11 @@ _LANDING_HTML = """<!DOCTYPE html>
   <div class="container">
     <div>Security Scanner &mdash; Built for the AI-native developer</div>
     <div style="margin-top:12px;">
+      <a href="/blog">Blog</a>
+      <a href="/docs/api">API</a>
+      <a href="/contact">Contact</a>
       <a href="/privacy">Privacy</a>
       <a href="/terms">Terms</a>
-      <a href="/v1/openapi.json">API docs</a>
       <a href="/login">Sign in</a>
     </div>
   </div>
@@ -7321,13 +7603,13 @@ async def privacy_policy():
 </ul>
 
 <h2>Your rights</h2>
-<p>You can export all your data via the API, delete your account, or revoke API keys at any time. Email <a href="mailto:privacy@slederer.com">privacy@slederer.com</a> with any requests.</p>
+<p>You can export all your data via the API, delete your account, or revoke API keys at any time. Email <a href="mailto:privacy@securityscanner.dev">privacy@securityscanner.dev</a> with any requests.</p>
 
 <h2>Scanning ethics</h2>
 <p>You must only scan targets you own or have explicit permission to test. Unauthorized scanning violates our terms and may be illegal in your jurisdiction. We log all scans against the authenticated user.</p>
 
 <h2>Contact</h2>
-<p>Security Scanner is operated by Stefan Lederer. Questions? <a href="mailto:privacy@slederer.com">privacy@slederer.com</a></p>
+<p>Security Scanner is operated by Stefan Lederer. Questions? <a href="mailto:privacy@securityscanner.dev">privacy@securityscanner.dev</a></p>
 </div>
 </body></html>""")
 
@@ -7365,7 +7647,7 @@ async def terms_of_service():
 <p>You can delete your account at any time. We may terminate accounts that violate these terms with reasonable notice.</p>
 
 <h2>Contact</h2>
-<p><a href="mailto:support@slederer.com">support@slederer.com</a></p>
+<p><a href="mailto:support@securityscanner.dev">support@securityscanner.dev</a></p>
 </div>
 </body></html>""")
 
@@ -7684,13 +7966,13 @@ async def copilot_extension(request: Request):
     async def stream_response():
         import json as _json
         if not gh_email:
-            yield f'data: {_json.dumps({"choices": [{"delta": {"content": "To use Security Scanner, first create an account at https://security.slederer.com and link your GitHub email. Then run your command again."}}]})}\n\n'
+            yield f'data: {_json.dumps({"choices": [{"delta": {"content": "To use Security Scanner, first create an account at https://securityscanner.dev and link your GitHub email. Then run your command again."}}]})}\n\n'
             yield "data: [DONE]\n\n"
             return
 
         user = get_user_by_email(gh_email)
         if not user:
-            yield f'data: {_json.dumps({"choices": [{"delta": {"content": f"No Security Scanner account found for {gh_email}. Sign up at https://security.slederer.com/signup — it takes 30 seconds."}}]})}\n\n'
+            yield f'data: {_json.dumps({"choices": [{"delta": {"content": f"No Security Scanner account found for {gh_email}. Sign up at https://securityscanner.dev/signup — it takes 30 seconds."}}]})}\n\n'
             yield "data: [DONE]\n\n"
             return
 
@@ -7706,7 +7988,7 @@ async def copilot_extension(request: Request):
             user_id = user["id"]
             allowed, reason = can_user_scan(user_id)
             if not allowed:
-                yield f'data: {_json.dumps({"choices": [{"delta": {"content": f"Cannot scan: {reason}. Upgrade at https://security.slederer.com/billing"}}]})}\n\n'
+                yield f'data: {_json.dumps({"choices": [{"delta": {"content": f"Cannot scan: {reason}. Upgrade at https://securityscanner.dev/billing"}}]})}\n\n'
                 yield "data: [DONE]\n\n"
                 return
 
@@ -7739,7 +8021,7 @@ async def copilot_extension(request: Request):
             msg = (
                 f"Started security scan on `{host}` (run `{run_id}`). "
                 f"This takes 2-5 minutes. "
-                f"Full results: https://security.slederer.com/runs/{run_id}"
+                f"Full results: https://securityscanner.dev/runs/{run_id}"
             )
             yield f'data: {_json.dumps({"choices": [{"delta": {"content": msg}}]})}\n\n'
             yield "data: [DONE]\n\n"
@@ -7901,15 +8183,15 @@ code {{ background: #111827; padding: 2px 6px; border-radius: 4px; font-family: 
 
 <h2>2. Add Actions from our OpenAPI spec</h2>
 <p>In the GPT builder, click "Actions" → "Create new action" → "Import from URL":</p>
-<pre>https://security.slederer.com/v1/openapi.json</pre>
+<pre>https://securityscanner.dev/v1/openapi.json</pre>
 
 <h2>3. Configure Authentication</h2>
 <p>In the Actions settings, select <strong>Authentication → OAuth</strong>:</p>
 <ul>
     <li><strong>Client ID:</strong> <code>chatgpt</code></li>
     <li><strong>Client Secret:</strong> <code>{client_secret}</code> <span style="color:#9ca3af;font-size:0.8rem;">(keep this private)</span></li>
-    <li><strong>Authorization URL:</strong> <code>https://security.slederer.com/oauth/authorize</code></li>
-    <li><strong>Token URL:</strong> <code>https://security.slederer.com/oauth/token</code></li>
+    <li><strong>Authorization URL:</strong> <code>https://securityscanner.dev/oauth/authorize</code></li>
+    <li><strong>Token URL:</strong> <code>https://securityscanner.dev/oauth/token</code></li>
     <li><strong>Scope:</strong> <code>scan</code></li>
     <li><strong>Token Exchange Method:</strong> <code>Default (POST request)</code></li>
 </ul>
@@ -7919,9 +8201,277 @@ code {{ background: #111827; padding: 2px 6px; border-radius: 4px; font-family: 
 <pre>You are a security scanning assistant. When a user gives you a URL, use the scanTarget action to scan it. Poll getScanStatus every 30 seconds until status is "completed". Then retrieve findings and fix instructions via getFixFile. Present findings by severity (CRITICAL first). Always warn: "Only scan targets you own or have permission to test."</pre>
 
 <h2>5. Publish</h2>
-<p>Set privacy policy URL to <code>https://security.slederer.com/privacy</code>, then publish publicly or keep it private to you.</p>
+<p>Set privacy policy URL to <code>https://securityscanner.dev/privacy</code>, then publish publicly or keep it private to you.</p>
 </div>
 </body></html>""")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# /blog — posts index + per-post pages
+# ═════════════════════════════════════════════════════════════════════════════
+
+try:
+    from scanner.blog_posts import POSTS as _BLOG_POSTS, get_post as _blog_get
+    from scanner.blog_posts import get_posts_sorted as _blog_sorted
+except ImportError:
+    from scanner_blog_posts import POSTS as _BLOG_POSTS, get_post as _blog_get  # type: ignore
+    from scanner_blog_posts import get_posts_sorted as _blog_sorted  # type: ignore
+
+
+_BLOG_CSS = """
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.7; }
+  nav { padding: 16px 24px; border-bottom: 1px solid #1f2937; max-width: 1100px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }
+  nav .logo { color: #e5e7eb; font-weight: 700; text-decoration: none; }
+  nav .logo span { color: #dc2626; }
+  nav .links a { color: #9ca3af; text-decoration: none; font-size: 0.85rem; margin-left: 20px; }
+  nav .links a:hover { color: #e5e7eb; }
+  .container { max-width: 760px; margin: 0 auto; padding: 50px 24px 80px; }
+  h1 { font-size: 2.4rem; letter-spacing: -0.03em; margin-bottom: 8px; font-weight: 700; }
+  h2 { font-size: 1.4rem; margin-top: 36px; margin-bottom: 14px; letter-spacing: -0.01em; font-weight: 600; }
+  h3 { font-size: 1.1rem; margin-top: 24px; margin-bottom: 10px; font-weight: 600; color: #e5e7eb; }
+  p { color: #d1d5db; margin-bottom: 16px; font-size: 0.97rem; }
+  ul, ol { color: #d1d5db; margin: 0 0 16px 24px; }
+  li { margin-bottom: 6px; }
+  code { font-family: 'SF Mono', Menlo, monospace; background: #111827; padding: 1px 6px; border-radius: 4px; font-size: 0.87em; color: #fde047; border: 1px solid #1f2937; }
+  a { color: #dc2626; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .meta { color: #6b7280; font-size: 0.85rem; margin-bottom: 36px; }
+  .post-card { padding: 20px 0; border-bottom: 1px solid #1f2937; }
+  .post-card:last-child { border-bottom: 0; }
+  .post-card h3 { margin: 0 0 6px 0; font-size: 1.25rem; }
+  .post-card h3 a { color: #e5e7eb; }
+  .post-card .date { color: #6b7280; font-size: 0.82rem; margin-bottom: 10px; }
+  .post-card p { margin: 0; color: #9ca3af; font-size: 0.95rem; }
+  .back { color: #9ca3af; font-size: 0.85rem; text-decoration: none; margin-bottom: 30px; display: inline-block; }
+"""
+
+
+def _render_blog_nav():
+    return """<nav>
+  <a href="/" class="logo"><span>&#9632;</span> Security Scanner</a>
+  <div class="links">
+    <a href="/blog">Blog</a>
+    <a href="/docs/api">API</a>
+    <a href="/contact">Contact</a>
+    <a href="/signup">Start free</a>
+  </div>
+</nav>"""
+
+
+@app.get("/blog", response_class=HTMLResponse)
+async def blog_index():
+    posts = _blog_sorted()
+    cards = "".join(
+        f"""<div class="post-card">
+  <h3><a href="/blog/{p['slug']}">{p['title']}</a></h3>
+  <div class="date">{p['date']}</div>
+  <p>{p['excerpt']}</p>
+</div>"""
+        for p in posts
+    )
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Blog — Security Scanner</title>
+<meta name="description" content="Findings, write-ups, and notes from scanning AI-built apps in the wild.">
+<style>{_BLOG_CSS}</style></head>
+<body>
+{_render_blog_nav()}
+<div class="container">
+<h1>Blog</h1>
+<p class="meta">Findings, write-ups, and notes from scanning AI-built apps in the wild.</p>
+{cards}
+</div>
+</body></html>""")
+
+
+@app.get("/blog/{slug}", response_class=HTMLResponse)
+async def blog_post(slug: str):
+    p = _blog_get(slug)
+    if not p:
+        return HTMLResponse(
+            f"""<!DOCTYPE html><html><head><style>{_BLOG_CSS}</style></head>
+<body>{_render_blog_nav()}<div class="container">
+<a href="/blog" class="back">← Back to blog</a>
+<h1>Post not found</h1><p>That post doesn't exist.</p></div></body></html>""",
+            status_code=404,
+        )
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>{p['title']} — Security Scanner</title>
+<meta name="description" content="{p['excerpt']}">
+<style>{_BLOG_CSS}</style></head>
+<body>
+{_render_blog_nav()}
+<div class="container">
+<a href="/blog" class="back">← Back to blog</a>
+<h1>{p['title']}</h1>
+<div class="meta">{p['date']} · Security Scanner</div>
+{p['body']}
+<hr style="border:0;border-top:1px solid #1f2937;margin:48px 0 24px;">
+<p style="color:#9ca3af;font-size:0.9rem;">
+Scan your own app at <a href="/signup">securityscanner.dev</a>.
+Questions? <a href="mailto:stefan@securityscanner.dev">stefan@securityscanner.dev</a>.
+</p>
+</div>
+</body></html>""")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# /contact — contact page + POST handler (sends to stefan@ via Resend)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_CONTACT_HTML = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Contact — Security Scanner</title>
+<style>{_BLOG_CSS}
+  form {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 28px; margin-top: 24px; }}
+  label {{ display: block; font-size: 0.85rem; color: #9ca3af; margin-bottom: 6px; margin-top: 16px; }}
+  label:first-of-type {{ margin-top: 0; }}
+  input, textarea {{ width: 100%; background: #0a0e17; border: 1px solid #1f2937; color: #e5e7eb; padding: 10px 12px; border-radius: 6px; font-family: inherit; font-size: 0.95rem; }}
+  input:focus, textarea:focus {{ outline: none; border-color: #dc2626; }}
+  textarea {{ min-height: 160px; resize: vertical; }}
+  button {{ margin-top: 20px; background: #dc2626; color: white; border: 0; padding: 10px 20px; border-radius: 6px; font-family: inherit; font-size: 0.95rem; font-weight: 600; cursor: pointer; }}
+  button:hover {{ background: #b91c1c; }}
+  button:disabled {{ opacity: 0.5; cursor: wait; }}
+  .status {{ margin-top: 14px; padding: 10px 14px; border-radius: 6px; font-size: 0.9rem; display: none; }}
+  .status.ok {{ background: #052e16; border: 1px solid #166534; color: #86efac; display: block; }}
+  .status.err {{ background: #450a0a; border: 1px solid #991b1b; color: #fca5a5; display: block; }}
+</style></head>
+<body>
+{_render_blog_nav()}
+<div class="container">
+<h1>Contact</h1>
+<p class="meta">Questions about the product, disclosures, or enterprise plans.</p>
+
+<p>The fastest way to reach us is email:</p>
+<ul>
+  <li><strong>General</strong> — <a href="mailto:stefan@securityscanner.dev">stefan@securityscanner.dev</a></li>
+  <li><strong>Privacy / data requests</strong> — <a href="mailto:privacy@securityscanner.dev">privacy@securityscanner.dev</a></li>
+  <li><strong>Support</strong> — <a href="mailto:support@securityscanner.dev">support@securityscanner.dev</a></li>
+</ul>
+
+<p>Or use the form below — it routes to the same inbox.</p>
+
+<form id="contactForm" onsubmit="return submitContact(event)">
+  <label for="name">Your name</label>
+  <input id="name" name="name" required maxlength="120">
+
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" required maxlength="240">
+
+  <label for="subject">Subject</label>
+  <input id="subject" name="subject" required maxlength="200">
+
+  <label for="message">Message</label>
+  <textarea id="message" name="message" required minlength="10" maxlength="5000"></textarea>
+
+  <button type="submit" id="submitBtn">Send</button>
+  <div class="status" id="status"></div>
+</form>
+
+<script>
+async function submitContact(e) {{
+  e.preventDefault();
+  const btn = document.getElementById('submitBtn');
+  const status = document.getElementById('status');
+  btn.disabled = true;
+  btn.textContent = 'Sending...';
+  status.className = 'status';
+  status.textContent = '';
+  try {{
+    const r = await fetch('/api/contact', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        name: document.getElementById('name').value,
+        email: document.getElementById('email').value,
+        subject: document.getElementById('subject').value,
+        message: document.getElementById('message').value,
+      }}),
+    }});
+    const data = await r.json();
+    if (r.ok) {{
+      status.className = 'status ok';
+      status.textContent = 'Thanks — we\\'ll get back to you within a day or two.';
+      document.getElementById('contactForm').reset();
+    }} else {{
+      status.className = 'status err';
+      status.textContent = data.error || 'Something went wrong. Please email us directly.';
+    }}
+  }} catch (err) {{
+    status.className = 'status err';
+    status.textContent = 'Network error. Please email us directly.';
+  }}
+  btn.disabled = false;
+  btn.textContent = 'Send';
+  return false;
+}}
+</script>
+</div>
+</body></html>"""
+
+
+@app.get("/contact", response_class=HTMLResponse)
+async def contact_page():
+    return HTMLResponse(_CONTACT_HTML)
+
+
+@app.post("/api/contact")
+async def contact_submit(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip()[:240]
+    subject = (data.get("subject") or "").strip()[:200]
+    message = (data.get("message") or "").strip()[:5000]
+    if not (name and email and subject and message):
+        return JSONResponse({"error": "all fields are required"}, status_code=400)
+    # Minimal email format sanity check
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return JSONResponse({"error": "please enter a valid email"}, status_code=400)
+
+    resend_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not resend_key:
+        return JSONResponse(
+            {"error": "contact form is offline — please email stefan@securityscanner.dev"},
+            status_code=500,
+        )
+    try:
+        import httpx
+        body_text = (
+            f"Name: {name}\n"
+            f"Email: {email}\n"
+            f"Subject: {subject}\n\n"
+            f"{message}\n"
+        )
+        r = httpx.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "Contact Form <contact@securityscanner.dev>",
+                "to": ["stefan@securityscanner.dev"],
+                "reply_to": email,
+                "subject": f"[contact] {subject}",
+                "text": body_text,
+            },
+            timeout=10,
+        )
+        if r.status_code >= 400:
+            return JSONResponse(
+                {"error": "couldn't send — please email us directly"},
+                status_code=500,
+            )
+    except Exception:
+        return JSONResponse(
+            {"error": "couldn't send — please email us directly"},
+            status_code=500,
+        )
+    return {"ok": True}
 
 
 if __name__ == "__main__":

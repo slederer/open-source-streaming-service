@@ -121,7 +121,7 @@ def run_monitor(monitor: sqlite3.Row):
     if alert:
         user = get_user_by_id(user_id) or {}
         subject = f"[Security Alert] {target}: " + "; ".join(alert_reasons[:2])
-        dashboard_url = f"https://security.slederer.com/?run={run_id}"
+        dashboard_url = f"https://securityscanner.dev/?run={run_id}"
 
         if monitor["alert_email"]:
             html = f"""
@@ -133,7 +133,7 @@ def run_monitor(monitor: sqlite3.Row):
                     {''.join(f'<li>{r}</li>' for r in alert_reasons)}
                 </ul>
                 <p><a href="{dashboard_url}" style="background:#dc2626;color:white;padding:10px 20px;border-radius:6px;text-decoration:none;">View Details</a></p>
-                <p style="color:#9ca3af;font-size:0.8rem;margin-top:40px;">Manage monitors at <a href="https://security.slederer.com/monitors">/monitors</a>.</p>
+                <p style="color:#9ca3af;font-size:0.8rem;margin-top:40px;">Manage monitors at <a href="https://securityscanner.dev/monitors">/monitors</a>.</p>
             </div>
             """
             send_alert_email(monitor["alert_email"], subject, html)

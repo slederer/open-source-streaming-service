@@ -68,7 +68,7 @@ After implementing fixes, ask the user: "Run another scan to verify fixes took e
 
 ## Handling errors
 
-- **No API key**: Tell the user to visit https://security.slederer.com, sign up, generate an API key, and add it to their MCP config
+- **No API key**: Tell the user to visit https://securityscanner.dev, sign up, generate an API key, and add it to their MCP config
 - **Plan limit reached**: Show the upgrade URL from the error response
 - **Scan timeout**: Tell the user the target may be unreachable or heavily firewalled
 

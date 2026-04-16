@@ -7865,15 +7865,84 @@ _LANDING_HTML = """<!DOCTYPE html>
   footer { padding: 40px 0; text-align: center; color: #6b7280; font-size: 0.85rem; }
   footer a { color: #9ca3af; margin: 0 12px; }
   footer a:hover { color: #e5e7eb; }
+
+  /* Hamburger button — hidden on desktop */
+  .nav-toggle { display: none; background: transparent; border: 0; color: #e5e7eb; padding: 8px; cursor: pointer; border-radius: 6px; }
+  .nav-toggle:active { background: #1f2937; }
+  .nav-toggle svg { width: 24px; height: 24px; display: block; }
+
+  /* Mobile breakpoint: stack nav into a drawer */
+  @media (max-width: 760px) {
+    nav { flex-wrap: nowrap; padding: 14px 0; }
+    nav .logo { font-size: 1rem; }
+    .nav-toggle { display: inline-flex; align-items: center; }
+
+    nav .links {
+      position: fixed; top: 0; right: 0; height: 100vh;
+      width: min(82vw, 320px);
+      background: #0a0e17; border-left: 1px solid #1f2937;
+      flex-direction: column; align-items: stretch; gap: 0;
+      padding: 64px 20px 20px;
+      transform: translateX(100%);
+      transition: transform 0.22s ease;
+      z-index: 1001; overflow-y: auto;
+      box-shadow: -8px 0 24px rgba(0,0,0,0.45);
+    }
+    nav .links a { padding: 14px 8px; border-bottom: 1px solid #1f2937; font-size: 1rem; color: #e5e7eb; }
+    nav .links a:last-child { border-bottom: 0; }
+    nav .links a.cta { background: #dc2626; color: white !important; border-bottom: 0; text-align: center; border-radius: 8px; margin-top: 12px; padding: 12px 16px; }
+    body.nav-open nav .links { transform: translateX(0); }
+
+    /* Backdrop */
+    .nav-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; opacity: 0; pointer-events: none; transition: opacity 0.22s; }
+    body.nav-open .nav-backdrop { opacity: 1; pointer-events: auto; }
+
+    /* Close X inside drawer */
+    .nav-close { position: absolute; top: 14px; right: 14px; background: transparent; border: 0; color: #9ca3af; padding: 8px; cursor: pointer; }
+    .nav-close svg { width: 24px; height: 24px; display: block; }
+
+    /* Hero scaling for narrow viewports */
+    .hero { padding: 48px 0; }
+    .hero h1 { font-size: 2.2rem; }
+    .hero p { font-size: 1rem; margin-bottom: 28px; }
+    .hero .btns { flex-direction: column; }
+    .hero .btn { width: 100%; justify-content: center; }
+
+    section { padding: 48px 0; }
+    section h2 { font-size: 1.5rem; }
+    section .sub { font-size: 0.92rem; margin-bottom: 32px; }
+
+    /* Capability cards: allow smaller cards so iPhone SE (375px) fits without scroll */
+    .caps { grid-template-columns: 1fr; gap: 14px; }
+    .integrations { grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    .pricing { grid-template-columns: 1fr; }
+    .steps { grid-template-columns: 1fr; }
+
+    #faq .container { padding: 0 18px; }
+    pre, code { font-size: 0.8rem; }
+  }
+
+  /* Extra-narrow phones (iPhone SE portrait ~375, older Android ~360) */
+  @media (max-width: 400px) {
+    .hero h1 { font-size: 1.9rem; }
+    .integrations { grid-template-columns: 1fr; }
+  }
 </style></head>
 <body>
+<div class="nav-backdrop" onclick="closeNav()"></div>
 <nav class="container">
   <div class="logo"><span>&#9632;</span> Security Scanner</div>
+  <button class="nav-toggle" aria-label="Open menu" onclick="openNav()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+  </button>
   <div class="links">
-    <a href="#how">How it works</a>
-    <a href="#capabilities">What we check</a>
-    <a href="#pricing">Pricing</a>
-    <a href="#faq">FAQ</a>
+    <button class="nav-close" aria-label="Close menu" onclick="closeNav()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="6" x2="18" y2="18"/><line x1="6" y1="18" x2="18" y2="6"/></svg>
+    </button>
+    <a href="#how" onclick="closeNav()">How it works</a>
+    <a href="#capabilities" onclick="closeNav()">What we check</a>
+    <a href="#pricing" onclick="closeNav()">Pricing</a>
+    <a href="#faq" onclick="closeNav()">FAQ</a>
     <a href="/blog">Blog</a>
     <a href="/docs/api">API</a>
     <a href="/contact">Contact</a>
@@ -7881,6 +7950,11 @@ _LANDING_HTML = """<!DOCTYPE html>
     <a href="/signup" class="cta">Get started</a>
   </div>
 </nav>
+<script>
+function openNav(){document.body.classList.add('nav-open');}
+function closeNav(){document.body.classList.remove('nav-open');}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeNav();});
+</script>
 
 <section class="hero">
   <div class="container">

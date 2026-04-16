@@ -33,16 +33,16 @@ POSTS = [
 <thead><tr style="border-bottom:1px solid #1f2937;"><th align="left" style="padding:8px 4px;">Cohort</th><th style="padding:8px 4px;">Scanned</th><th style="padding:8px 4px;">With CRIT</th><th style="padding:8px 4px;">Rate</th></tr></thead>
 <tbody>
 <tr><td style="padding:6px 4px;">YC companies (W24 → F25)</td><td align="center">100</td><td align="center">0</td><td align="center">0%</td></tr>
-<tr><td style="padding:6px 4px;">Lovable</td><td align="center">58</td><td align="center">3</td><td align="center">5%</td></tr>
-<tr><td style="padding:6px 4px;">Bolt.host</td><td align="center">38</td><td align="center">5</td><td align="center">13%</td></tr>
-<tr><td style="padding:6px 4px;">Bolt.new</td><td align="center">8</td><td align="center">1</td><td align="center">13%</td></tr>
-<tr><td style="padding:6px 4px;">Replit + Tempo + Emergent</td><td align="center">22</td><td align="center">1</td><td align="center">5%</td></tr>
-<tr style="border-top:1px solid #1f2937;"><td style="padding:8px 4px;"><strong>Vibe-coded total</strong></td><td align="center"><strong>126</strong></td><td align="center"><strong>10</strong></td><td align="center"><strong>8%</strong></td></tr>
+<tr><td style="padding:6px 4px;">Lovable</td><td align="center">58</td><td align="center">3</td><td align="center">5.2%</td></tr>
+<tr><td style="padding:6px 4px;">Bolt.host</td><td align="center">30</td><td align="center">6</td><td align="center">20.0%</td></tr>
+<tr><td style="padding:6px 4px;">Bolt.new</td><td align="center">8</td><td align="center">1</td><td align="center">12.5%</td></tr>
+<tr><td style="padding:6px 4px;">Replit + Tempo + Emergent</td><td align="center">30</td><td align="center">0</td><td align="center">0%</td></tr>
+<tr style="border-top:1px solid #1f2937;"><td style="padding:8px 4px;"><strong>Vibe-coded total</strong></td><td align="center"><strong>126</strong></td><td align="center"><strong>10</strong></td><td align="center"><strong>7.9%</strong></td></tr>
 </tbody></table>
 
 <p>Every single CRIT in this batch was the same class of issue: Supabase Row Level Security disabled on tables backing real user data. Not a mix of vulnerabilities — one pattern, showing up again and again.</p>
 
-<h2>Why Bolt apps fail 2.6× more often than Lovable</h2>
+<h2>Why Bolt.host apps fail 4× more often than Lovable</h2>
 
 <p>Both products target the same developer with the same backend (Supabase). So why the gap?</p>
 
@@ -52,18 +52,11 @@ POSTS = [
 
 <h2>The table names tell you exactly how this happens</h2>
 
-<p>Across the 10 vulnerable apps we found these recurring table names in the anon-readable sets:</p>
+<p>Looking across the 51 world-readable tables in these 10 apps, the names are almost all tutorial-style. Generic primitives that appear on every Supabase "build-your-first-app" guide: <code>users</code>, <code>profiles</code>, <code>sessions</code>, <code>categories</code>, <code>subscriptions</code>, <code>comments</code>, <code>coaches</code>, <code>players</code>, <code>teams</code>.</p>
 
-<ul>
-<li><code>profiles</code> — in 4 apps</li>
-<li><code>categories</code> — in 3 apps</li>
-<li><code>sessions</code>, <code>coaches</code>, <code>players</code> — each in 2 apps</li>
-<li><code>subscriptions</code>, <code>comments</code>, <code>users</code> — each in 2 apps</li>
-</ul>
+<p>Only two tables appeared in more than one app in our sample (<code>players</code> and <code>categories</code>, each in 2 apps) — everything else is unique to its app. But the <em>shape</em> of the names is the same everywhere. These are the names you get when you start from the Supabase docs, get RLS working on your first tutorial table (usually <code>profiles</code> or <code>todos</code>), then build 10 more tables without touching the RLS toggle again. The Supabase dashboard shows each new table in green whether RLS is on or off, which makes the error silent.</p>
 
-<p>These are the <em>tutorial</em> table names. Supabase's onboarding flow uses <code>profiles</code> as the first example. Blog posts about "build a Lovable app with auth" use <code>sessions</code> and <code>users</code>. Devs copy the first example, get RLS working on <code>profiles</code>, then create ten more tables and forget every one.</p>
-
-<p>The fix on Supabase's side is a two-character change: flip the default on new tables from RLS-off to RLS-on. They've had the dashboard flag for this for years. It's still opt-in.</p>
+<p>The fix on Supabase's side is a single default-flip: new tables with RLS on by default instead of off. The dashboard has had an opt-in for this for years, but the default remains off — which is what produces findings like these at scale.</p>
 
 <h2>The worst apps we found</h2>
 

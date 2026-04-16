@@ -7798,17 +7798,19 @@ _LANDING_HTML = """<!DOCTYPE html>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.5; }
   a { color: inherit; text-decoration: none; }
-  .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
-  nav { padding: 20px 0; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1f2937; }
-  nav .logo { font-size: 1.05rem; font-weight: 700; letter-spacing: -0.02em; }
-  nav .logo span { color: #dc2626; }
-  nav .links { display: flex; gap: 20px; font-size: 0.85rem; color: #9ca3af; align-items: center; }
+  .container { max-width: 1180px; margin: 0 auto; padding: 0 28px; }
+  nav { padding: 22px 0; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1f2937; gap: 24px; }
+  nav .logo { font-size: 1.08rem; font-weight: 700; letter-spacing: -0.02em; display: inline-flex; align-items: center; gap: 8px; }
+  nav .logo span { color: #dc2626; font-size: 1.1rem; line-height: 1; }
+  nav .links { display: flex; gap: 28px; font-size: 0.92rem; color: #9ca3af; align-items: center; }
+  nav .links a { transition: color .15s; }
   nav .links a:hover { color: #e5e7eb; }
-  nav .cta { background: #dc2626; color: white !important; padding: 8px 16px; border-radius: 6px; font-weight: 600; }
+  nav .signin { margin-left: 10px; padding-left: 22px; border-left: 1px solid #1f2937; }
+  nav .cta { background: #dc2626; color: white !important; padding: 9px 18px; border-radius: 7px; font-weight: 600; font-size: 0.9rem; }
   nav .cta:hover { background: #b91c1c; }
 
-  .hero { padding: 80px 0; text-align: center; background: radial-gradient(circle at 50% 0%, #1f2937 0%, #0a0e17 70%); }
-  .hero h1 { font-size: 3.2rem; font-weight: 800; letter-spacing: -0.03em; line-height: 1.05; margin-bottom: 20px; }
+  .hero { padding: 96px 0 88px; text-align: center; background: radial-gradient(circle at 50% 0%, #1f2937 0%, #0a0e17 70%); }
+  .hero h1 { font-size: 3.4rem; font-weight: 800; letter-spacing: -0.03em; line-height: 1.08; margin-bottom: 22px; }
   .hero h1 span { color: #dc2626; }
   .hero p { font-size: 1.15rem; color: #9ca3af; max-width: 640px; margin: 0 auto 36px; }
   .hero .btns { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
@@ -7888,9 +7890,10 @@ _LANDING_HTML = """<!DOCTYPE html>
       z-index: 1001; overflow-y: auto;
       box-shadow: -8px 0 24px rgba(0,0,0,0.45);
     }
-    nav .links a { padding: 14px 8px; border-bottom: 1px solid #1f2937; font-size: 1rem; color: #e5e7eb; }
+    nav .links a { padding: 14px 8px; border-bottom: 1px solid #1f2937; font-size: 1rem; color: #e5e7eb; margin-left: 0; padding-left: 8px; border-left: 0; }
     nav .links a:last-child { border-bottom: 0; }
     nav .links a.cta { background: #dc2626; color: white !important; border-bottom: 0; text-align: center; border-radius: 8px; margin-top: 12px; padding: 12px 16px; }
+    nav .links .signin { margin-top: 8px; }
     body.nav-open nav .links { transform: translateX(0); }
 
     /* Backdrop */
@@ -7940,13 +7943,11 @@ _LANDING_HTML = """<!DOCTYPE html>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="6" x2="18" y2="18"/><line x1="6" y1="18" x2="18" y2="6"/></svg>
     </button>
     <a href="#how" onclick="closeNav()">How it works</a>
-    <a href="#capabilities" onclick="closeNav()">What we check</a>
     <a href="#pricing" onclick="closeNav()">Pricing</a>
     <a href="#faq" onclick="closeNav()">FAQ</a>
     <a href="/blog">Blog</a>
     <a href="/docs/api">API</a>
-    <a href="/contact">Contact</a>
-    <a href="/login">Sign in</a>
+    <a href="/login" class="signin">Sign in</a>
     <a href="/signup" class="cta">Get started</a>
   </div>
 </nav>

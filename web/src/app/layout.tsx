@@ -41,6 +41,12 @@ export default function RootLayout({
               >
                 Browse
               </Link>
+              <Link
+                href="/about"
+                className="text-gray-300 hover:text-white transition-colors"
+              >
+                About
+              </Link>
               <AuthButton />
             </div>
           </div>

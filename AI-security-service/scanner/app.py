@@ -9464,6 +9464,10 @@ _BLOG_CSS = """
   body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.7; -webkit-font-smoothing: antialiased; }
   a { text-decoration: none; }
 
+  /* Card link — full-card clickable wrapper */
+  a.card-link { color: inherit; display: block; }
+  a.card-link:hover { color: inherit; }
+
   /* Nav */
   nav { padding: 18px 24px; border-bottom: 1px solid #1f2937; max-width: 1180px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }
   nav .logo { color: #e5e7eb; font-weight: 700; font-size: 1rem; letter-spacing: -0.01em; }
@@ -9486,8 +9490,7 @@ _BLOG_CSS = """
   .featured:hover { border-color: #dc2626; transform: translateY(-2px); }
   .featured .row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
   .featured .featured-pill { background: #dc2626; color: white; font-size: 0.65rem; font-weight: 700; padding: 3px 10px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.06em; }
-  .featured h2 { font-size: 1.9rem; letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 10px; font-weight: 700; }
-  .featured h2 a { color: white; }
+  .featured h2 { font-size: 1.9rem; letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 10px; font-weight: 700; color: white; }
   .featured p.lead { font-size: 1.05rem; color: #d1d5db; margin-bottom: 18px; }
   .featured .read { color: #dc2626; font-size: 0.9rem; font-weight: 600; }
 
@@ -9496,8 +9499,7 @@ _BLOG_CSS = """
   .post-card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 24px 24px 22px; transition: border-color .2s, transform .2s; cursor: pointer; display: flex; flex-direction: column; min-height: 180px; }
   .post-card:hover { border-color: #4b5563; transform: translateY(-2px); }
   .post-card .row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-  .post-card h3 { font-size: 1.15rem; line-height: 1.3; letter-spacing: -0.015em; font-weight: 700; margin-bottom: 8px; }
-  .post-card h3 a { color: #e5e7eb; }
+  .post-card h3 { font-size: 1.15rem; line-height: 1.3; letter-spacing: -0.015em; font-weight: 700; margin-bottom: 8px; color: #e5e7eb; }
   .post-card .excerpt { color: #9ca3af; font-size: 0.92rem; flex-grow: 1; }
   .post-card .read { color: #6b7280; font-size: 0.78rem; margin-top: 14px; }
 
@@ -9600,7 +9602,7 @@ async def blog_index():
     rest = posts[1:]
     feat_rt = _blog_rt(featured["body"])
     featured_html = f"""
-    <a href="/blog/{featured['slug']}" style="color:inherit;">
+    <a href="/blog/{featured['slug']}" class="card-link">
       <div class="featured">
         <div class="row">
           <span class="featured-pill">Latest</span>
@@ -9609,20 +9611,20 @@ async def blog_index():
           <span class="meta-dot">·</span>
           <span class="meta-text">{feat_rt} min read</span>
         </div>
-        <h2><a href="/blog/{featured['slug']}">{featured['title']}</a></h2>
+        <h2>{featured['title']}</h2>
         <p class="lead">{featured['excerpt']}</p>
         <div class="read">Read the post →</div>
       </div>
     </a>"""
 
     cards_html = "".join(
-        f"""<a href="/blog/{p['slug']}" style="color:inherit;">
+        f"""<a href="/blog/{p['slug']}" class="card-link">
       <div class="post-card">
         <div class="row">
           {_tag_pill_html(p.get('tag', 'Post'))}
           <span class="meta-text">{_fmt_date(p['date'])}</span>
         </div>
-        <h3><a href="/blog/{p['slug']}">{p['title']}</a></h3>
+        <h3>{p['title']}</h3>
         <p class="excerpt">{p['excerpt']}</p>
         <div class="read">{_blog_rt(p['body'])} min read</div>
       </div>

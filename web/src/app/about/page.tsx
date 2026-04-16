@@ -17,7 +17,7 @@ export default function AboutPage() {
         <h1 className="text-5xl md:text-6xl font-bold text-white leading-tight mb-6">
           A full streaming service,<br />built in one session.
         </h1>
-        <p className="text-xl text-gray-300 leading-relaxed">
+        <p className="text-xl text-gray-200 leading-relaxed">
           From empty directory to{" "}
           <Link href="/" className="text-white underline decoration-blue-500 decoration-2 underline-offset-4 hover:decoration-blue-400">
             stream.slederer.com
@@ -32,7 +32,7 @@ export default function AboutPage() {
             className="inline-flex items-center gap-2 px-4 py-2 bg-gray-900 hover:bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 transition-colors"
           >
             <span>View source on GitHub</span>
-            <span className="text-gray-500">→</span>
+            <span className="text-gray-400">→</span>
           </Link>
         </div>
       </header>
@@ -159,7 +159,7 @@ export default function AboutPage() {
             body={
               <>
                 Every job completed transcoding then failed to write output to S3
-                with the error <em className="text-gray-400">&ldquo;Problem with output configuration. Check your
+                with the error <em className="text-gray-300">&ldquo;Problem with output configuration. Check your
                 AWS S3 or Google GCS bucket configuration and permissions.&rdquo;</em> We
                 tried root creds, a dedicated IAM user with S3 full access, removed
                 encryption, removed public access block, used Generic S3 output with
@@ -192,11 +192,11 @@ export default function AboutPage() {
             title="Bitmovin Player UI is a separate module"
             body={
               <>
-                Importing <code className="bg-gray-800 px-1.5 py-0.5 rounded text-gray-300">bitmovin-player</code> gives you a headless
+                Importing <code className="bg-gray-800 px-1.5 py-0.5 rounded text-gray-200">bitmovin-player</code> gives you a headless
                 player — no play button, no seek bar. The UI lives in a separate
-                <code className="bg-gray-800 px-1.5 py-0.5 rounded text-gray-300 ml-1">bitmovinplayer-ui.js</code> module that must be
+                <code className="bg-gray-800 px-1.5 py-0.5 rounded text-gray-200 ml-1">bitmovinplayer-ui.js</code> module that must be
                 imported, its CSS imported separately, and wired via{" "}
-                <code className="bg-gray-800 px-1.5 py-0.5 rounded text-gray-300">UIFactory.buildDefaultUI()</code>. Easy to miss.
+                <code className="bg-gray-800 px-1.5 py-0.5 rounded text-gray-200">UIFactory.buildDefaultUI()</code>. Easy to miss.
               </>
             }
           />
@@ -317,7 +317,7 @@ export default function AboutPage() {
             </code>{" "}
             endpoint — the default path.
           </p>
-          <p className="mt-4 text-gray-300 leading-relaxed">
+          <p className="mt-4 text-gray-200 leading-relaxed">
             Agents don&apos;t want to orchestrate fifteen sequential API calls.
             They want to describe the desired output and get a manifest URL
             back.
@@ -327,7 +327,7 @@ export default function AboutPage() {
 
       {/* ==== Credits ==== */}
       <footer className="pt-12 border-t border-gray-800">
-        <p className="text-sm text-gray-500 leading-relaxed">
+        <p className="text-sm text-gray-400 leading-relaxed">
           Content licenses: Blender Foundation films (CC-BY 4.0), Internet
           Archive public-domain features, Library of Congress National Screening
           Room, NASA. Built with Bitmovin, AWS, Cloudflare, Next.js, Go, Docker,
@@ -356,7 +356,7 @@ function SectionHeader({
       </p>
       <h2 className="text-4xl font-bold text-white leading-tight">{title}</h2>
       {subtitle && (
-        <p className="mt-2 text-lg text-gray-400">{subtitle}</p>
+        <p className="mt-2 text-lg text-gray-300">{subtitle}</p>
       )}
     </header>
   );
@@ -364,7 +364,7 @@ function SectionHeader({
 
 function Prose({ children }: { children: React.ReactNode }) {
   return (
-    <div className="space-y-5 text-lg text-gray-300 leading-relaxed">
+    <div className="space-y-5 text-lg text-gray-200 leading-relaxed">
       {children}
     </div>
   );
@@ -376,7 +376,7 @@ function Stat({ value, label }: { value: string; label: string }) {
       <div className="text-4xl md:text-5xl font-bold text-white tracking-tight">
         {value}
       </div>
-      <div className="mt-2 text-sm uppercase tracking-wider text-gray-500">
+      <div className="mt-2 text-sm uppercase tracking-wider text-gray-400">
         {label}
       </div>
     </div>
@@ -385,9 +385,9 @@ function Stat({ value, label }: { value: string; label: string }) {
 
 function StackGroup({ title, items }: { title: string; items: string[] }) {
   return (
-    <div className="p-5 bg-gray-900/50 border border-gray-800 rounded-xl">
+    <div className="p-5 bg-gray-900 border border-gray-800 rounded-xl">
       <h3 className="text-white font-semibold mb-3 text-base">{title}</h3>
-      <ul className="space-y-2 text-gray-400 text-[15px]">
+      <ul className="space-y-2 text-gray-300 text-[15px]">
         {items.map((item) => (
           <li key={item} className="flex gap-2">
             <span className="text-gray-600">—</span>
@@ -416,7 +416,7 @@ function Hurdle({
       className={`relative p-6 rounded-xl border ${
         isBlocker
           ? "bg-red-950/30 border-red-800/60"
-          : "bg-gray-900/50 border-gray-800"
+          : "bg-gray-900 border-gray-800"
       }`}
     >
       <div className="flex items-start gap-4">
@@ -424,7 +424,7 @@ function Hurdle({
           className={`flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center text-base font-bold ${
             isBlocker
               ? "bg-red-600 text-white"
-              : "bg-gray-800 text-gray-300 border border-gray-700"
+              : "bg-gray-800 text-gray-200 border border-gray-700"
           }`}
         >
           {n}
@@ -438,7 +438,7 @@ function Hurdle({
               </span>
             )}
           </h3>
-          <p className="mt-2 text-[15px] md:text-base text-gray-300 leading-relaxed">
+          <p className="mt-2 text-[15px] md:text-base text-gray-200 leading-relaxed">
             {body}
           </p>
         </div>
@@ -482,7 +482,7 @@ function Feedback({
         <h4 className="text-lg md:text-xl font-semibold text-white leading-tight">
           {title}
         </h4>
-        <p className="mt-2 text-[15px] md:text-base text-gray-300 leading-relaxed">
+        <p className="mt-2 text-[15px] md:text-base text-gray-200 leading-relaxed">
           {body}
         </p>
       </div>

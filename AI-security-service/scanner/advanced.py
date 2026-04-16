@@ -471,52 +471,77 @@ def scan_target_github_org(run_id: str, ip: str, name: str) -> list[dict]:
     except ImportError:
         from scanner_crawl import _search_any, _SearchUnavailable  # type: ignore
 
-    # Core dorks targeting GitHub + this domain.
+    # Core dorks targeting GitHub + this domain. Base severity is capped at
+    # MEDIUM for pure keyword dorks ("password", "api_key", "secret") because
+    # those match any tutorial, docs, or example that merely mentions the
+    # target domain — too noisy to ship as HIGH by default. HIGH is reserved
+    # for specific-filename dorks (DATABASE_URL, .env).
     dorks = [
-        (f'site:github.com "{ip}" password', "Password near target domain on GitHub", "HIGH"),
-        (f'site:github.com "{ip}" api_key', "API key near target domain on GitHub", "HIGH"),
-        (f'site:github.com "{ip}" secret', "Secret near target domain on GitHub", "MEDIUM"),
+        (f'site:github.com "{ip}" password', "Password keyword near target domain on GitHub", "MEDIUM"),
+        (f'site:github.com "{ip}" api_key', "API key keyword near target domain on GitHub", "MEDIUM"),
+        (f'site:github.com "{ip}" secret', "Secret keyword near target domain on GitHub", "LOW"),
         (f'site:github.com "{ip}" "DATABASE_URL"', "Database URL near target on GitHub", "HIGH"),
         (f'site:github.com "{ip}" ".env"', ".env reference near target on GitHub", "MEDIUM"),
         (f'site:gist.github.com "{ip}"', "Target domain in public GitHub Gist", "LOW"),
     ]
 
-    # Own-org heuristic for GitHub URL filtering. Derives likely GitHub org
-    # names from the target's domain so we can suppress hits inside the
-    # target's OWN SDK/examples/tutorial repos (placeholder secrets aren't
-    # real leaks, but they were producing HIGH findings in the earlier runs).
+    # Own-org heuristic. Derives GitHub orgs likely owned by the target to
+    # suppress hits inside the target's OWN example/SDK/tutorial repos.
     target_org = re.sub(r"^www\.", "", ip).split(".")[0].lower()
     own_repo_path_hints = (
         f"github.com/{target_org}/",
         f"github.com/{target_org}inc/",
         f"github.com/{target_org}-",
+        f"github.com/{target_org}labs/",
     )
-    # Path-level hints that a match is in an SDK/example/starter/tutorial repo
-    # — same semantic: placeholder values, not real credentials.
+    # Path fragments that signal tutorial / example / template repos.
+    # Intentionally permissive — these are designed to contain placeholder
+    # credentials that trip the search, not real leaks.
     noise_repo_substrings = (
-        "/sdk-examples", "/examples", "/starter-kit", "/tutorial",
-        "/sample-", "/example-app", ".env.example",
+        "/tutorial", "/tutorials",
+        "/example", "/examples", "/example-app",
+        "/sample-", "/samples/", "/sample/",
+        "/starter-kit", "/starter-template", "-starter",
+        "/boilerplate", "/template", "/templates/", "-template",
+        "/course-", "/courses/", "/workshop", "/workshops/",
+        "/demo", "/demos/", "-demo",
+        "/docs/", "/documentation/", "/guide",
+        "/sdk-examples", "/sdk/",
+        "/__fixtures__/", "/__mocks__/",
+    )
+    # File basenames that are ALWAYS intentional public templates, regardless
+    # of which org they're in.
+    template_file_basenames = (
+        ".env.example", ".env.sample", ".env.template",
+        ".env.dist", ".env.local", ".env.defaults",
+        "example.env", "sample.env",
     )
 
     def _filter_and_rate(results: list, base_sev: str) -> tuple[list, str]:
-        """Drop URLs from target's own org OR obvious example repos.
-        Return (remaining_results, possibly_downgraded_severity)."""
+        """Drop URLs from target's own org, obvious example repos, or
+        intentional template files. Return (remaining, possibly_demoted_sev)."""
         filtered = []
-        own_or_example = 0
+        dropped = 0
         for r in results:
             link = (r.get("link") or r.get("url", "")).lower()
-            if any(p in link for p in own_repo_path_hints) or \
-               any(s in link for s in noise_repo_substrings):
-                own_or_example += 1
+            if (
+                any(p in link for p in own_repo_path_hints)
+                or any(s in link for s in noise_repo_substrings)
+                or any(link.endswith(b) for b in template_file_basenames)
+            ):
+                dropped += 1
                 continue
             filtered.append(r)
         new_sev = base_sev
-        # If we dropped ANY results, demote a notch — the signal is weaker
-        # than originally sized.
-        if own_or_example > 0:
+        # If anything was filtered, the remaining signal is weaker — demote.
+        if dropped > 0:
             new_sev = {"CRITICAL": "HIGH", "HIGH": "MEDIUM",
                        "MEDIUM": "LOW", "LOW": "INFO"}.get(base_sev, base_sev)
         return filtered, new_sev
+
+    # Minimum hits required AFTER filtering to emit a finding. Single-hit
+    # matches on broad keyword dorks are overwhelmingly false positives.
+    MIN_HITS_AFTER_FILTER = 2
 
     for dork, title, sev in dorks:
         try:
@@ -526,8 +551,8 @@ def scan_target_github_org(run_id: str, ip: str, name: str) -> list[dict]:
         if not results:
             continue
         results, sev = _filter_and_rate(results, sev)
-        if not results:
-            continue  # everything was noise
+        if len(results) < MIN_HITS_AFTER_FILTER:
+            continue  # not enough post-filter signal
         sample = "\n".join("- " + (r.get("link") or r.get("url", ""))
                            for r in results[:3])
         findings.append({
@@ -536,9 +561,11 @@ def scan_target_github_org(run_id: str, ip: str, name: str) -> list[dict]:
             "description": (
                 "Google returned GitHub results where the target domain appears "
                 "alongside secret-related keywords. Review each URL — "
-                "developers frequently commit credentials, staging URLs, "
-                "or sensitive config tied to this domain into public repos. "
-                "Own-org / SDK-example / tutorial repos were filtered out."
+                "developers occasionally commit credentials, staging URLs, "
+                "or sensitive config tied to a domain into public repos. "
+                "Own-org repos, SDK/example/tutorial/template paths, and "
+                "intentional template files (.env.example, .env.sample, etc.) "
+                "were filtered out."
             ),
             "evidence": f"dork: {dork}\n{sample}",
             "tool": "github-dork",

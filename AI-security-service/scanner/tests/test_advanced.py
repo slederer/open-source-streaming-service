@@ -111,7 +111,8 @@ class TestJsCve:
 
 class TestGithubOrg:
     def test_flags_gh_password_hits_from_third_party_repos(self, monkeypatch):
-        """Use third-party repo URLs to sidestep the own-org filter."""
+        """Broad keyword dorks (password) are capped at MEDIUM — too noisy
+        to warrant HIGH when the phrase may appear in any tutorial/docs."""
         monkeypatch.setenv("SERPER_API_KEY", "dummy")
 
         def fake_search(q, num=10):
@@ -126,7 +127,10 @@ class TestGithubOrg:
             findings = scan_target_github_org("r1", "acme.com", "t")
         pw_hits = [f for f in findings if "password" in f["title"].lower()]
         assert pw_hits
-        assert pw_hits[0]["severity"] == "HIGH"
+        # Password keyword dork is MEDIUM by default (not HIGH) because the
+        # word "password" matches every login-tutorial repo that mentions
+        # the target domain.
+        assert pw_hits[0]["severity"] == "MEDIUM"
 
 
 # ── Module 13: API fuzz ────────────────────────────────────────────────────
@@ -361,37 +365,98 @@ class TestGithubDorkOwnOrgFilter:
             f"own-org SDK repos must be filtered; got: {[f['title'] for f in findings]}"
 
     def test_third_party_hit_demoted_when_mixed_with_own_org(self, monkeypatch):
-        """Mixing own-org + third-party results demotes severity one notch."""
+        """Mixing own-org + third-party results demotes severity one notch
+        AND must still meet the post-filter minimum-hits threshold (2)."""
         from scanner.advanced import scan_target_github_org
         monkeypatch.setenv("SERPER_API_KEY", "dummy")
 
         def fake_search(q, num=10):
             if "password" in q:
                 return [
-                    {"link": "https://github.com/bitmovin/bitmovin-sdk-examples/x.py"},  # own
-                    {"link": "https://github.com/random-dev/myconfig/blob/main/.env"},  # 3rd party
+                    {"link": "https://github.com/bitmovin/bitmovin-sdk-examples/x.py"},  # own, filtered
+                    {"link": "https://github.com/random-dev/myconfig/blob/main/.env"},   # 3rd party, kept
+                    {"link": "https://github.com/other-dev/deploy/blob/main/conf.yml"},  # 3rd party, kept
                 ]
             return []
         with patch("scanner.crawl._search_any", side_effect=fake_search):
             findings = scan_target_github_org("r1", "bitmovin.com", "t")
         hits = [f for f in findings if "password" in f["title"].lower()]
         assert hits
-        # Base severity was HIGH; one own-org result filtered → demoted to MEDIUM
-        assert hits[0]["severity"] == "MEDIUM", f"got {hits[0]['severity']}"
+        # Password dork base is MEDIUM; one own-org filtered → demoted to LOW.
+        assert hits[0]["severity"] == "LOW", f"got {hits[0]['severity']}"
 
     def test_pure_third_party_hit_keeps_severity(self, monkeypatch):
+        """DATABASE_URL dork stays at HIGH when 2+ third-party hits remain."""
         from scanner.advanced import scan_target_github_org
         monkeypatch.setenv("SERPER_API_KEY", "dummy")
 
         def fake_search(q, num=10):
             if "DATABASE_URL" in q:
-                return [{"link": "https://github.com/random/repo/blob/main/.env"}]
+                return [
+                    {"link": "https://github.com/random/repo/blob/main/.env"},
+                    {"link": "https://github.com/another/service/blob/main/.env"},
+                ]
             return []
         with patch("scanner.crawl._search_any", side_effect=fake_search):
             findings = scan_target_github_org("r1", "bitmovin.com", "t")
         hits = [f for f in findings if "Database URL" in f["title"]]
         assert hits
         assert hits[0]["severity"] == "HIGH"
+
+    def test_single_hit_below_min_threshold_is_dropped(self, monkeypatch):
+        """Post-filter hit count < 2 → no finding emitted, regardless of dork.
+        Protects against HN-readers finding a single tutorial hit and calling
+        us out for noise."""
+        from scanner.advanced import scan_target_github_org
+        monkeypatch.setenv("SERPER_API_KEY", "dummy")
+
+        def fake_search(q, num=10):
+            if "DATABASE_URL" in q:
+                return [{"link": "https://github.com/unrelated/project/.env"}]
+            return []
+        with patch("scanner.crawl._search_any", side_effect=fake_search):
+            findings = scan_target_github_org("r1", "bitmovin.com", "t")
+        assert not any("Database URL" in f["title"] for f in findings), \
+            "single-hit DATABASE_URL dork should not emit a finding"
+
+    def test_env_example_basename_is_filtered(self, monkeypatch):
+        """.env.example, .env.sample, .env.template are intentional template
+        files — never a real leak, filter them regardless of org."""
+        from scanner.advanced import scan_target_github_org
+        monkeypatch.setenv("SERPER_API_KEY", "dummy")
+
+        def fake_search(q, num=10):
+            if "DATABASE_URL" in q:
+                return [
+                    {"link": "https://github.com/muxinc/video-course-starter-kit/blob/main/.env.example"},
+                    {"link": "https://github.com/some-app/api/blob/main/.env.sample"},
+                    {"link": "https://github.com/bar/baz/blob/main/.env.template"},
+                ]
+            return []
+        with patch("scanner.crawl._search_any", side_effect=fake_search):
+            findings = scan_target_github_org("r1", "acme.com", "t")
+        # All three results are template files → all filtered → no finding.
+        assert not findings, \
+            f".env.example/.env.sample/.env.template must be filtered; got: {[f['title'] for f in findings]}"
+
+    def test_plural_tutorials_path_is_filtered(self, monkeypatch):
+        """`/tutorials/` (plural) must match the same as `/tutorial` — this
+        was the Mux false-positive pattern (storyblok/tutorials/...)."""
+        from scanner.advanced import scan_target_github_org
+        monkeypatch.setenv("SERPER_API_KEY", "dummy")
+
+        def fake_search(q, num=10):
+            if "password" in q:
+                return [
+                    {"link": "https://github.com/storyblok/tutorials/blob/main/build/data.json"},
+                    {"link": "https://github.com/other/examples/blob/main/file.md"},
+                ]
+            return []
+        with patch("scanner.crawl._search_any", side_effect=fake_search):
+            findings = scan_target_github_org("r1", "mux.com", "t")
+        # Both results are in tutorial/example paths → filtered → no finding.
+        assert not findings, \
+            f"tutorial/examples paths must be filtered; got: {[f['title'] for f in findings]}"
 
 
 # TestAiConsensusGating retired along with the scan_target_ai_chain module.

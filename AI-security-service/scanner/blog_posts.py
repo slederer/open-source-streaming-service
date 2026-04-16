@@ -15,6 +15,112 @@ def _reading_time(html: str) -> int:
 
 POSTS = [
     {
+        "slug": "lovable-vs-bolt-vs-replit-rls",
+        "title": "Lovable vs Bolt vs Replit: who's leaking the most Supabase data?",
+        "date": "2026-04-16",
+        "tag": "Findings",
+        "excerpt": (
+            "We scanned 226 apps overnight — 126 vibe-coded across four AI builders, "
+            "plus 100 YC companies as a control. Zero CRITs on YC. Ten CRITs on the vibe-coded side, "
+            "every one Supabase RLS off. Here's the per-platform breakdown."
+        ),
+        "body": """
+<p>Overnight we ran a scan across 226 deployed apps: 126 vibe-coded (Lovable, Bolt, Replit, Tempo, Emergent) + 100 YC companies from recent batches (W24–F25). The goal was a clean head-to-head: same scanner, same modules, same week — what's the actual per-platform risk profile?</p>
+
+<h2>The headline</h2>
+
+<table style="width:100%;margin:16px 0;border-collapse:collapse;">
+<thead><tr style="border-bottom:1px solid #1f2937;"><th align="left" style="padding:8px 4px;">Cohort</th><th style="padding:8px 4px;">Scanned</th><th style="padding:8px 4px;">With CRIT</th><th style="padding:8px 4px;">Rate</th></tr></thead>
+<tbody>
+<tr><td style="padding:6px 4px;">YC companies (W24 → F25)</td><td align="center">100</td><td align="center">0</td><td align="center">0%</td></tr>
+<tr><td style="padding:6px 4px;">Lovable</td><td align="center">58</td><td align="center">3</td><td align="center">5%</td></tr>
+<tr><td style="padding:6px 4px;">Bolt.host</td><td align="center">38</td><td align="center">5</td><td align="center">13%</td></tr>
+<tr><td style="padding:6px 4px;">Bolt.new</td><td align="center">8</td><td align="center">1</td><td align="center">13%</td></tr>
+<tr><td style="padding:6px 4px;">Replit + Tempo + Emergent</td><td align="center">22</td><td align="center">1</td><td align="center">5%</td></tr>
+<tr style="border-top:1px solid #1f2937;"><td style="padding:8px 4px;"><strong>Vibe-coded total</strong></td><td align="center"><strong>126</strong></td><td align="center"><strong>10</strong></td><td align="center"><strong>8%</strong></td></tr>
+</tbody></table>
+
+<p>Every single CRIT in this batch was the same class of issue: Supabase Row Level Security disabled on tables backing real user data. Not a mix of vulnerabilities — one pattern, showing up again and again.</p>
+
+<h2>Why Bolt apps fail 2.6× more often than Lovable</h2>
+
+<p>Both products target the same developer with the same backend (Supabase). So why the gap?</p>
+
+<p>Our read, from looking at the exposed apps' JS bundles: <strong>Bolt deployments are more often quick prototypes that never got productionized.</strong> The giveaway is in the hostnames — <code>trippy-duplicated-6mxq.bolt.host</code>, <code>mobile-liquid-glass-w7cb.bolt.host</code>, <code>ffo-paywallmobile-sa-65qs.bolt.host</code>. Those auto-generated slugs mean the dev clicked "deploy" once to share with a friend, then forgot about it. RLS was never in scope because the app was never serious.</p>
+
+<p>Lovable apps are more often <em>named</em> — <code>ruth-prissman-coach.lovable.app</code>, <code>crmcoach.lovable.app</code>, <code>engagementsurvey.lovable.app</code>. They belong to someone. The rate is lower, but the consequences per leak are higher, because it's a live business with real paying customers on the other side.</p>
+
+<h2>The table names tell you exactly how this happens</h2>
+
+<p>Across the 10 vulnerable apps we found these recurring table names in the anon-readable sets:</p>
+
+<ul>
+<li><code>profiles</code> — in 4 apps</li>
+<li><code>categories</code> — in 3 apps</li>
+<li><code>sessions</code>, <code>coaches</code>, <code>players</code> — each in 2 apps</li>
+<li><code>subscriptions</code>, <code>comments</code>, <code>users</code> — each in 2 apps</li>
+</ul>
+
+<p>These are the <em>tutorial</em> table names. Supabase's onboarding flow uses <code>profiles</code> as the first example. Blog posts about "build a Lovable app with auth" use <code>sessions</code> and <code>users</code>. Devs copy the first example, get RLS working on <code>profiles</code>, then create ten more tables and forget every one.</p>
+
+<p>The fix on Supabase's side is a two-character change: flip the default on new tables from RLS-off to RLS-on. They've had the dashboard flag for this for years. It's still opt-in.</p>
+
+<h2>The worst apps we found</h2>
+
+<p>Three stood out for sheer volume of exposed data:</p>
+
+<ol>
+<li><strong>ruth-prissman-coach.lovable.app</strong> — 15 tables world-readable. The app is a personal coaching site for a therapist in Israel. The exposed tables include <code>payment_methods</code>, <code>future_sessions</code>, <code>content_subscribers</code>, and <code>email_delivery_attempts</code>. Real paying clients, real PII.</li>
+<li><strong>videozenithuygulamasi.lovable.app</strong> — 9 tables. Turkish live-streaming platform with <code>live_chat_messages</code>, <code>profiles</code>, <code>subscriptions</code>. Every chat message every user has ever sent is readable with one curl.</li>
+<li><strong>crmcoach.lovable.app</strong> — 8 tables. Hebrew coaching CRM with <code>user_roles</code>, <code>coaches</code>, <code>sessions</code>, <code>session_summaries</code>. Plus <code>user_roles</code> is writable, so an attacker can grant themselves admin on any account by sending one INSERT.</li>
+</ol>
+
+<p>All three were emailed disclosures the morning after the scan. At the time of writing, none have responded yet; we'll update this post if/when they do.</p>
+
+<h2>What YC got right</h2>
+
+<p>Zero CRITs across 100 YC companies — W24, S24, F24, W25, S25, F25. That's a striking result and worth unpacking.</p>
+
+<p>It's not that YC companies run fancier security programs. A few of the 100 we scanned are 3-person teams that started 8 months ago. But they've all been through YC's Bookface / office-hour culture where one of the first things you hear from other founders is "don't ship the anon key with RLS off." That kind of informal transmission — the thing a YC cohort gives you that a vibe-coder downloading the Lovable starter template doesn't — is what's actually protecting these apps.</p>
+
+<p>The YC apps did have findings: missing security headers, exposed <code>/docs</code> endpoints, CORS misconfigurations. But nothing where an attacker could drop a curl and walk away with customer data. There's a real difference between "not perfectly hardened" and "catastrophically exposed," and this batch makes the gap quantitative.</p>
+
+<h2>One embarrassment for StackBlitz</h2>
+
+<p>In a small bit of irony: <code>buildwith.bolt.new</code> — the StackBlitz-owned admin console for their "Build with Bolt" workshop program — has the same RLS misconfiguration. Its <code>coupons</code> table is anon-readable AND anon-writable. That table appears to hold Bolt Pro redemption codes. Anyone can harvest the codes or insert new ones and redeem them.</p>
+
+<p>We didn't disclose to StackBlitz security because this post is about pattern, not piling on. But it's a good illustration that the bug doesn't respect maturity — if it can hit the platform's own internal tool, it can hit yours too.</p>
+
+<h2>What this means if you're shipping</h2>
+
+<p>If you're building on Lovable, Bolt, or Replit with Supabase, the one thing to do today is audit <strong>every</strong> table in your project — not just the one from the tutorial:</p>
+
+<pre><code>SELECT schemaname, tablename,
+       CASE WHEN rowsecurity THEN 'ON' ELSE 'OFF' END AS rls
+FROM pg_tables
+WHERE schemaname = 'public'
+ORDER BY rowsecurity, tablename;</code></pre>
+
+<p>Anything showing <code>OFF</code> needs:</p>
+
+<pre><code>ALTER TABLE &lt;table&gt; ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "authenticated_only" ON &lt;table&gt;
+  FOR SELECT USING (auth.uid() IS NOT NULL);</code></pre>
+
+<p>Tighter policies are obviously better — this is the minimum. If you want to check the full attack surface of your app in one shot, <a href="/signup">run a scan</a>; one free, no card.</p>
+
+<h2>Methodology</h2>
+
+<p>Targets sourced from: certificate transparency logs (<code>*.lovable.app</code>, <code>*.bolt.host</code>, <code>*.replit.app</code>, <code>*.bolt.new</code>, <code>*.tempo.new</code>, <code>*.emergent.sh</code>) for the vibe-coded cohort; YC's public directory for the YC cohort. All 226 unique — no overlap with our previous 150-target batch.</p>
+
+<p>Scanner: our standard full-scan module set (50+ checks including <code>supabase-audit</code>, <code>baas-detect</code>, <code>secret-scan</code>, <code>nuclei</code>, <code>subdomain-takeover</code>, <code>github-dork</code>, AI-triage).</p>
+
+<p>Every CRIT was verified reproducible before disclosure — we re-ran the exact curl command the scanner used, confirmed a real row came back, and used that specific command in the disclosure email to the owner.</p>
+
+<p>Runtime: ~4 hours wall time at 10 concurrent scans on a t3.2xlarge. Zero scan failures out of 226.</p>
+""",
+    },
+    {
         "slug": "we-are-live",
         "title": "We're live: Security Scanner for the vibe-coding era",
         "date": "2026-03-18",

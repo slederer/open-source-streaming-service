@@ -6147,7 +6147,14 @@ async def v1_openapi():
                             "required": ["host"],
                         }}},
                     },
-                    "responses": {"200": {"description": "Scan started", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                    "responses": {"200": {"description": "Scan started", "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "properties": {
+                            "run_id": {"type": "string", "description": "Unique scan run identifier"},
+                            "status": {"type": "string", "description": "Scan status (running, completed, error)"},
+                            "target": {"type": "string", "description": "Host being scanned"},
+                        },
+                    }}}}},
                 }
             },
             "/v1/scan/{run_id}": {
@@ -6155,7 +6162,30 @@ async def v1_openapi():
                     "operationId": "getScanStatus",
                     "summary": "Get scan status and findings",
                     "parameters": [{"name": "run_id", "in": "path", "required": True, "schema": {"type": "string"}}],
-                    "responses": {"200": {"description": "Scan status", "content": {"application/json": {"schema": {"type": "object"}}}}},
+                    "responses": {"200": {"description": "Scan status", "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "properties": {
+                            "run_id": {"type": "string"},
+                            "status": {"type": "string", "description": "running, completed, or error"},
+                            "target": {"type": "string"},
+                            "started_at": {"type": "string", "format": "date-time"},
+                            "finished_at": {"type": "string", "format": "date-time", "nullable": True},
+                            "findings": {"type": "array", "items": {"type": "object", "properties": {
+                                "severity": {"type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]},
+                                "title": {"type": "string"},
+                                "tool": {"type": "string"},
+                                "description": {"type": "string"},
+                                "evidence": {"type": "string"},
+                            }}},
+                            "summary": {"type": "object", "properties": {
+                                "critical": {"type": "integer"},
+                                "high": {"type": "integer"},
+                                "medium": {"type": "integer"},
+                                "low": {"type": "integer"},
+                                "info": {"type": "integer"},
+                            }},
+                        },
+                    }}}}},
                 }
             },
             "/v1/scan/{run_id}/fix": {
@@ -6183,6 +6213,7 @@ async def v1_openapi():
             },
         },
         "components": {
+            "schemas": {},
             "securitySchemes": {
                 "ApiKeyAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "API Key", "description": "API key in format sk-sec-..."}
             }

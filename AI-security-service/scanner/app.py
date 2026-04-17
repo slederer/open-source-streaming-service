@@ -3481,9 +3481,14 @@ _GOOGLE_SVG = '<svg viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.
 async def login_page(request: Request):
     user = get_user(request)
     if user:
-        return RedirectResponse("/")
+        next_url = request.query_params.get("next", "/")
+        return RedirectResponse(next_url if next_url.startswith("/") else "/")
     error = request.query_params.get("error", "")
     verified = request.query_params.get("verified", "")
+    # Preserve ?next= through the Google OAuth round-trip
+    login_next = request.query_params.get("next", "")
+    if login_next and login_next.startswith("/"):
+        request.session["login_next"] = login_next
     alert = ""
     if error:
         alert = f'<div class="error">{_html(error[:200])}</div>'
@@ -3875,6 +3880,9 @@ async def auth_callback(request: Request):
     if pending:
         from urllib.parse import urlencode
         return RedirectResponse(f"/oauth/authorize?{urlencode(pending)}")
+    login_next = request.session.pop("login_next", "")
+    if login_next and login_next.startswith("/"):
+        return RedirectResponse(login_next)
     return RedirectResponse("/")
 
 
@@ -4000,6 +4008,9 @@ async def login(request: Request):
     if pending:
         from urllib.parse import urlencode
         return {"ok": True, "redirect": f"/oauth/authorize?{urlencode(pending)}"}
+    login_next = request.session.pop("login_next", "")
+    if login_next and login_next.startswith("/"):
+        return {"ok": True, "redirect": login_next}
     return {"ok": True}
 
 
@@ -8767,6 +8778,83 @@ async def newsletter_signup(request: Request):
     except Exception:
         return JSONResponse({"error": "Could not save your email — please email stefan@securityscanner.dev directly."}, status_code=500)
     return {"ok": True, "message": "Thanks — we'll let you know when we publish."}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Outreach unsubscribe — one-click, HMAC-verified, POSTs also accepted per
+# RFC 8058 (List-Unsubscribe-Post header). No login, no captcha.
+# ═════════════════════════════════════════════════════════════════════════════
+
+import hmac as _hmac
+import hashlib as _hashlib
+
+
+def _outreach_unsub_token(email: str) -> str:
+    """HMAC(SESSION_SECRET, email) — truncated to 16 hex chars."""
+    secret = os.getenv("SESSION_SECRET", "").encode()
+    if not secret:
+        return ""
+    return _hmac.new(
+        secret, email.lower().encode(), _hashlib.sha256
+    ).hexdigest()[:16]
+
+
+def outreach_unsub_url(email: str) -> str:
+    """Build the unsubscribe URL for a given recipient — embed in every email."""
+    from urllib.parse import urlencode
+    q = urlencode({"email": email, "t": _outreach_unsub_token(email)})
+    return f"https://securityscanner.dev/unsubscribe?{q}"
+
+
+async def _do_unsubscribe(email: str, token: str) -> bool:
+    """Return True if the email is valid + token matches, suppression recorded."""
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        return False
+    expected = _outreach_unsub_token(email)
+    if not _hmac.compare_digest(expected, token or ""):
+        return False
+    with get_db() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO outreach_suppressions (email, reason) VALUES (?, ?)",
+            (email, "user_unsub"),
+        )
+    return True
+
+
+@app.get("/unsubscribe", response_class=HTMLResponse)
+async def unsubscribe_get(request: Request):
+    email = request.query_params.get("email", "")
+    token = request.query_params.get("t", "")
+    ok = await _do_unsubscribe(email, token)
+    msg = (
+        f"You're unsubscribed. We won't send you anything else at <b>{email}</b>."
+        if ok else
+        "Invalid unsubscribe link. If you'd still like to be removed, email "
+        "<a href=\"mailto:stefan@securityscanner.dev\" "
+        "style=\"color:#dc2626;\">stefan@securityscanner.dev</a> directly."
+    )
+    return HTMLResponse(
+        f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Unsubscribed — Security Scanner</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>body{{font-family:-apple-system,sans-serif;background:#0a0e17;color:#e5e7eb;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}}
+.card{{max-width:480px;background:#111827;border:1px solid #1f2937;border-radius:12px;
+padding:40px;text-align:center;}}h1{{font-size:1.3rem;margin-bottom:14px;}}
+p{{color:#9ca3af;line-height:1.6;}}a{{color:#dc2626;}}</style></head><body>
+<div class="card"><h1>{'Unsubscribed' if ok else 'Could not unsubscribe'}</h1>
+<p>{msg}</p></div></body></html>"""
+    )
+
+
+@app.post("/unsubscribe")
+async def unsubscribe_post(request: Request):
+    """RFC 8058 one-click support — mail clients POST to complete unsub."""
+    email = request.query_params.get("email", "")
+    token = request.query_params.get("t", "")
+    ok = await _do_unsubscribe(email, token)
+    return JSONResponse({"ok": ok})
 
 
 _LEGAL_CSS = """

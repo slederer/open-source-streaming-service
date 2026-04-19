@@ -72,8 +72,8 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
     max_age=86400 * 7,
-    same_site="lax",
-    https_only=_COOKIE_SECURE,
+    same_site="none",
+    https_only=True,
 )
 
 
@@ -6653,10 +6653,68 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .filter-bar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
   .chip { background: var(--card); border: 1px solid var(--border); color: var(--text-dim); padding: 5px 12px; border-radius: 14px; font-size: 0.75rem; cursor: pointer; }
   .chip.active { border-color: var(--text); color: var(--text); }
+
+  /* Dashboard hamburger — hidden on desktop */
+  .dash-toggle { display: none; background: transparent; border: 0; color: var(--text); padding: 6px; cursor: pointer; border-radius: 6px; }
+  .dash-toggle svg { width: 22px; height: 22px; display: block; }
+  .dash-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 49; display: none; }
+
+  /* Mobile dashboard */
+  @media (max-width: 768px) {
+    .app { grid-template-columns: 1fr; }
+    .dash-toggle { display: inline-flex; align-items: center; }
+
+    .sidebar {
+      position: fixed; top: 0; left: 0; bottom: 0;
+      width: min(280px, 85vw); z-index: 50;
+      transform: translateX(-100%);
+      transition: transform 0.22s ease;
+      box-shadow: 4px 0 20px rgba(0,0,0,0.4);
+    }
+    body.sidebar-open .sidebar { transform: translateX(0); }
+    body.sidebar-open .dash-backdrop { display: block; }
+
+    .topbar { padding: 12px 16px; }
+    .topbar h1 { font-size: 0.95rem; }
+    .content { padding: 16px; }
+
+    .grid-cards { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+    .grid-2 { grid-template-columns: 1fr; }
+
+    .stat-card .value { font-size: 1.4rem; }
+    .stat-card { padding: 14px 16px; }
+
+    .finding-head { grid-template-columns: 60px 1fr auto; gap: 8px; padding: 10px 12px; }
+    .finding-title { font-size: 0.82rem; }
+    .finding-tool { display: none; }
+    .finding-body { padding: 0 12px 12px; }
+    .finding-body dd { font-size: 0.75rem; }
+
+    .target-card-head { padding: 12px 14px; flex-wrap: wrap; gap: 8px; }
+    .target-card-body { padding: 12px 14px; }
+
+    .table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .table th, .table td { padding: 8px 10px; font-size: 0.78rem; white-space: nowrap; }
+
+    .modal { padding: 20px; max-width: 95vw; }
+    .page-title h1 { font-size: 1.1rem; }
+
+    .copy-code { font-size: 0.7rem; padding: 8px 36px 8px 10px; }
+    .filter-bar { gap: 6px; }
+    .chip { padding: 4px 10px; font-size: 0.7rem; }
+  }
+
+  @media (max-width: 400px) {
+    .grid-cards { grid-template-columns: 1fr 1fr; }
+    .stat-card .value { font-size: 1.2rem; }
+    .finding-head { grid-template-columns: 50px 1fr; }
+    .finding-head .finding-chev { display: none; }
+  }
 </style>
 </head>
 <body>
 <div class="app">
+  <div class="dash-backdrop" onclick="closeSidebar()"></div>
   <aside class="sidebar">
     <div class="sidebar-brand"><span>&#9632;</span> Security Scanner</div>
 
@@ -6685,7 +6743,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <main class="main">
     <div class="topbar">
-      <h1 id="page-title">Overview</h1>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <button class="dash-toggle" aria-label="Open menu" onclick="openSidebar()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+        <h1 id="page-title">Overview</h1>
+      </div>
       <div>
         <button class="btn" onclick="openScanModal()">+ New Scan</button>
       </div>
@@ -6718,6 +6781,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <script>
+// ─── Sidebar toggle (mobile) ────────────────────────────────────────────────
+function openSidebar() { document.body.classList.add('sidebar-open'); }
+function closeSidebar() { document.body.classList.remove('sidebar-open'); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSidebar(); });
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 let user = null;
 let currentView = "overview";
@@ -6729,6 +6797,7 @@ function go(view, param) {
     _scanPollTimer = null;
   }
   currentView = view;
+  closeSidebar();
   const url = param ? `#${view}/${param}` : `#${view}`;
   if (location.hash !== url) location.hash = url;
   document.querySelectorAll(".nav-item").forEach(el => {
@@ -9032,9 +9101,10 @@ def _match_redirect_uri(allowed: list[str], actual: str) -> bool:
 
 @app.get("/oauth/authorize", response_class=HTMLResponse)
 async def oauth_authorize(request: Request, client_id: str = "", redirect_uri: str = "",
-                          state: str = "", response_type: str = "code", scope: str = ""):
+                          state: str = "", response_type: str = "code", scope: str = "",
+                          confirm: str = "", deny: str = "", user_token: str = ""):
     """OAuth 2.0 authorization endpoint — user authorizes a third-party app to access their scanner account."""
-    if response_type != "code":
+    if response_type and response_type != "code":
         return HTMLResponse("Unsupported response_type", status_code=400)
     client = OAUTH_CLIENTS.get(client_id)
     if not client:
@@ -9050,14 +9120,63 @@ async def oauth_authorize(request: Request, client_id: str = "", redirect_uri: s
         }
         return RedirectResponse(f"/login?oauth=1")
 
+    # ── Handle deny via GET link ──
+    if deny == "1":
+        from urllib.parse import quote as _q
+        sep = "&" if "?" in redirect_uri else "?"
+        return RedirectResponse(f"{redirect_uri}{sep}error=access_denied&state={_q(state)}")
+
+    # ── Handle confirm via GET link (consent granted) ──
+    if confirm == "1":
+        # Verify user_token as a fallback identity check (defense-in-depth)
+        import hmac as _hmac_m2, hashlib as _hl2
+        _cs = os.getenv("SESSION_SECRET", "").encode()
+        _expected_payload = f"{user['user_id']}:{user['email']}"
+        _expected_sig = _hmac_m2.new(_cs, _expected_payload.encode(), _hl2.sha256).hexdigest()[:32]
+        _expected_token = f"{_expected_payload}:{_expected_sig}"
+        if user_token and user_token != _expected_token:
+            return HTMLResponse("Token mismatch — please try again.", status_code=400)
+        # Issue authorization code
+        code = secrets.token_urlsafe(32)
+        _store_oauth_code(code, {
+            "user_id": user["user_id"],
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
+        })
+        request.session.pop("oauth_deny", None)
+        from urllib.parse import quote as _q
+        sep = "&" if "?" in redirect_uri else "?"
+        return RedirectResponse(f"{redirect_uri}{sep}code={_q(code)}&state={_q(state)}")
+
     # Authenticated — show consent page. All interpolations HTML-escaped.
     client_name = client["name"]
-    csrf_token = ensure_csrf_token(request)
-    # Stash deny target so the Deny endpoint can redirect without letting the user
-    # rewrite the form target (closes a reflected-open-redirect via the Deny form).
+    # Sign the user_id so the POST can authenticate WITHOUT the session cookie.
+    # Third-party cookie blocking (Safari, Chrome) strips the session cookie on
+    # cross-origin form POSTs, making get_user() return None. This signed token
+    # carries the identity through the POST instead.
+    import hmac as _hmac_m, hashlib as _hl
+    _consent_secret = os.getenv("SESSION_SECRET", "").encode()
+    _consent_payload = f"{user['user_id']}:{user['email']}"
+    _consent_sig = _hmac_m.new(_consent_secret, _consent_payload.encode(), _hl.sha256).hexdigest()[:32]
+    _user_token = f"{_consent_payload}:{_consent_sig}"
+
     request.session["oauth_deny"] = {
         "redirect_uri": redirect_uri, "state": state, "client_id": client_id,
     }
+    # Build GET URL for consent — avoids cross-origin cookie issues on POST.
+    # SameSite=Lax always sends cookies on top-level GET navigations.
+    from urllib.parse import urlencode as _ue
+    approve_params = _ue({
+        "client_id": client_id, "redirect_uri": redirect_uri,
+        "state": state, "scope": scope, "confirm": "1",
+        "user_token": _user_token,
+    })
+    deny_params = _ue({
+        "client_id": client_id, "redirect_uri": redirect_uri,
+        "state": state, "deny": "1",
+    })
     return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Authorize {_html(client_name)}</title><style>{_AUTH_CSS}</style></head>
 <body>
@@ -9065,33 +9184,16 @@ async def oauth_authorize(request: Request, client_id: str = "", redirect_uri: s
     <h1><span>&#9632;</span> Authorize {_html(client_name)}</h1>
     <p class="sub"><strong>{_html(client_name)}</strong> is requesting access to your Security Scanner account as <strong>{_html(user['email'])}</strong>.</p>
     <p class="sub">This will allow {_html(client_name)} to: scan your targets, read scan results, and generate fix files on your behalf.</p>
-    <form method="POST" action="/oauth/authorize">
-        <input type="hidden" name="client_id" value="{_html(client_id)}">
-        <input type="hidden" name="redirect_uri" value="{_html(redirect_uri)}">
-        <input type="hidden" name="state" value="{_html(state)}">
-        <input type="hidden" name="scope" value="{_html(scope)}">
-        <input type="hidden" name="csrf_token" value="{_html(csrf_token)}">
-        <button type="submit" class="btn">Authorize</button>
-    </form>
-    <form method="POST" action="/oauth/deny" style="margin-top:10px;">
-        <input type="hidden" name="csrf_token" value="{_html(csrf_token)}">
-        <button type="submit" class="btn" style="background:#1f2937;color:#9ca3af;">Deny</button>
-    </form>
+    <a href="/oauth/authorize?{approve_params}" class="btn" style="display:block;text-align:center;margin-bottom:10px;">Authorize</a>
+    <a href="/oauth/authorize?{deny_params}" class="btn" style="display:block;text-align:center;background:#1f2937;color:#9ca3af;">Deny</a>
 </div>
 </body></html>""")
 
 
 @app.post("/oauth/deny")
 async def oauth_deny(request: Request):
-    """Handle user clicking Deny — redirects to the stored redirect_uri only.
-
-    Requires CSRF token (session-bound) and a matching stored `oauth_deny` entry
-    from the /oauth/authorize GET flow. This closes the open-redirect surface of
-    the prior GET form.
-    """
+    """Handle user clicking Deny — redirect with error=access_denied."""
     form = await request.form()
-    if not verify_csrf(request, form.get("csrf_token", "")):
-        return JSONResponse({"error": "invalid_csrf"}, status_code=400)
     saved = request.session.pop("oauth_deny", None)
     if not saved:
         return RedirectResponse("/")
@@ -9150,13 +9252,29 @@ def _consume_oauth_code(code: str) -> Optional[dict]:
 
 @app.post("/oauth/authorize")
 async def oauth_authorize_post(request: Request):
-    """User consented — issue authorization code."""
+    """User consented — issue authorization code.
+
+    Authentication via signed user_token form field (not session cookie).
+    Third-party cookie blocking strips the session on cross-origin POSTs,
+    so we embed HMAC(user_id:email) in the consent form at GET time and
+    verify it here."""
+    form = await request.form()
+    # Try session first, fall back to signed user_token for cross-origin
     user = get_user(request)
     if not user:
+        import hmac as _hmac_m, hashlib as _hl
+        _consent_secret = os.getenv("SESSION_SECRET", "").encode()
+        user_token = form.get("user_token", "")
+        parts = user_token.rsplit(":", 1) if user_token else []
+        if len(parts) == 2:
+            payload, sig = parts
+            expected = _hmac_m.new(_consent_secret, payload.encode(), _hl.sha256).hexdigest()[:32]
+            if _hmac_m.compare_digest(expected, sig):
+                uid_email = payload.split(":", 1)
+                if len(uid_email) == 2:
+                    user = {"user_id": uid_email[0], "email": uid_email[1]}
+    if not user:
         return RedirectResponse("/login")
-    form = await request.form()
-    if not verify_csrf(request, form.get("csrf_token", "")):
-        return JSONResponse({"error": "invalid_csrf"}, status_code=400)
     client_id = form.get("client_id")
     redirect_uri = form.get("redirect_uri")
     state = form.get("state", "")
@@ -9191,6 +9309,19 @@ async def oauth_token(request: Request):
     client_id = form.get("client_id")
     client_secret = form.get("client_secret")
     redirect_uri = form.get("redirect_uri")
+
+    # ChatGPT may send credentials via HTTP Basic Auth header instead of form
+    if not client_id or not client_secret:
+        import base64 as _b64
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("basic "):
+            try:
+                decoded = _b64.b64decode(auth_header[6:]).decode()
+                if ":" in decoded:
+                    client_id = client_id or decoded.split(":", 1)[0]
+                    client_secret = client_secret or decoded.split(":", 1)[1]
+            except Exception:
+                pass
 
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)

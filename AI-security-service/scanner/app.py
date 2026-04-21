@@ -8071,13 +8071,55 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape')closeNav();});
 <section class="hero">
   <div class="container">
     <h1>Security scans for the<br><span>vibe-coding</span> era.</h1>
-    <p>Scan any deployed app. 40+ modules: Supabase RLS probe, AI-key detection, GraphQL audit, subdomain takeover, prompt-injection probing, WAF fingerprint, nuclei CVE, and more. Fix instructions your AI assistant can execute directly.</p>
-    <div class="btns">
-      <a href="/signup" class="btn btn-primary">Start free — 1 scan, no card</a>
-      <a href="#how" class="btn btn-secondary">See how it works</a>
+    <p>Scan any deployed app. 50+ modules: Supabase RLS probe, AI-key detection, GraphQL audit, subdomain takeover, prompt-injection probing, WAF fingerprint, nuclei CVE, and more.</p>
+    <div id="quick-scan" style="margin:28px auto 0;max-width:560px;">
+      <form id="qs-form" onsubmit="return runQuickScan(event)" style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;">
+        <input type="text" id="qs-url" required placeholder="https://your-app.com" style="flex:1;min-width:240px;background:#111827;border:1px solid #1f2937;color:#e5e7eb;padding:13px 16px;border-radius:8px;font-size:1rem;font-family:inherit;">
+        <button type="submit" class="btn btn-primary" id="qs-btn" style="padding:13px 24px;font-size:1rem;">Scan now</button>
+      </form>
+      <div style="margin-top:8px;font-size:0.82rem;color:#6b7280;text-align:center;">Free, no signup. Quick results in ~10 seconds.</div>
+      <div id="qs-results" style="margin-top:20px;display:none;"></div>
     </div>
   </div>
 </section>
+<script>
+async function runQuickScan(e) {
+  e.preventDefault();
+  const btn = document.getElementById('qs-btn');
+  const input = document.getElementById('qs-url');
+  const results = document.getElementById('qs-results');
+  let host = input.value.trim().replace(/^https?:\/\//, '').replace(/\/.*/, '').split('?')[0];
+  if (!host) return false;
+  btn.disabled = true; btn.textContent = 'Scanning...';
+  results.style.display = 'block';
+  results.innerHTML = '<div style="text-align:center;color:#9ca3af;padding:20px;"><div class="spinner" style="display:inline-block;width:18px;height:18px;border:2px solid #1f2937;border-top-color:#e5e7eb;border-radius:50%;animation:spin 0.8s linear infinite;"></div> Running quick scan on <strong>' + host + '</strong>...</div>';
+  try {
+    const r = await fetch('/api/quick-scan', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({host})});
+    const d = await r.json();
+    if (!r.ok) { results.innerHTML = '<div style="color:#dc2626;padding:12px;">Error: ' + (d.error || 'scan failed') + '</div>'; btn.disabled = false; btn.textContent = 'Scan now'; return false; }
+    let html = '<div style="background:#111827;border:1px solid #1f2937;border-radius:10px;padding:20px;text-align:left;">';
+    html += '<div style="font-size:0.82rem;color:#6b7280;margin-bottom:12px;">Quick scan of <strong style="color:#e5e7eb;">' + host + '</strong> — ' + d.findings.length + ' findings</div>';
+    const icons = {pass:'✅', warn:'⚠️', fail:'❌', info:'ℹ️'};
+    d.findings.forEach(f => {
+      const icon = f.severity === 'CRITICAL' || f.severity === 'HIGH' ? icons.fail : f.severity === 'MEDIUM' ? icons.warn : f.pass ? icons.pass : icons.info;
+      const sevColor = {CRITICAL:'#dc2626',HIGH:'#f97316',MEDIUM:'#eab308',LOW:'#3b82f6',INFO:'#6b7280'}[f.severity] || '#6b7280';
+      html += '<div style="padding:8px 0;border-bottom:1px solid #1f2937;display:flex;gap:10px;align-items:baseline;">';
+      html += '<span style="font-size:0.9rem;">' + icon + '</span>';
+      html += '<div><span style="color:' + sevColor + ';font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">' + f.severity + '</span>';
+      html += ' <span style="color:#d1d5db;font-size:0.88rem;">' + f.title + '</span></div></div>';
+    });
+    html += '<div style="margin-top:18px;padding-top:14px;border-top:1px solid #1f2937;text-align:center;">';
+    html += '<div style="color:#9ca3af;font-size:0.85rem;margin-bottom:12px;">This is a quick preview (6 checks). The full scan runs <strong>50+ modules</strong> including Supabase RLS probe, nuclei CVE templates, subdomain takeover, and AI-powered analysis.</div>';
+    html += '<a href="/signup" class="btn btn-primary" style="display:inline-flex;padding:10px 22px;">Get the full scan free →</a>';
+    html += '</div></div>';
+    results.innerHTML = html;
+  } catch (err) {
+    results.innerHTML = '<div style="color:#dc2626;padding:12px;">Network error — try again?</div>';
+  }
+  btn.disabled = false; btn.textContent = 'Scan again';
+  return false;
+}
+</script>
 
 <section id="integrations">
   <div class="container">
@@ -8856,6 +8898,99 @@ def _ensure_newsletter_table():
 
 
 _ensure_newsletter_table()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Quick scan — fast, no-auth, landing-page preview. Runs 6 lightweight checks
+# in ~10 seconds. No DB write, no background task, no AI modules.
+# Rate-limited per IP to prevent abuse.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/quick-scan")
+async def quick_scan(request: Request):
+    ip_addr = client_ip(request)
+    ok, retry = rate_limit(f"quick_scan:{ip_addr}", max_events=5, window_seconds=300)
+    if not ok:
+        return JSONResponse({"error": "Rate limit — try again in a few minutes."}, status_code=429)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    host = (data.get("host") or "").strip().lower()
+    host = re.sub(r"^https?://", "", host).rstrip("/").split("/")[0].split("?")[0]
+    if not host or len(host) < 3 or "." not in host:
+        return JSONResponse({"error": "Please enter a valid hostname."}, status_code=400)
+
+    # SSRF guard
+    valid, reason = validate_scan_target(host, allow_unresolvable=False)
+    if not valid:
+        return JSONResponse({"error": f"Cannot scan: {reason}"}, status_code=400)
+
+    import subprocess, ssl, socket
+
+    findings = []
+
+    # 1. TLS check
+    try:
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.socket(), server_hostname=host) as s:
+            s.settimeout(5)
+            s.connect((host, 443))
+            cert = s.getpeercert()
+            not_after = cert.get("notAfter", "")
+            from datetime import datetime as _dt
+            exp = _dt.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+            days = (exp - _dt.utcnow()).days
+            if days < 0:
+                findings.append({"severity": "CRITICAL", "title": f"TLS certificate expired {-days} days ago", "pass": False})
+            elif days < 30:
+                findings.append({"severity": "HIGH", "title": f"TLS certificate expires in {days} days", "pass": False})
+            else:
+                findings.append({"severity": "INFO", "title": f"TLS certificate valid ({days} days remaining)", "pass": True})
+    except Exception as e:
+        findings.append({"severity": "MEDIUM", "title": f"TLS connection failed: {str(e)[:60]}", "pass": False})
+
+    # 2-5. Security headers
+    try:
+        r = subprocess.run(
+            ["curl", "-sk", "-m", "5", "-D", "-", "-o", "/dev/null", f"https://{host}/"],
+            capture_output=True, text=True, timeout=8
+        )
+        headers_raw = r.stdout.lower()
+        checks = [
+            ("strict-transport-security", "Strict-Transport-Security (HSTS)"),
+            ("content-security-policy", "Content-Security-Policy (CSP)"),
+            ("x-content-type-options", "X-Content-Type-Options"),
+            ("x-frame-options", "X-Frame-Options"),
+        ]
+        for hdr, label in checks:
+            present = hdr in headers_raw
+            findings.append({
+                "severity": "INFO" if present else "MEDIUM",
+                "title": f"{label}: {'present' if present else 'missing'}",
+                "pass": present,
+            })
+    except Exception:
+        findings.append({"severity": "INFO", "title": "Could not fetch headers", "pass": False})
+
+    # 6. SPF record
+    try:
+        r = subprocess.run(
+            ["dig", "+short", "TXT", host],
+            capture_output=True, text=True, timeout=5
+        )
+        has_spf = "v=spf1" in r.stdout
+        findings.append({
+            "severity": "INFO" if has_spf else "MEDIUM",
+            "title": f"SPF record: {'present' if has_spf else 'missing — email spoofing possible'}",
+            "pass": has_spf,
+        })
+    except Exception:
+        pass
+
+    return {"host": host, "findings": findings, "full_scan_url": f"https://securityscanner.dev/signup"}
 
 
 @app.post("/api/newsletter")

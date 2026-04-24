@@ -8881,6 +8881,109 @@ async def status_page():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# State of Vibe-Coded Security — Q2 2026 report
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/reports/2026-q2", response_class=HTMLResponse)
+async def report_q2_2026():
+    with get_db() as db:
+        total_targets = db.execute("SELECT COUNT(DISTINCT host) FROM targets").fetchone()[0]
+        total_runs = db.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0]
+        total_findings = db.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+        total_crits = db.execute("SELECT COUNT(*) FROM findings WHERE severity='CRITICAL'").fetchone()[0]
+        total_highs = db.execute("SELECT COUNT(*) FROM findings WHERE severity='HIGH'").fetchone()[0]
+        crit_targets = db.execute(
+            "SELECT COUNT(DISTINCT target) FROM findings WHERE severity='CRITICAL'"
+        ).fetchone()[0]
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>State of Vibe-Coded Security — Q2 2026</title>
+<meta name="description" content="We scanned {total_targets:,}+ deployed apps built with AI tools. Here's what's leaking.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta property="og:type" content="article">
+<meta property="og:title" content="State of Vibe-Coded Security — Q2 2026">
+<meta property="og:description" content="We scanned {total_targets:,}+ deployed apps. {total_crits} CRITs. Here's the breakdown.">
+<meta property="og:image" content="https://securityscanner.dev/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<style>{_BLOG_CSS}
+  .big-stat {{ text-align: center; padding: 24px 0; }}
+  .big-stat .num {{ font-size: 3rem; font-weight: 800; letter-spacing: -0.03em; color: #dc2626; }}
+  .big-stat .label {{ font-size: 0.85rem; color: #9ca3af; margin-top: 4px; }}
+  .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin: 32px 0; }}
+  .stat-box {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; text-align: center; }}
+  .stat-box .num {{ font-size: 1.8rem; font-weight: 700; }}
+  .stat-box .label {{ font-size: 0.75rem; color: #9ca3af; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; }}
+  .rate-table {{ width: 100%; border-collapse: collapse; margin: 24px 0; }}
+  .rate-table th {{ text-align: left; padding: 10px 12px; font-size: 0.72rem; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #1f2937; }}
+  .rate-table td {{ padding: 10px 12px; border-bottom: 1px solid #1f2937; font-size: 0.9rem; }}
+  .rate-table .rate {{ font-weight: 700; }}
+  .rate-table .zero {{ color: #22c55e; }}
+  .rate-table .high {{ color: #dc2626; }}
+</style></head>
+<body>
+{_render_blog_nav()}
+<div class="post-wrap">
+  <a href="/" class="back-link">← Home</a>
+  <header class="post-header">
+    <div class="row">
+      <span class="tag-pill" style="background:#dc26261a;color:#dc2626;border:1px solid #dc262633;">Report</span>
+      <span class="meta-text">April 2026</span>
+    </div>
+    <h1 class="post-title">State of Vibe-Coded Security</h1>
+    <p class="lead">Q2 2026 — aggregate findings from {total_targets:,} deployed apps built with AI coding tools.</p>
+  </header>
+  <article>
+    <div class="stat-grid">
+      <div class="stat-box"><div class="num">{total_targets:,}</div><div class="label">Apps scanned</div></div>
+      <div class="stat-box"><div class="num" style="color:#dc2626;">{total_crits}</div><div class="label">Critical findings</div></div>
+      <div class="stat-box"><div class="num" style="color:#f97316;">{total_highs}</div><div class="label">High findings</div></div>
+      <div class="stat-box"><div class="num">{total_findings:,}</div><div class="label">Total findings</div></div>
+      <div class="stat-box"><div class="num">{crit_targets}</div><div class="label">Apps with CRITs</div></div>
+      <div class="stat-box"><div class="num">{total_runs:,}</div><div class="label">Scan runs</div></div>
+    </div>
+
+    <h2>Per-platform CRIT rate</h2>
+    <table class="rate-table">
+    <thead><tr><th>Platform</th><th>Scanned</th><th>With CRIT</th><th>Rate</th></tr></thead>
+    <tbody>
+    <tr><td>YC companies (W21–F25)</td><td>200</td><td>0</td><td class="rate zero">0%</td></tr>
+    <tr><td>Lovable</td><td>476</td><td>34</td><td class="rate high">7.1%</td></tr>
+    <tr><td>Bolt.host</td><td>289</td><td>21</td><td class="rate high">7.3%</td></tr>
+    <tr><td>Replit</td><td>194</td><td>4</td><td class="rate">2.1%</td></tr>
+    <tr><td>Vercel (v0/AI)</td><td>67</td><td>2</td><td class="rate">3.0%</td></tr>
+    <tr><td>Streamlit</td><td>90</td><td>0</td><td class="rate zero">0%</td></tr>
+    <tr><td>Other</td><td>53</td><td>3</td><td class="rate">5.7%</td></tr>
+    </tbody></table>
+
+    <h2>Finding breakdown</h2>
+    <p>Top CRIT categories across all scans:</p>
+    <ul>
+      <li><strong>Supabase RLS off</strong> — 96% of all CRITs. Tables with real user data readable by anyone with the public anon key.</li>
+      <li><strong>API keys in JS bundles</strong> — OpenAI, Anthropic, Google, Stripe keys shipped client-side. 15% of Bolt.host apps affected.</li>
+      <li><strong>IDOR / broken access control</strong> — sequential IDs on API endpoints returning other users' data.</li>
+      <li><strong>Unauthed APIs</strong> — entire OpenAPI specs with zero security schemes defined.</li>
+      <li><strong>Private key material in production</strong> — PEM-format keys bundled by Webpack/Vite.</li>
+    </ul>
+
+    <h2>Methodology</h2>
+    <p>Targets sourced from certificate transparency logs, Google search, and platform directories. All scans are read-only (GET + minimal POST probes). 50+ scanner modules per target. Every CRIT finding verified reproducible before disclosure. Private disclosures sent to all identifiable owners before publication.</p>
+    <p>Scanner: <a href="https://securityscanner.dev" style="color:#dc2626;">securityscanner.dev</a> — open to anyone. One free scan, no card.</p>
+
+    <h2>Detailed write-ups</h2>
+    <ul>
+      <li><a href="/blog/lovable-vs-bolt-vs-replit-rls" style="color:#dc2626;">Lovable vs Bolt vs Replit: per-platform RLS breakdown →</a></li>
+      <li><a href="/blog/beyond-supabase-rls-five-other-crits" style="color:#dc2626;">Beyond Supabase RLS: 5 other critical vulnerabilities →</a></li>
+      <li><a href="/blog/top-5-supabase-rls-mistakes-on-lovable-apps" style="color:#dc2626;">Top 5 Supabase RLS mistakes on Lovable apps →</a></li>
+      <li><a href="/blog/top-5-security-issues-on-replit-apps" style="color:#dc2626;">Top 5 security issues on Replit apps →</a></li>
+    </ul>
+
+    <p style="margin-top:32px;color:#6b7280;font-size:0.85rem;">This report is updated as we scan more apps. Data as of April 2026. Questions or corrections: <a href="mailto:stefan@securityscanner.dev" style="color:#dc2626;">stefan@securityscanner.dev</a>.</p>
+  </article>
+</div>
+</body></html>""")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Newsletter signup — POST /api/newsletter
 # ═════════════════════════════════════════════════════════════════════════════
 

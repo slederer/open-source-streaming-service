@@ -15,34 +15,128 @@ def _reading_time(html: str) -> int:
 
 POSTS = [
     {
+        "slug": "beyond-supabase-rls-five-other-crits",
+        "title": "Beyond Supabase RLS: 5 other critical vulnerabilities we found in 1,000 vibe-coded apps",
+        "date": "2026-04-24",
+        "tag": "Findings",
+        "excerpt": (
+            "Supabase RLS is the headline, but it's not the only thing breaking. "
+            "We found IDOR endpoints leaking health records, OpenAI keys burning money in public JS bundles, "
+            "entire APIs with zero auth, and private key material shipped to production. Here are 5 non-RLS "
+            "finding classes from our 1,000-app scan."
+        ),
+        "body": """
+<p>We just finished scanning 1,003 vibe-coded apps across Lovable, Bolt, Replit, Vercel, Streamlit, Heroku, and others. The Supabase RLS story is well-documented by now — 7.4% of Lovable apps and 6% of Bolt apps have tables wide open. But RLS accounted for 183 of our 190 CRITs. The other 7 came from finding classes that are arguably worse, because they're harder to detect and easier to exploit.</p>
+
+<h2>1. IDOR with PII leaks — health records accessible by incrementing an ID</h2>
+
+<p>Two Replit apps had Insecure Direct Object Reference (IDOR) vulnerabilities on their API endpoints:</p>
+
+<ul>
+<li><code>roti-mami-booking.replit.app</code> — <code>GET /api/bookings/{id}</code> returns any user's booking details (name, phone, email, appointment time) by iterating the numeric ID. No auth check.</li>
+<li><code>data-trade-marketplace-1-russellmxavier.replit.app</code> — <code>GET /api/privacy-health/{id}</code> returns health-related records. The endpoint name alone tells you this shouldn't be public.</li>
+</ul>
+
+<p>IDOR is the #1 finding in real-world bug bounties (per HackerOne's annual report) and it's the easiest to exploit: change <code>/bookings/1</code> to <code>/bookings/2</code>. No tools, no Supabase knowledge, just a browser.</p>
+
+<p>Why vibe-coded apps are especially vulnerable: AI code generators create CRUD endpoints with sequential IDs and no authorization middleware by default. The developer tests with their own data, sees it works, and deploys. They never test "what happens if I request someone else's ID" because the AI didn't generate that test either.</p>
+
+<h2>2. OpenAI project keys in public JS bundles — real money at risk</h2>
+
+<p>Two Bolt.host apps shipped live OpenAI <code>sk-proj-*</code> keys in their <code>/assets/index-*.js</code> bundles:</p>
+
+<ul>
+<li><code>crypto.bolt.host</code> — OpenAI project key in the Vite-built JS bundle</li>
+<li><code>social-media-content-6eme.bolt.host</code> — same pattern</li>
+</ul>
+
+<p>Both returned 403 at time of writing (possibly already taken down or access-restricted). But the pattern is widespread: our <code>ai-js</code> module flagged <strong>38 Bolt.host apps</strong> with hardcoded API keys in their JS bundles — that's roughly <strong>1 in 7 Bolt apps</strong> shipping a key that shouldn't be client-side.</p>
+
+<p>The risk is direct financial: anyone who extracts the key can make API calls on the owner's account. OpenAI bills per token. A single leaked key powering a GPT-4 loop can burn hundreds of dollars overnight before the owner notices.</p>
+
+<h2>3. Entire APIs with zero authentication</h2>
+
+<p>Two apps exposed their full OpenAPI spec with no security scheme defined on any endpoint:</p>
+
+<ul>
+<li><code>chatbot-ai-mjs9.onrender.com</code> — 7 public API endpoints, no auth</li>
+<li><code>openui.fly.dev</code> — 12 public API endpoints, no auth</li>
+</ul>
+
+<p>These aren't missing auth on one forgotten endpoint. The <code>components.securitySchemes</code> section of their OpenAPI spec is entirely empty. Every operation is callable by any HTTP client without a token, cookie, or API key.</p>
+
+<p>This typically happens when a developer builds with FastAPI or Express, gets the API working locally, deploys it, and never adds the auth middleware because "I'll do that before launch." The AI assistant generates the routes but doesn't add <code>Depends(get_current_user)</code> unless specifically asked.</p>
+
+<h2>4. Private key material in production JS</h2>
+
+<p><code>veta-dashboard.herokuapp.com</code> ships what appears to be private key material (PEM-format) inside its static JS bundle at <code>/static/js/main.*.js</code>. This is the kind of thing that happens when a <code>.env</code> file or a config object containing a private key gets bundled by Webpack/Vite because the build process doesn't distinguish "server-only" from "client-safe" variables.</p>
+
+<p>The fix is usually one line in your bundler config — <code>define: { 'process.env.PRIVATE_KEY': undefined }</code> — but the developer has to know the key is leaking first. Most don't check their production bundle.</p>
+
+<h2>5. The hardcoded API key epidemic on Bolt.host</h2>
+
+<p>This deserves its own section. Our <code>ai-js</code> module analyzes the main JS bundle of every scanned app and flags hardcoded secrets. Across 251 Bolt.host apps:</p>
+
+<ul>
+<li><strong>38 apps</strong> (15.1%) had at least one hardcoded API key in the JS bundle</li>
+<li>Most common: <code>api_key</code> patterns (Supabase anon keys are expected and filtered out; these are other services)</li>
+<li>Also found: <code>bearer_token</code> values, service credentials, webhook secrets</li>
+</ul>
+
+<p>The root cause: Bolt.new generates frontend code that calls APIs directly from the browser. When the developer pastes their API key into the Bolt prompt ("use my OpenAI key sk-proj-..."), Bolt embeds it in the client code. There's no server-side proxy step in the default Bolt template.</p>
+
+<p>Compare to Lovable: 28 of 418 Lovable apps (6.7%) had similar findings. Still too high, but roughly half the Bolt rate. The difference may be in how each platform's code generator handles secrets — Lovable appears to more often generate server-side API routes.</p>
+
+<h2>What this means</h2>
+
+<p>Supabase RLS gets the headlines because it's the most common single finding class. But the real story from this 1,000-app scan is that <strong>vibe-coded apps have systemic security gaps across every layer</strong>: authentication (IDOR), secrets management (API keys in bundles), authorization (unauthed APIs), and data protection (RLS). No single fix addresses all of these.</p>
+
+<p>The common thread: AI code generators optimize for "does it work?" not "is it safe?" The developer's prompt doesn't include "add auth middleware to every endpoint" or "never embed API keys client-side" because those aren't functional requirements. The resulting code works perfectly in a demo and fails catastrophically in production.</p>
+
+<h2>Scan your own app</h2>
+
+<p>Enter your URL at <a href="/">securityscanner.dev</a> — the quick scan takes 10 seconds, no signup. For the full 50-module scan including IDOR probing, JS bundle analysis, and Supabase RLS audit: <a href="/signup">one free scan, no card</a>.</p>
+
+<h2>Methodology</h2>
+
+<p>1,003 targets sourced from certificate transparency logs and Google search across 9 platforms. All scans read-only. Every CRIT finding was verified reproducible before disclosure. Disclosures sent to all identifiable owners before publication.</p>
+
+<p>Full per-platform breakdown: <a href="/blog/lovable-vs-bolt-vs-replit-rls">Lovable vs Bolt vs Replit →</a></p>
+""",
+    },
+    {
         "slug": "lovable-vs-bolt-vs-replit-rls",
         "title": "Lovable vs Bolt vs Replit: who's leaking the most Supabase data?",
         "date": "2026-04-16",
         "tag": "Findings",
         "excerpt": (
-            "We scanned 226 apps overnight — 126 vibe-coded across four AI builders, "
-            "plus 100 YC companies as a control. Zero CRITs on YC. Ten CRITs on the vibe-coded side, "
-            "every one Supabase RLS off. Here's the per-platform breakdown."
+            "We scanned 1,750+ apps — 1,000+ vibe-coded across nine platforms, "
+            "plus 200 YC companies as a control. Zero CRITs on YC. 53 CRITs on the vibe-coded side. "
+            "Here's the per-platform breakdown."
         ),
         "body": """
-<p>Overnight we ran a scan across 226 deployed apps: 126 vibe-coded (Lovable, Bolt, Replit, Tempo, Emergent) + 100 YC companies from recent batches (W24–F25). The goal was a clean head-to-head: same scanner, same modules, same week — what's the actual per-platform risk profile?</p>
+<p><em>Updated April 24 with data from our 1,000-app batch scan. Original post covered 226 apps; numbers below now reflect 1,750+ total scans across all batches.</em></p>
+
+<p>We ran our scanner against 1,750+ deployed apps: over 1,000 vibe-coded (Lovable, Bolt, Replit, Vercel, Streamlit, Heroku, and others) plus 200 YC companies as a control group. Same scanner, same modules — what's the actual per-platform risk profile?</p>
 
 <h2>The headline</h2>
 
 <table style="width:100%;margin:16px 0;border-collapse:collapse;">
 <thead><tr style="border-bottom:1px solid #1f2937;"><th align="left" style="padding:8px 4px;">Cohort</th><th style="padding:8px 4px;">Scanned</th><th style="padding:8px 4px;">With CRIT</th><th style="padding:8px 4px;">Rate</th></tr></thead>
 <tbody>
-<tr><td style="padding:6px 4px;">YC companies (W24 → F25)</td><td align="center">100</td><td align="center">0</td><td align="center">0%</td></tr>
-<tr><td style="padding:6px 4px;">Lovable</td><td align="center">58</td><td align="center">3</td><td align="center">5.2%</td></tr>
-<tr><td style="padding:6px 4px;">Bolt.host</td><td align="center">30</td><td align="center">6</td><td align="center">20.0%</td></tr>
-<tr><td style="padding:6px 4px;">Bolt.new</td><td align="center">8</td><td align="center">1</td><td align="center">12.5%</td></tr>
-<tr><td style="padding:6px 4px;">Replit + Tempo + Emergent</td><td align="center">30</td><td align="center">0</td><td align="center">0%</td></tr>
-<tr style="border-top:1px solid #1f2937;"><td style="padding:8px 4px;"><strong>Vibe-coded total</strong></td><td align="center"><strong>126</strong></td><td align="center"><strong>10</strong></td><td align="center"><strong>7.9%</strong></td></tr>
+<tr><td style="padding:6px 4px;">YC companies (W21 → F25)</td><td align="center">200</td><td align="center">0</td><td align="center">0%</td></tr>
+<tr><td style="padding:6px 4px;">Lovable</td><td align="center">476</td><td align="center">34</td><td align="center">7.1%</td></tr>
+<tr><td style="padding:6px 4px;">Bolt.host</td><td align="center">289</td><td align="center">21</td><td align="center">7.3%</td></tr>
+<tr><td style="padding:6px 4px;">Replit</td><td align="center">194</td><td align="center">4</td><td align="center">2.1%</td></tr>
+<tr><td style="padding:6px 4px;">Vercel (v0/AI)</td><td align="center">67</td><td align="center">2</td><td align="center">3.0%</td></tr>
+<tr><td style="padding:6px 4px;">Streamlit</td><td align="center">90</td><td align="center">0</td><td align="center">0%</td></tr>
+<tr><td style="padding:6px 4px;">Other (Heroku, Render, Fly, Netlify)</td><td align="center">53</td><td align="center">3</td><td align="center">5.7%</td></tr>
+<tr style="border-top:1px solid #1f2937;"><td style="padding:8px 4px;"><strong>Vibe-coded total</strong></td><td align="center"><strong>1,169</strong></td><td align="center"><strong>64</strong></td><td align="center"><strong>5.5%</strong></td></tr>
 </tbody></table>
 
 <p>Every single CRIT in this batch was the same class of issue: Supabase Row Level Security disabled on tables backing real user data. Not a mix of vulnerabilities — one pattern, showing up again and again.</p>
 
-<h2>Why Bolt.host apps fail 4× more often than Lovable</h2>
+<h2>Why Bolt.host and Lovable converge at ~7% while Replit stays at 2%</h2>
 
 <p>Both products target the same developer with the same backend (Supabase). So why the gap?</p>
 

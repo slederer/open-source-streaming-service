@@ -37,7 +37,7 @@ POSTS = [
 <li><code>data-trade-marketplace-1-russellmxavier.replit.app</code> — <code>GET /api/privacy-health/{id}</code> returns health-related records. The endpoint name alone tells you this shouldn't be public.</li>
 </ul>
 
-<p>IDOR is the #1 finding in real-world bug bounties (per HackerOne's annual report) and it's the easiest to exploit: change <code>/bookings/1</code> to <code>/bookings/2</code>. No tools, no Supabase knowledge, just a browser.</p>
+<p>IDOR is consistently one of the top finding categories in real-world bug bounties (broken access control tops the OWASP Top 10 and HackerOne's annual reports) and it's the easiest to exploit: change <code>/bookings/1</code> to <code>/bookings/2</code>. No tools, no Supabase knowledge, just a browser.</p>
 
 <p>Why vibe-coded apps are especially vulnerable: AI code generators create CRUD endpoints with sequential IDs and no authorization middleware by default. The developer tests with their own data, sees it works, and deploys. They never test "what happens if I request someone else's ID" because the AI didn't generate that test either.</p>
 
@@ -50,7 +50,7 @@ POSTS = [
 <li><code>social-media-content-6eme.bolt.host</code> — same pattern</li>
 </ul>
 
-<p>Both returned 403 at time of writing (possibly already taken down or access-restricted). But the pattern is widespread: our <code>ai-js</code> module flagged <strong>38 Bolt.host apps</strong> with hardcoded API keys in their JS bundles — that's roughly <strong>1 in 7 Bolt apps</strong> shipping a key that shouldn't be client-side.</p>
+<p>Both returned 403 at time of writing (possibly already taken down or access-restricted). But the pattern is widespread: our <code>ai-js</code> module flagged <strong>38 apps across all platforms</strong> with hardcoded API keys in their JS bundles — 17 on Bolt.host (1 in 15), 18 on Vercel (1 in 4 of the AI-generated ones we scanned), and 3 others.</p>
 
 <p>The risk is direct financial: anyone who extracts the key can make API calls on the owner's account. OpenAI bills per token. A single leaked key powering a GPT-4 loop can burn hundreds of dollars overnight before the owner notices.</p>
 
@@ -78,14 +78,15 @@ POSTS = [
 <p>This deserves its own section. Our <code>ai-js</code> module analyzes the main JS bundle of every scanned app and flags hardcoded secrets. Across 251 Bolt.host apps:</p>
 
 <ul>
-<li><strong>38 apps</strong> (15.1%) had at least one hardcoded API key in the JS bundle</li>
+<li><strong>17 of 251 Bolt.host apps</strong> (6.8%) had at least one hardcoded API key in the JS bundle</li>
+<li><strong>18 of 67 Vercel AI apps</strong> (26.9%) had the same — the highest rate of any platform</li>
 <li>Most common: <code>api_key</code> patterns (Supabase anon keys are expected and filtered out; these are other services)</li>
 <li>Also found: <code>bearer_token</code> values, service credentials, webhook secrets</li>
 </ul>
 
-<p>The root cause: Bolt.new generates frontend code that calls APIs directly from the browser. When the developer pastes their API key into the Bolt prompt ("use my OpenAI key sk-proj-..."), Bolt embeds it in the client code. There's no server-side proxy step in the default Bolt template.</p>
+<p>The root cause: both Bolt.new and v0.dev generate frontend code that calls APIs directly from the browser. When the developer pastes their API key into the prompt ("use my OpenAI key sk-proj-..."), the generator embeds it in the client code. There's no server-side proxy step in the default templates.</p>
 
-<p>Compare to Lovable: 28 of 418 Lovable apps (6.7%) had similar findings. Still too high, but roughly half the Bolt rate. The difference may be in how each platform's code generator handles secrets — Lovable appears to more often generate server-side API routes.</p>
+<p>Notably, Lovable had <strong>zero</strong> ai-js findings in this batch. Their code generator appears to route API calls through server-side endpoints by default — a meaningful architectural difference that keeps secrets out of the bundle.</p>
 
 <h2>What this means</h2>
 
@@ -101,7 +102,8 @@ POSTS = [
 
 <p>1,003 targets sourced from certificate transparency logs and Google search across 9 platforms. All scans read-only. Every CRIT finding was verified reproducible before disclosure. Disclosures sent to all identifiable owners before publication.</p>
 
-<p>Full per-platform breakdown: <a href="/blog/lovable-vs-bolt-vs-replit-rls">Lovable vs Bolt vs Replit →</a></p>
+<p>Full per-platform breakdown: <a href="/blog/lovable-vs-bolt-vs-replit-rls">Lovable vs Bolt vs Replit →</a><br>
+Aggregate stats: <a href="/reports/2026-q2">State of Vibe-Coded Security Q2 2026 →</a></p>
 """,
     },
     {

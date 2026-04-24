@@ -8379,6 +8379,7 @@ async function nlSubmit(e) {
     <div>Security Scanner &mdash; Built for the AI-native developer</div>
     <div style="margin-top:12px;">
       <a href="/blog">Blog</a>
+      <a href="/reports/2026-q2">Q2 Report</a>
       <a href="/blog/rss.xml">RSS</a>
       <a href="/changelog">Changelog</a>
       <a href="/status">Status</a>

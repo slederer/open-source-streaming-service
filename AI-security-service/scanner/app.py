@@ -2674,6 +2674,8 @@ try:
         scan_target_session_entropy, scan_target_jwt_weak_secret,
         scan_target_oauth_redirect, scan_target_ssrf_fetch,
         scan_target_typosquat_deps,
+        scan_target_xss, scan_target_cookies,
+        scan_target_firebase_deep, scan_target_js_unsafe,
     )
     from scanner.ai_triage import (
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -2694,6 +2696,8 @@ except ImportError:
         scan_target_session_entropy, scan_target_jwt_weak_secret,
         scan_target_oauth_redirect, scan_target_ssrf_fetch,
         scan_target_typosquat_deps,
+        scan_target_xss, scan_target_cookies,
+        scan_target_firebase_deep, scan_target_js_unsafe,
     )
     from scanner_ai_triage import (  # type: ignore
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -2748,6 +2752,10 @@ SCAN_MODULES = [
     ("typosquat_deps",  "Typosquatted npm deps",            "scan_target_typosquat_deps"),
     ("nuclei_cve",      "Nuclei CVE + takeover templates",  "scan_target_nuclei_cve"),
     ("accessibility",   "Privacy & compliance audit",       "scan_target_accessibility"),
+    ("xss_probe",       "Reflected XSS probe",              "scan_target_xss"),
+    ("cookie_audit",    "Cookie security audit",            "scan_target_cookies"),
+    ("firebase_deep",   "Firebase rules deep probe",        "scan_target_firebase_deep"),
+    ("js_unsafe",       "Unsafe JS patterns (eval, etc.)",  "scan_target_js_unsafe"),
     # Structured AI modules (replaces the retired `ai_chain` fuzzy reasoner).
     # Each has narrow structured I/O and live-verifies its own claims before
     # emitting a finding.
@@ -5071,6 +5079,117 @@ async def get_fix_all(request: Request, run_id: str):
     })
 
 
+# ── PDF Export ────────────────────────────────────────────────────────────────
+
+@app.get("/api/runs/{run_id}/pdf")
+async def get_run_pdf(request: Request, run_id: str, target: str = ""):
+    """Generate a PDF report for a scan run."""
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    if not _verify_run_ownership(run_id, user["user_id"]):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    with get_db() as db:
+        run = db.execute("SELECT * FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        run = dict(run)
+        q = "SELECT * FROM findings WHERE run_id=?"
+        params = [run_id]
+        if target:
+            q += " AND target=?"
+            params.append(target)
+        q += " ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END"
+        findings = [dict(r) for r in db.execute(q, params).fetchall()]
+
+    import json as _json
+    summary = _json.loads(run.get("summary_json") or "{}") if run.get("summary_json") else {}
+    grade = summary.get("risk_grade", "?")
+    scan_target = target or run.get("target", "unknown")
+
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for f in findings:
+        counts[f.get("severity", "INFO")] = counts.get(f.get("severity", "INFO"), 0) + 1
+
+    findings_rows = ""
+    for f in findings:
+        sev = f.get("severity", "INFO")
+        sev_color = {"CRITICAL": "#dc2626", "HIGH": "#f97316", "MEDIUM": "#eab308", "LOW": "#3b82f6", "INFO": "#6b7280"}.get(sev, "#6b7280")
+        title = (f.get("title") or "")[:100]
+        tool = f.get("tool", "")
+        desc = (f.get("description") or "")[:200]
+        evidence = (f.get("evidence") or "")[:300]
+        findings_rows += f"""
+        <tr>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb;"><span style="color:{sev_color};font-weight:700;font-size:0.8rem;">{sev}</span></td>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb;font-size:0.85rem;">{title}<br><span style="color:#6b7280;font-size:0.75rem;">[{tool}]</span></td>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb;font-size:0.78rem;color:#4b5563;">{desc}</td>
+        </tr>"""
+
+    html_report = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>Security Scan Report — {scan_target}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; color: #111827; padding: 40px; max-width: 900px; margin: 0 auto; font-size: 14px; line-height: 1.5; }}
+  h1 {{ font-size: 1.6rem; margin-bottom: 4px; }}
+  .meta {{ color: #6b7280; font-size: 0.85rem; margin-bottom: 24px; }}
+  .grade {{ display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: 10px; font-weight: 800; font-size: 1.3rem; color: white; }}
+  .grade-A {{ background: #14532d; }} .grade-B {{ background: #172554; }} .grade-C {{ background: #422006; }} .grade-D {{ background: #431407; }} .grade-F {{ background: #450a0a; }}
+  .summary {{ display: flex; gap: 16px; margin: 20px 0; }}
+  .summary div {{ padding: 12px 16px; border: 1px solid #e5e7eb; border-radius: 8px; text-align: center; flex: 1; }}
+  .summary .num {{ font-size: 1.4rem; font-weight: 700; }}
+  .summary .label {{ font-size: 0.7rem; color: #6b7280; text-transform: uppercase; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+  th {{ text-align: left; padding: 8px; font-size: 0.7rem; color: #6b7280; text-transform: uppercase; border-bottom: 2px solid #e5e7eb; }}
+  .footer {{ margin-top: 40px; padding-top: 20px; border-top: 1px solid #e5e7eb; color: #9ca3af; font-size: 0.78rem; }}
+  @media print {{ body {{ padding: 20px; }} }}
+</style></head>
+<body>
+  <div style="display:flex;align-items:center;gap:16px;margin-bottom:8px;">
+    <div class="grade grade-{grade}">{grade}</div>
+    <div>
+      <h1>Security Scan Report</h1>
+      <div class="meta">{scan_target} · Scan #{run_id} · {run.get("started_at", "")[:10]}</div>
+    </div>
+  </div>
+
+  <div class="summary">
+    <div><div class="num" style="color:#dc2626;">{counts["CRITICAL"]}</div><div class="label">Critical</div></div>
+    <div><div class="num" style="color:#f97316;">{counts["HIGH"]}</div><div class="label">High</div></div>
+    <div><div class="num" style="color:#eab308;">{counts["MEDIUM"]}</div><div class="label">Medium</div></div>
+    <div><div class="num" style="color:#3b82f6;">{counts["LOW"]}</div><div class="label">Low</div></div>
+    <div><div class="num" style="color:#6b7280;">{counts["INFO"]}</div><div class="label">Info</div></div>
+  </div>
+
+  <h2>Findings ({len(findings)})</h2>
+  <table>
+    <thead><tr><th>Severity</th><th>Finding</th><th>Description</th></tr></thead>
+    <tbody>{findings_rows}</tbody>
+  </table>
+
+  <div class="footer">
+    <p>Generated by Security Scanner · securityscanner.dev</p>
+    <p>This report is based on automated scanning. Findings should be verified before remediation. All scans are read-only and non-destructive.</p>
+  </div>
+</body></html>"""
+
+    # Try weasyprint for real PDF; fall back to HTML download
+    try:
+        from weasyprint import HTML as _WeasyprintHTML
+        pdf_bytes = _WeasyprintHTML(string=html_report).write_pdf()
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="scan-report-{run_id}.pdf"'},
+        )
+    except ImportError:
+        return HTMLResponse(
+            html_report,
+            headers={"Content-Disposition": f'attachment; filename="scan-report-{run_id}.html"'},
+        )
+
+
 # ── Monitoring + Alerts (item #11) ───────────────────────────────────────────
 
 def _ensure_monitoring_table():
@@ -6847,6 +6966,13 @@ async function api(path, opts) {
 }
 
 function esc(s) { return (s||"").toString().replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function _copyFix(btn, target, sev, title, desc, evidence) {
+  const prompt = `Fix this security issue on ${target}:\n\n[${sev}] ${title}\n\nDescription: ${desc}\n\nEvidence: ${evidence}\n\nPlease implement a fix for this vulnerability.`;
+  navigator.clipboard.writeText(prompt).then(() => {
+    const orig = btn.innerHTML; btn.innerHTML = '&#10003; Copied!'; btn.style.color='var(--success)';
+    setTimeout(() => { btn.innerHTML = orig; btn.style.color=''; }, 2000);
+  });
+}
 function fmtTime(s) { if (!s) return ""; const d = new Date(s); const now = new Date(); const diff = (now - d) / 1000; if (diff < 60) return "just now"; if (diff < 3600) return Math.floor(diff/60) + "m ago"; if (diff < 86400) return Math.floor(diff/3600) + "h ago"; return d.toLocaleDateString(); }
 
 // ─── Overview view ───────────────────────────────────────────────────────────
@@ -7048,9 +7174,13 @@ function _renderTargetCard(runId, target, findings, gradeFor, diff) {
                 ${f.description ? `<dt>Description</dt><dd>${esc(f.description)}</dd>` : ''}
                 ${f.evidence ? `<dt>Evidence</dt><dd style="font-family:'SF Mono',Menlo,monospace;font-size:0.82rem;white-space:pre-wrap;word-break:break-all;background:#0a0e17;padding:8px 10px;border-radius:4px;border:1px solid #1f2937;">${esc(f.evidence)}</dd>` : ''}
                 <dt>Category</dt><dd>${esc(f.category)}</dd>
+                <button class="btn btn-outline btn-sm" style="margin-top:10px;" onclick="event.stopPropagation();_copyFix(this,'${esc(target).replace(/'/g,"\\'")}','${f.severity}',\`${esc(f.title).replace(/`/g,"\\`")}\`,\`${esc(f.description||"").replace(/`/g,"\\`")}\`,\`${esc(f.evidence||"").replace(/`/g,"\\`")}\`)">&#128203; Copy fix to Cursor</button>
               </div>
             </div>`).join('')).join('')}
-        <div style="margin-top:10px;"><a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">Download fix for ${esc(target)}</a></div>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+          <a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">&#128196; Download fix (.md)</a>
+          <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/pdf?target=${encodeURIComponent(target)}" target="_blank">&#128462; Export PDF report</a>
+        </div>
       </div>
     </div>`;
 }
@@ -7182,7 +7312,11 @@ VIEWS["scan-detail"] = async (runId, isPoll = false) => {
             ${canceledNote ? `<span style="font-size:0.75rem;color:var(--text-muted);">${canceledNote}</span>` : ''}
           </div>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          ${!isRunning && sumAll.risk_grade ? `<div style="text-align:center;min-width:80px;">
+            <div class="grade grade-${sumAll.risk_grade}" style="width:56px;height:56px;font-size:1.5rem;border-radius:12px;margin:0 auto;">${sumAll.risk_grade}</div>
+            <div style="font-size:0.65rem;color:var(--text-muted);margin-top:4px;">${sumAll.risk_score != null ? sumAll.risk_score + '/100' : ''}</div>
+          </div>` : ''}
           ${stopBtn}
         </div>
       </div>

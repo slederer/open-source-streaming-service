@@ -2089,3 +2089,248 @@ def scan_target_typosquat_deps(run_id: str, ip: str, name: str) -> list[dict]:
                 "tool": "supply-chain",
             })
     return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — XSS reflected probe
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_xss(run_id: str, ip: str, name: str) -> list[dict]:
+    """Test discovered endpoints for reflected XSS by injecting payloads
+    into query parameters and checking if they appear unescaped in the response."""
+    findings: list[dict] = []
+    payloads = [
+        ('<script>alert(1)</script>', 'script-tag'),
+        ('"><img src=x onerror=alert(1)>', 'img-onerror'),
+        ("'><svg/onload=alert(1)>", 'svg-onload'),
+    ]
+    test_paths = ["/", "/search", "/api/search", "/q"]
+    test_params = ["q", "search", "query", "input", "name", "redirect", "url", "next", "callback"]
+
+    for path in test_paths:
+        for param in test_params[:3]:
+            for payload, label in payloads:
+                from urllib.parse import quote
+                test_url = f"https://{ip}{path}?{param}={quote(payload)}"
+                try:
+                    r = subprocess.run(
+                        ["curl", "-sk", "-m", "5", "-o", "-", test_url],
+                        capture_output=True, text=True, timeout=8,
+                    )
+                    body = r.stdout
+                    if not body:
+                        continue
+                    if payload in body:
+                        findings.append({
+                            "target": ip, "severity": "HIGH", "category": "application",
+                            "title": f"Reflected XSS via {param} parameter on {path} ({label})",
+                            "description": (
+                                f"The payload was reflected unescaped in the response body. "
+                                f"An attacker can craft a URL that executes JavaScript in a "
+                                f"victim's browser when they click the link."
+                            ),
+                            "evidence": f"GET {test_url}\nPayload '{payload}' reflected in response body",
+                            "tool": "xss-probe",
+                        })
+                        return findings
+                except Exception:
+                    continue
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Cookie security audit
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_cookies(run_id: str, ip: str, name: str) -> list[dict]:
+    """Check Set-Cookie headers for missing security flags."""
+    findings: list[dict] = []
+    for scheme in ["https", "http"]:
+        port = 443 if scheme == "https" else 80
+        try:
+            r = subprocess.run(
+                ["curl", f"-{'s' if scheme == 'https' else ''}kI", "-m", "5",
+                 f"{scheme}://{ip}/"],
+                capture_output=True, text=True, timeout=8,
+            )
+        except Exception:
+            continue
+        for line in r.stdout.splitlines():
+            if not line.lower().startswith("set-cookie:"):
+                continue
+            cookie_str = line[len("set-cookie:"):].strip()
+            cookie_name = cookie_str.split("=")[0].strip() if "=" in cookie_str else "unknown"
+            cookie_lower = cookie_str.lower()
+            issues = []
+            if "secure" not in cookie_lower and scheme == "https":
+                issues.append("missing Secure flag")
+            if "httponly" not in cookie_lower:
+                issues.append("missing HttpOnly flag")
+            if "samesite" not in cookie_lower:
+                issues.append("missing SameSite attribute")
+            if issues:
+                findings.append({
+                    "target": ip, "severity": "MEDIUM", "category": "application",
+                    "title": f"Cookie '{cookie_name}' on port {port}: {', '.join(issues)}",
+                    "description": (
+                        f"The cookie '{cookie_name}' is set without recommended security flags. "
+                        f"Missing Secure allows interception over HTTP. Missing HttpOnly allows "
+                        f"JavaScript access (XSS escalation). Missing SameSite weakens CSRF protection."
+                    ),
+                    "evidence": f"Set-Cookie: {cookie_str[:200]}",
+                    "tool": "cookie-audit",
+                })
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Firebase deep probe
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_firebase_deep(run_id: str, ip: str, name: str) -> list[dict]:
+    """If Firebase is detected, probe for open Realtime DB, Firestore, and Storage."""
+    findings: list[dict] = []
+    try:
+        html = subprocess.run(
+            ["curl", "-sk", "-m", "5", f"https://{ip}/"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout
+    except Exception:
+        return findings
+
+    fb_match = re.search(
+        r'["\']https?://([a-z0-9-]+)\.firebaseio\.com["\']', html
+    )
+    if not fb_match:
+        fb_match = re.search(r'"projectId"\s*:\s*"([a-z0-9-]+)"', html)
+    if not fb_match:
+        return findings
+
+    project = fb_match.group(1)
+
+    # 1. Realtime Database — unauthenticated read at root
+    try:
+        r = subprocess.run(
+            ["curl", "-sk", "-m", "5", f"https://{project}.firebaseio.com/.json"],
+            capture_output=True, text=True, timeout=8,
+        )
+        body = r.stdout.strip()
+        if body and body != "null" and "Permission denied" not in body and len(body) > 5:
+            findings.append({
+                "target": ip, "severity": "CRITICAL", "category": "baas",
+                "title": f"Firebase Realtime DB readable without auth (project: {project})",
+                "description": (
+                    "The Firebase Realtime Database returns data at the root path "
+                    "without authentication. Anyone can read the entire database."
+                ),
+                "evidence": f"GET https://{project}.firebaseio.com/.json → {body[:200]}",
+                "tool": "firebase-deep",
+            })
+    except Exception:
+        pass
+
+    # 2. Firestore — attempt to list a common collection
+    for collection in ["users", "profiles", "posts", "messages", "orders"]:
+        try:
+            url = (
+                f"https://firestore.googleapis.com/v1/projects/{project}"
+                f"/databases/(default)/documents/{collection}?pageSize=1"
+            )
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "5", url],
+                capture_output=True, text=True, timeout=8,
+            )
+            if '"documents"' in r.stdout and '"fields"' in r.stdout:
+                findings.append({
+                    "target": ip, "severity": "CRITICAL", "category": "baas",
+                    "title": f"Firestore collection '{collection}' readable without auth",
+                    "description": (
+                        f"The Firestore collection '{collection}' returns documents "
+                        f"without authentication. Security rules may be too permissive."
+                    ),
+                    "evidence": f"GET {url} → contains documents with fields",
+                    "tool": "firebase-deep",
+                })
+                break
+        except Exception:
+            continue
+
+    # 3. Firebase Storage — check default bucket
+    try:
+        storage_url = f"https://firebasestorage.googleapis.com/v0/b/{project}.appspot.com/o"
+        r = subprocess.run(
+            ["curl", "-sk", "-m", "5", storage_url],
+            capture_output=True, text=True, timeout=8,
+        )
+        if '"items"' in r.stdout:
+            findings.append({
+                "target": ip, "severity": "HIGH", "category": "baas",
+                "title": f"Firebase Storage bucket listable (project: {project})",
+                "description": (
+                    "The default Firebase Storage bucket returns a file listing "
+                    "without authentication."
+                ),
+                "evidence": f"GET {storage_url} → contains 'items' array",
+                "tool": "firebase-deep",
+            })
+    except Exception:
+        pass
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Unsafe JS patterns (eval, Function constructor, etc.)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_js_unsafe(run_id: str, ip: str, name: str) -> list[dict]:
+    """Detect unsafe JavaScript patterns in client bundles that indicate
+    potential code injection surfaces."""
+    findings: list[dict] = []
+    try:
+        html = subprocess.run(
+            ["curl", "-sk", "-m", "5", f"https://{ip}/"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout
+    except Exception:
+        return findings
+
+    js_urls = re.findall(r'(?:src|href)=["\']([^"\']*\.js[^"\']*)', html)
+    corpus = ""
+    for js_url in js_urls[:5]:
+        if js_url.startswith("/"):
+            full = f"https://{ip}{js_url.split('?')[0]}"
+        elif js_url.startswith("http"):
+            full = js_url.split("?")[0]
+        else:
+            continue
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "8", "--max-filesize", "5000000", full],
+                capture_output=True, text=True, timeout=12,
+            )
+            corpus += r.stdout
+        except Exception:
+            continue
+
+    if not corpus:
+        return findings
+
+    unsafe_patterns = [
+        (r'\beval\s*\(', "eval()", "Executes arbitrary strings as code — injection risk if input is user-controlled"),
+        (r'\bnew\s+Function\s*\(', "new Function()", "Dynamic function construction from strings — equivalent to eval()"),
+        (r'document\.write\s*\(', "document.write()", "Writes raw HTML to the page — XSS vector if input is tainted"),
+        (r'innerHTML\s*=\s*[^"\'`]', "innerHTML assignment", "Sets raw HTML — XSS vector if the value includes user input"),
+    ]
+
+    for pattern, label, desc in unsafe_patterns:
+        matches = re.findall(pattern, corpus)
+        if len(matches) >= 3:
+            findings.append({
+                "target": ip, "severity": "MEDIUM", "category": "application",
+                "title": f"Unsafe JS pattern: {label} used {len(matches)} times in bundle",
+                "description": desc,
+                "evidence": f"Found {len(matches)} occurrences of {label} in client JS bundles",
+                "tool": "js-unsafe",
+            })
+    return findings

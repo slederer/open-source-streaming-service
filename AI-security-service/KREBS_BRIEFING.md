@@ -149,4 +149,3 @@ The developer, in most cases, is a non-technical founder or a solo builder who c
 
 Stefan Lederer
 stefan@securityscanner.dev
-Signal: available on request

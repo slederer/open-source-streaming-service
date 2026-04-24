@@ -8055,8 +8055,8 @@ _LANDING_HTML = """<!DOCTYPE html>
     </button>
     <a href="#how" onclick="closeNav()">How it works</a>
     <a href="#pricing" onclick="closeNav()">Pricing</a>
-    <a href="#faq" onclick="closeNav()">FAQ</a>
     <a href="/blog">Blog</a>
+    <a href="/reports/2026-q2">Q2 Report</a>
     <a href="/docs/api">API</a>
     <a href="/login" class="signin">Sign in</a>
     <a href="/signup" class="cta">Get started</a>

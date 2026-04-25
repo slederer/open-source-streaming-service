@@ -2334,3 +2334,153 @@ def scan_target_js_unsafe(run_id: str, ip: str, name: str) -> list[dict]:
                 "tool": "js-unsafe",
             })
     return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — AI code fingerprinting (detect LLM-generated code patterns)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_AI_COMMENT_PATTERNS = [
+    r"//\s*Handle the case where",
+    r"//\s*TODO:?\s*implement",
+    r"//\s*This (?:function|component|hook) (?:handles|manages|creates|renders)",
+    r"//\s*(?:Create|Initialize|Setup|Configure) the",
+    r"//\s*(?:Check|Verify|Validate) (?:if|that|whether)",
+    r"//\s*(?:Return|Send|Display|Show|Render) the",
+    r"//\s*(?:Update|Modify|Change) the",
+    r"//\s*(?:Add|Remove|Delete) (?:the|a|an)",
+    r"/\*\*\s*\n\s*\*\s*(?:This|A|The) (?:function|component|class|method)",
+]
+
+_AI_CODE_PATTERNS = [
+    r"const\s+handle\w+\s*=\s*(?:async\s*)?\(\)\s*=>",
+    r"(?:placeholder|dummy|example|sample|test)(?:Data|Value|Text|Name|Email|Password)",
+    r"console\.log\(['\"](?:TODO|FIXME|DEBUG|HACK)",
+    r"catch\s*\(\w+\)\s*\{\s*(?:console\.(?:log|error)|//)",
+    r"(?:your|my|the)(?:ApiKey|SecretKey|Token|Password)\s*[:=]",
+]
+
+_HALLUCINATED_FUNCTIONS = {
+    "supabase": [
+        "auth.verifyToken", "auth.validateSession", "auth.checkPermission",
+        "auth.refreshSession", "auth.verifyOTP",
+        "from.upsertMany", "from.bulkInsert", "from.findOne",
+        "storage.createBucket", "storage.deleteBucket",
+        "realtime.subscribe", "realtime.unsubscribe",
+    ],
+    "firebase": [
+        "auth.verifyToken", "auth.validateUser",
+        "firestore.bulkWrite", "firestore.findOne", "firestore.aggregate",
+        "storage.listFiles", "storage.createFolder",
+    ],
+    "stripe": [
+        "charges.capture", "charges.void",
+        "customers.findByEmail", "customers.search",
+        "subscriptions.pause", "subscriptions.unpause",
+    ],
+    "openai": [
+        "chat.complete", "completions.stream",
+        "models.finetune", "embeddings.create_batch",
+    ],
+}
+
+
+def scan_target_ai_fingerprint(run_id: str, ip: str, name: str) -> list[dict]:
+    """Analyze JS bundle for patterns indicating LLM-generated code.
+    Reports: estimated AI-generation percentage + specific hallucination risks."""
+    findings: list[dict] = []
+    try:
+        html = subprocess.run(
+            ["curl", "-sk", "-m", "5", f"https://{ip}/"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout
+    except Exception:
+        return findings
+
+    js_urls = re.findall(r'(?:src|href)=["\']([^"\']*\.js[^"\']*)', html)
+    corpus = ""
+    for js_url in js_urls[:5]:
+        if js_url.startswith("/"):
+            full = f"https://{ip}{js_url.split('?')[0]}"
+        elif js_url.startswith("http"):
+            full = js_url.split("?")[0]
+        else:
+            continue
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "8", "--max-filesize", "5000000", full],
+                capture_output=True, text=True, timeout=12,
+            )
+            corpus += r.stdout
+        except Exception:
+            continue
+
+    if len(corpus) < 500:
+        return findings
+
+    # Count AI-generated code signals
+    ai_comment_hits = sum(len(re.findall(p, corpus)) for p in _AI_COMMENT_PATTERNS)
+    ai_code_hits = sum(len(re.findall(p, corpus)) for p in _AI_CODE_PATTERNS)
+    total_lines = corpus.count("\n") or 1
+    total_comments = len(re.findall(r"//[^\n]+|/\*[\s\S]*?\*/", corpus))
+
+    ai_signal = ai_comment_hits + ai_code_hits
+    if total_comments > 0:
+        ai_comment_ratio = ai_comment_hits / total_comments
+    else:
+        ai_comment_ratio = 0
+
+    # Estimate AI-generation percentage (heuristic)
+    if ai_signal > 20 and ai_comment_ratio > 0.3:
+        ai_pct = min(95, 40 + ai_signal)
+    elif ai_signal > 10:
+        ai_pct = min(80, 30 + ai_signal)
+    elif ai_signal > 5:
+        ai_pct = min(60, 20 + ai_signal * 2)
+    else:
+        ai_pct = 0
+
+    if ai_pct >= 30:
+        findings.append({
+            "target": ip, "severity": "INFO", "category": "code-quality",
+            "title": f"~{ai_pct}% of client code appears AI-generated",
+            "description": (
+                f"Detected {ai_comment_hits} AI-style comments and {ai_code_hits} "
+                f"LLM-typical code patterns in the JS bundle. AI-generated code has "
+                f"a higher false-security-assumption rate — review auth middleware, "
+                f"input validation, and secret handling in AI-generated sections."
+            ),
+            "evidence": (
+                f"AI comment patterns: {ai_comment_hits} hits\n"
+                f"AI code patterns: {ai_code_hits} hits\n"
+                f"Total comments: {total_comments}\n"
+                f"AI comment ratio: {ai_comment_ratio:.0%}\n"
+                f"Bundle size: {len(corpus):,} chars"
+            ),
+            "tool": "ai-fingerprint",
+        })
+
+    # Hallucination detection — check for function calls that don't exist
+    for lib, funcs in _HALLUCINATED_FUNCTIONS.items():
+        if lib not in corpus.lower():
+            continue
+        for func in funcs:
+            parts = func.split(".")
+            pattern = r"\." + r"\.".join(re.escape(p) for p in parts) + r"\s*\("
+            matches = re.findall(pattern, corpus)
+            if matches:
+                findings.append({
+                    "target": ip, "severity": "HIGH", "category": "code-quality",
+                    "title": f"Possible hallucinated function: {lib}.{func}()",
+                    "description": (
+                        f"The bundle calls `{lib}.{func}()` which does not exist in the "
+                        f"official {lib} SDK. This is a common LLM hallucination pattern — "
+                        f"the AI invented a security-related function that gives false "
+                        f"confidence. The call silently fails or throws at runtime, leaving "
+                        f"the security check unimplemented."
+                    ),
+                    "evidence": f"Found {len(matches)} call(s) to .{func}() in JS bundle",
+                    "tool": "ai-hallucination",
+                })
+
+    return findings

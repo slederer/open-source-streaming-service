@@ -2676,6 +2676,7 @@ try:
         scan_target_typosquat_deps,
         scan_target_xss, scan_target_cookies,
         scan_target_firebase_deep, scan_target_js_unsafe,
+        scan_target_ai_fingerprint,
     )
     from scanner.ai_triage import (
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -2698,6 +2699,7 @@ except ImportError:
         scan_target_typosquat_deps,
         scan_target_xss, scan_target_cookies,
         scan_target_firebase_deep, scan_target_js_unsafe,
+        scan_target_ai_fingerprint,
     )
     from scanner_ai_triage import (  # type: ignore
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -2756,6 +2758,7 @@ SCAN_MODULES = [
     ("cookie_audit",    "Cookie security audit",            "scan_target_cookies"),
     ("firebase_deep",   "Firebase rules deep probe",        "scan_target_firebase_deep"),
     ("js_unsafe",       "Unsafe JS patterns (eval, etc.)",  "scan_target_js_unsafe"),
+    ("ai_fingerprint",  "AI code fingerprint + hallucination detection", "scan_target_ai_fingerprint"),
     # Structured AI modules (replaces the retired `ai_chain` fuzzy reasoner).
     # Each has narrow structured I/O and live-verifies its own claims before
     # emitting a finding.
@@ -5213,6 +5216,219 @@ async def get_run_pdf(request: Request, run_id: str, target: str = ""):
             html_report,
             headers={"Content-Disposition": f'attachment; filename="scan-report-{run_id}.html"'},
         )
+
+
+# ── Compliance Report — OWASP Top 10 mapping ─────────────────────────────────
+
+_OWASP_MAP = {
+    "A01:2021": ("Broken Access Control", ["supabase-audit", "idor-probe", "cors-audit", "oauth-probe"]),
+    "A02:2021": ("Cryptographic Failures", ["openssl", "secret-scan", "js-secret-scan", "jwt-audit"]),
+    "A03:2021": ("Injection", ["xss-probe", "api-fuzz", "js-unsafe", "prompt-injection"]),
+    "A04:2021": ("Insecure Design", ["ai-fingerprint", "ai-hallucination"]),
+    "A05:2021": ("Security Misconfiguration", ["curl", "infra-leak", "cookie-audit", "firebase-deep"]),
+    "A06:2021": ("Vulnerable Components", ["js-cve", "nuclei", "supply-chain"]),
+    "A07:2021": ("Authentication Failures", ["session-entropy", "jwt-weak-secret", "default-creds"]),
+    "A08:2021": ("Data Integrity Failures", ["takeover", "typosquat-deps"]),
+    "A09:2021": ("Logging & Monitoring Failures", []),
+    "A10:2021": ("Server-Side Request Forgery", ["ssrf-fetch"]),
+}
+
+
+@app.get("/api/runs/{run_id}/compliance")
+async def get_compliance_report(request: Request, run_id: str):
+    """Generate OWASP Top 10 compliance mapping for a scan run."""
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    if not _verify_run_ownership(run_id, user["user_id"]):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    with get_db() as db:
+        run = db.execute("SELECT * FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        findings = [dict(r) for r in db.execute(
+            "SELECT * FROM findings WHERE run_id=? ORDER BY severity", (run_id,)
+        ).fetchall()]
+
+    target = dict(run).get("target", "unknown")
+    summary = json.loads(dict(run).get("summary_json") or "{}") if dict(run).get("summary_json") else {}
+    grade = summary.get("risk_grade", "?")
+
+    owasp_results = []
+    for code, (name, tools) in _OWASP_MAP.items():
+        mapped = [f for f in findings if f.get("tool") in tools]
+        crits = len([f for f in mapped if f["severity"] == "CRITICAL"])
+        highs = len([f for f in mapped if f["severity"] == "HIGH"])
+        meds = len([f for f in mapped if f["severity"] == "MEDIUM"])
+        status = "FAIL" if crits > 0 else "WARN" if highs > 0 else "ATTENTION" if meds > 0 else "PASS"
+        owasp_results.append({
+            "code": code, "name": name, "status": status,
+            "critical": crits, "high": highs, "medium": meds,
+            "findings": [{"severity": f["severity"], "title": f["title"], "tool": f["tool"]}
+                         for f in mapped[:5]],
+        })
+
+    return {
+        "target": target, "run_id": run_id, "grade": grade,
+        "framework": "OWASP Top 10 (2021)",
+        "categories": owasp_results,
+        "pass_count": sum(1 for r in owasp_results if r["status"] == "PASS"),
+        "fail_count": sum(1 for r in owasp_results if r["status"] == "FAIL"),
+        "total_mapped_findings": sum(r["critical"] + r["high"] + r["medium"] for r in owasp_results),
+    }
+
+
+@app.get("/api/runs/{run_id}/compliance/pdf")
+async def get_compliance_pdf(request: Request, run_id: str):
+    """OWASP compliance report as PDF."""
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    if not _verify_run_ownership(run_id, user["user_id"]):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    with get_db() as db:
+        run = db.execute("SELECT * FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        run = dict(run)
+        findings = [dict(r) for r in db.execute(
+            "SELECT * FROM findings WHERE run_id=?", (run_id,)
+        ).fetchall()]
+
+    target = run.get("target", "unknown")
+    summary = json.loads(run.get("summary_json") or "{}") if run.get("summary_json") else {}
+    grade = summary.get("risk_grade", "?")
+
+    rows_html = ""
+    for code, (name, tools) in _OWASP_MAP.items():
+        mapped = [f for f in findings if f.get("tool") in tools]
+        crits = len([f for f in mapped if f["severity"] == "CRITICAL"])
+        highs = len([f for f in mapped if f["severity"] == "HIGH"])
+        status = "FAIL" if crits else "WARN" if highs else "PASS"
+        color = {"FAIL": "#dc2626", "WARN": "#f97316", "PASS": "#22c55e"}.get(status, "#6b7280")
+        top_findings = "".join(f"<li>{f['severity']}: {f['title'][:60]}</li>" for f in mapped[:3])
+        rows_html += f"""<tr>
+            <td style="padding:10px;border-bottom:1px solid #e5e7eb;font-weight:600;">{code}</td>
+            <td style="padding:10px;border-bottom:1px solid #e5e7eb;">{name}</td>
+            <td style="padding:10px;border-bottom:1px solid #e5e7eb;color:{color};font-weight:700;">{status}</td>
+            <td style="padding:10px;border-bottom:1px solid #e5e7eb;font-size:0.8rem;">{f"C:{crits} H:{highs}" if mapped else "—"}</td>
+            <td style="padding:10px;border-bottom:1px solid #e5e7eb;font-size:0.78rem;"><ul style="margin:0;padding-left:16px;">{top_findings or "<li>No findings</li>"}</ul></td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>OWASP Compliance Report — {target}</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; color: #111827; padding: 40px; max-width: 950px; margin: 0 auto; font-size: 13px; }}
+h1 {{ font-size: 1.5rem; }} h2 {{ font-size: 1.1rem; margin-top: 24px; }}
+.grade {{ display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 10px; font-weight: 800; font-size: 1.2rem; color: white; }}
+.grade-A {{ background: #14532d; }} .grade-B {{ background: #172554; }} .grade-C {{ background: #422006; }} .grade-D {{ background: #431407; }} .grade-F {{ background: #450a0a; }}
+table {{ width: 100%; border-collapse: collapse; }} th {{ text-align: left; padding: 8px 10px; font-size: 0.7rem; color: #6b7280; text-transform: uppercase; border-bottom: 2px solid #e5e7eb; }}
+.footer {{ margin-top: 30px; padding-top: 16px; border-top: 1px solid #e5e7eb; color: #9ca3af; font-size: 0.75rem; }}
+</style></head><body>
+<div style="display:flex;align-items:center;gap:14px;margin-bottom:16px;">
+  <div class="grade grade-{grade}">{grade}</div>
+  <div><h1 style="margin:0;">OWASP Top 10 Compliance Report</h1>
+  <div style="color:#6b7280;font-size:0.85rem;">{target} · Scan #{run_id} · {run.get("started_at","")[:10]}</div></div>
+</div>
+<h2>OWASP Top 10 (2021) Assessment</h2>
+<table><thead><tr><th>Code</th><th>Category</th><th>Status</th><th>Findings</th><th>Details</th></tr></thead>
+<tbody>{rows_html}</tbody></table>
+<div class="footer">
+<p>Generated by Security Scanner · securityscanner.dev</p>
+<p>This report maps automated scan findings to OWASP Top 10 categories. It is not a substitute for a manual penetration test or formal compliance audit.</p>
+</div></body></html>"""
+
+    try:
+        from weasyprint import HTML as _WH
+        pdf = _WH(string=html).write_pdf()
+        return Response(content=pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="owasp-report-{run_id}.pdf"'})
+    except ImportError:
+        return HTMLResponse(html, headers={"Content-Disposition": f'attachment; filename="owasp-report-{run_id}.html"'})
+
+
+# ── Disclosure automation — one-click contact discovery + email draft ─────────
+
+@app.get("/api/runs/{run_id}/disclosure")
+async def generate_disclosure(request: Request, run_id: str, target: str = ""):
+    """Generate a disclosure draft for CRIT findings on a target."""
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    if not _verify_run_ownership(run_id, user["user_id"]):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    with get_db() as db:
+        q = ("SELECT * FROM findings WHERE run_id=? AND severity='CRITICAL'"
+             + (" AND target=?" if target else "")
+             + " ORDER BY target, tool")
+        params = [run_id, target] if target else [run_id]
+        crits = [dict(r) for r in db.execute(q, params).fetchall()]
+
+    if not crits:
+        return JSONResponse({"error": "No CRITICAL findings to disclose"}, status_code=404)
+
+    # Group by target
+    by_target = {}
+    for f in crits:
+        t = f["target"]
+        if t not in by_target:
+            by_target[t] = []
+        by_target[t].append(f)
+
+    disclosures = []
+    for host, findings_list in by_target.items():
+        table_names = []
+        for f in findings_list:
+            m = re.search(r"table '([^']+)'", f.get("title", ""))
+            if m:
+                table_names.append(m.group(1))
+
+        tables_str = ", ".join(table_names[:10])
+        if len(table_names) > 10:
+            tables_str += f", +{len(table_names)-10} more"
+
+        subject = f"Security disclosure: {len(findings_list)} critical findings on {host}"
+        body = (
+            f"Hi,\n\n"
+            f"I'm [YOUR NAME], using Security Scanner (securityscanner.dev).\n"
+            f"We scanned {host} and found {len(findings_list)} CRITICAL issue(s).\n\n"
+        )
+
+        if table_names:
+            body += (
+                f"Your Supabase project has Row Level Security (RLS) OFF on {len(table_names)} table(s):\n"
+                f"  {tables_str}\n\n"
+                f"Anyone with the public anon key (in your JS bundle) can read every row.\n\n"
+                f"Fix: ALTER TABLE <name> ENABLE ROW LEVEL SECURITY;\n\n"
+            )
+        else:
+            for f in findings_list[:3]:
+                body += f"  - [{f['severity']}] {f['title']}\n"
+            body += "\n"
+
+        body += (
+            f"We disclosed this privately before publishing anything.\n"
+            f"Happy to re-scan after you fix (free) — just reply.\n\n"
+            f"[YOUR NAME]\n"
+            f"[YOUR EMAIL]\n"
+        )
+
+        disclosures.append({
+            "host": host,
+            "finding_count": len(findings_list),
+            "tables": table_names,
+            "subject": subject,
+            "body": body,
+            "findings_summary": [
+                {"severity": f["severity"], "title": f["title"], "tool": f["tool"]}
+                for f in findings_list[:10]
+            ],
+        })
+
+    return {"disclosures": disclosures, "total_targets": len(disclosures), "total_findings": len(crits)}
 
 
 # ── Monitoring + Alerts (item #11) ───────────────────────────────────────────

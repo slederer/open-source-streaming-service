@@ -8621,7 +8621,7 @@ async function runQuickScan(e) {
       <div class="step">
         <div class="num">STEP 2</div>
         <h3>We run 80+ modules</h3>
-        <p>Transport &amp; headers, Supabase RLS probe with real table names from your JS bundle, GraphQL introspection audit, AI-key leak detection (Anthropic, OpenAI, AWS, Stripe), subdomain takeover (Vercel, Netlify, Unbounce), CORS / CSP / TLS / nuclei 8k+ CVE templates, prompt-injection probing, and more.</p>
+        <p>Transport &amp; headers, Supabase RLS probe, auth bypass on API endpoints, signup mass-assignment, payment webhook verification, SQL injection, SSTI, IDOR, GraphQL audit, AI-key leak detection, subdomain takeover, admin panel exposure, PII leak scanning, CORS / CSP / TLS / nuclei 8k+ CVE templates, and more.</p>
       </div>
       <div class="step">
         <div class="num">STEP 3</div>
@@ -8712,9 +8712,13 @@ async function runQuickScan(e) {
           <li><strong>Exposed endpoints</strong><small>/docs, /redoc, /.env, /.git, /actuator/env, /terraform.tfstate, /docker-compose.yml — 25 paths</small></li>
           <li><strong>OpenAPI audit</strong><small>parses /openapi.json, flags missing security on every operation</small></li>
           <li><strong>API fuzz</strong><small>SQL / NoSQL / LDAP injection signatures</small></li>
+          <li><strong>SQL injection</strong><small>boolean-based + error-based SQLi detection on parameterized endpoints</small></li>
+          <li><strong>SSTI probe</strong><small>server-side template injection in Jinja2, Mako, ERB, FreeMarker</small></li>
           <li><strong>GraphQL probe</strong><small>introspection + password-field detection + dangerous mutations + Hasura anonymous-role audit</small></li>
           <li><strong>CORS + CSP audit</strong><small>wildcard-origin + credentials, unsafe-eval / unsafe-inline</small></li>
           <li><strong>Rate limit probe</strong><small>brute-force resistance check on auth paths</small></li>
+          <li><strong>API enumeration</strong><small>discovers /api/v2, /api/internal, /api/debug, /api/beta — flags auth regressions</small></li>
+          <li><strong>Error leak probe</strong><small>triggers verbose errors to find stack traces, file paths, DB details</small></li>
         </ul>
       </div>
 
@@ -8725,6 +8729,13 @@ async function runQuickScan(e) {
           <li><strong>OAuth probe</strong><small>open-redirect on redirect_uri across 7 common paths</small></li>
           <li><strong>Session entropy</strong><small>Shannon entropy + sequential-token detection on Set-Cookie</small></li>
           <li><strong>Auth probes</strong><small>username enumeration, weak-password acceptance</small></li>
+          <li><strong>Auth bypass</strong><small>tests 35+ sensitive API endpoints (/api/users, /api/admin, /api/billing) without auth tokens</small></li>
+          <li><strong>Signup mass-assignment</strong><small>probes register endpoints for role=admin, isAdmin=true privilege escalation</small></li>
+          <li><strong>Mass assignment</strong><small>PATCH/PUT endpoints tested for privilege escalation via extra fields</small></li>
+          <li><strong>Login brute-force</strong><small>rate limiting on login, signup, password-reset endpoints</small></li>
+          <li><strong>Payment webhook bypass</strong><small>sends unsigned Stripe/Paddle events — flags missing signature verification</small></li>
+          <li><strong>Admin panel exposure</strong><small>probes /admin, /dashboard, /_admin, /cms + admin API endpoints</small></li>
+          <li><strong>PII exposure</strong><small>scans API list endpoints for leaked emails, phones, password hashes, SSNs</small></li>
           <li><strong>IDOR / BOLA sweep</strong><small>3-ID sweep on discovered endpoints, PII-leak detection in response bodies</small></li>
         </ul>
       </div>
@@ -9552,7 +9563,7 @@ async def report_q2_2026():
     </div>
 
     <h2>Methodology</h2>
-    <p>Targets sourced from certificate transparency logs, Google search, and platform directories. All scans are read-only (GET + minimal POST probes). <strong>70+ scanner modules</strong> per target. Every CRIT finding verified reproducible before disclosure. Private disclosures sent to all identifiable owners before publication.</p>
+    <p>Targets sourced from certificate transparency logs, Google search, and platform directories. All scans are read-only (GET + minimal POST probes). <strong>80+ scanner modules</strong> per target. Every CRIT finding verified reproducible before disclosure. Private disclosures sent to all identifiable owners before publication.</p>
 
     <h2>What we scan for</h2>
     <p>Supabase RLS · Firebase rules · XSS · IDOR · CORS · CSP bypass · Cookie security · GraphQL mutations · WebSocket auth · Open redirect · DNS zone transfer · API key exposure (38 patterns) · JS prototype pollution · Dependency confusion · AI code fingerprinting · LLM hallucination detection · OAuth redirect · JWT weak secrets · Subdomain takeover · Nuclei CVE templates · and more.</p>
@@ -9597,7 +9608,7 @@ async function _rptScan(e) {{
       const icon=f.pass?'\\u2705':f.severity==='CRITICAL'||f.severity==='HIGH'?'\\u274C':'\\u26A0\\uFE0F';
       html+='<div style="padding:5px 0;border-bottom:1px solid #1f2937;">'+icon+' '+f.title+'</div>';
     }});
-    html+='<div style="margin-top:12px;text-align:center;"><a href="/signup" style="background:#dc2626;color:white;padding:10px 20px;border-radius:8px;font-weight:600;text-decoration:none;display:inline-block;">Get full 70-module scan free \\u2192</a></div></div>';
+    html+='<div style="margin-top:12px;text-align:center;"><a href="/signup" style="background:#dc2626;color:white;padding:10px 20px;border-radius:8px;font-weight:600;text-decoration:none;display:inline-block;">Get full 80-module scan free \\u2192</a></div></div>';
     results.innerHTML=html;
   }} catch(err) {{ results.innerHTML='<p style="color:#dc2626;">Error \\u2014 try again</p>'; }}
   btn.disabled=false; btn.textContent='Scan again';
@@ -9797,13 +9808,16 @@ async def platform_landing(platform: str):
 <ul>
 <li><strong>Supabase RLS</strong> — extracts real table names from your JS bundle, tests each with the anon key</li>
 <li><strong>API keys in bundles</strong> — OpenAI, Anthropic, Stripe, Google, AWS keys shipped client-side</li>
-<li><strong>Authentication</strong> — IDOR, OAuth misconfig, session entropy, JWT weak secrets</li>
-<li><strong>Infrastructure</strong> — exposed /.env, /.git, subdomain takeover, DNS issues</li>
+<li><strong>Authentication</strong> — IDOR, OAuth misconfig, session entropy, JWT weak secrets, auth bypass on API endpoints</li>
+<li><strong>Mass assignment</strong> — signup privilege escalation (role=admin), PATCH/PUT field injection</li>
+<li><strong>Payment security</strong> — Stripe/Paddle webhook signature bypass, unsigned event acceptance</li>
+<li><strong>Injection</strong> — SQL injection (boolean + error-based), server-side template injection, XSS</li>
+<li><strong>Infrastructure</strong> — exposed /.env, /.git, admin panels, internal API endpoints, subdomain takeover</li>
 <li><strong>AI code quality</strong> — hallucinated functions, unsafe eval(), hardcoded credentials</li>
-<li><strong>70+ total modules</strong> — nuclei CVE templates, XSS, CORS, CSP bypass, and more</li>
+<li><strong>80+ total modules</strong> — nuclei CVE templates, CORS, CSP bypass, PII exposure, and more</li>
 </ul>
 <h2>Try it free</h2>
-<p>Paste your {data['name']} app URL on our homepage for a quick 10-second scan. For the full 70-module audit, sign up — one free scan, no card.</p>
+<p>Paste your {data['name']} app URL on our homepage for a quick 10-second scan. For the full 80-module audit, sign up — one free scan, no card.</p>
 <a href="/" class="cta">Scan your {data['name']} app free →</a>
 <h2>Research</h2>
 <ul>
@@ -9875,7 +9889,7 @@ async function runQuickScan(e) {{
       const icon=f.pass?'✅':f.severity==='CRITICAL'||f.severity==='HIGH'?'❌':'⚠️';
       html+='<div style="padding:6px 0;border-bottom:1px solid #1f2937;">'+icon+' '+f.title+'</div>';
     }});
-    html+='<div style="margin-top:14px;text-align:center;"><a href="/signup" class="cta">Get full 70-module scan free →</a></div></div>';
+    html+='<div style="margin-top:14px;text-align:center;"><a href="/signup" class="cta">Get full 80-module scan free →</a></div></div>';
     results.innerHTML=html;
   }} catch(err) {{ results.innerHTML='<p style="color:#dc2626;">Error — try again</p>'; }}
   btn.disabled=false; btn.textContent='Check again';
@@ -9925,7 +9939,7 @@ async def vuln_page(vuln_slug: str):
 <h2>How to fix</h2>
 <pre>{vuln['fix']}</pre>
 <h2>Scan for this vulnerability</h2>
-<p>Security Scanner automatically checks for this issue as part of its 70+ module scan. <a href="/">Try it free</a> — no signup needed for the quick scan.</p>
+<p>Security Scanner automatically checks for this issue as part of its 80+ module scan. <a href="/">Try it free</a> — no signup needed for the quick scan.</p>
 <a href="/" class="cta">Check your app now →</a>
 <h2>Related reading</h2>
 <ul>
@@ -10010,7 +10024,7 @@ async def integration_doc(slug: str):
 <li>Your deployed app URL</li>
 </ul>
 <h2>How it works</h2>
-<p>The webhook triggers a full 70-module scan on your deployed URL. When the scan completes, you can check the grade and findings via the API or dashboard. Set <code>min_grade</code> to fail the pipeline if security drops below your threshold.</p>
+<p>The webhook triggers a full 80-module scan on your deployed URL. When the scan completes, you can check the grade and findings via the API or dashboard. Set <code>min_grade</code> to fail the pipeline if security drops below your threshold.</p>
 <a href="/docs/api" class="cta">Full API docs →</a>
 </div></body></html>""")
 

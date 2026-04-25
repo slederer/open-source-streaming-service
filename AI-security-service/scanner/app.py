@@ -9416,27 +9416,36 @@ async def report_q2_2026():
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>State of Vibe-Coded Security — Q2 2026</title>
-<meta name="description" content="We scanned {total_targets:,}+ deployed apps built with AI tools. Here's what's leaking.">
+<meta name="description" content="We scanned {total_targets:,}+ deployed apps built with AI tools. {total_crits} critical vulnerabilities. Here's what's leaking.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:type" content="article">
 <meta property="og:title" content="State of Vibe-Coded Security — Q2 2026">
-<meta property="og:description" content="We scanned {total_targets:,}+ deployed apps. {total_crits} CRITs. Here's the breakdown.">
+<meta property="og:description" content="{total_targets:,} apps scanned. {total_crits} CRITs. 7% of Lovable/Bolt apps have wide-open databases. YC companies: 0%.">
 <meta property="og:image" content="https://securityscanner.dev/og.png">
 <meta name="twitter:card" content="summary_large_image">
 <style>{_BLOG_CSS}
-  .big-stat {{ text-align: center; padding: 24px 0; }}
-  .big-stat .num {{ font-size: 3rem; font-weight: 800; letter-spacing: -0.03em; color: #dc2626; }}
-  .big-stat .label {{ font-size: 0.85rem; color: #9ca3af; margin-top: 4px; }}
-  .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin: 32px 0; }}
-  .stat-box {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 20px; text-align: center; }}
+  .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; margin: 28px 0; }}
+  .stat-box {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 18px; text-align: center; }}
   .stat-box .num {{ font-size: 1.8rem; font-weight: 700; }}
-  .stat-box .label {{ font-size: 0.75rem; color: #9ca3af; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; }}
-  .rate-table {{ width: 100%; border-collapse: collapse; margin: 24px 0; }}
+  .stat-box .label {{ font-size: 0.72rem; color: #9ca3af; margin-top: 5px; text-transform: uppercase; letter-spacing: 0.05em; }}
+  .rate-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
   .rate-table th {{ text-align: left; padding: 10px 12px; font-size: 0.72rem; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #1f2937; }}
   .rate-table td {{ padding: 10px 12px; border-bottom: 1px solid #1f2937; font-size: 0.9rem; }}
   .rate-table .rate {{ font-weight: 700; }}
   .rate-table .zero {{ color: #22c55e; }}
   .rate-table .high {{ color: #dc2626; }}
+  .case {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 18px 20px; margin-bottom: 14px; }}
+  .case .sev {{ display: inline-block; background: #450a0a; color: #fca5a5; padding: 2px 8px; border-radius: 4px; font-size: 0.68rem; font-weight: 700; letter-spacing: 0.03em; margin-bottom: 8px; }}
+  .case h3 {{ font-size: 1rem; font-weight: 600; margin-bottom: 6px; }}
+  .case p {{ color: #9ca3af; font-size: 0.88rem; margin: 0; }}
+  .scan-cta {{ background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 28px; text-align: center; margin: 32px 0; }}
+  .scan-cta h3 {{ font-size: 1.2rem; margin-bottom: 8px; }}
+  .scan-cta p {{ color: #9ca3af; margin-bottom: 16px; font-size: 0.9rem; }}
+  .scan-cta form {{ display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; max-width: 480px; margin: 0 auto; }}
+  .scan-cta input {{ flex: 1; min-width: 200px; background: #0a0e17; border: 1px solid #1f2937; color: #e5e7eb; padding: 11px 14px; border-radius: 8px; font-size: 0.95rem; font-family: inherit; }}
+  .scan-cta button {{ background: #dc2626; color: white; border: none; padding: 11px 22px; border-radius: 8px; font-weight: 600; font-size: 0.95rem; cursor: pointer; font-family: inherit; }}
+  .scan-cta button:hover {{ background: #b91c1c; }}
+  @media (max-width: 600px) {{ .stat-grid {{ grid-template-columns: repeat(2, 1fr); }} }}
 </style></head>
 <body>
 {_render_blog_nav()}
@@ -9445,20 +9454,32 @@ async def report_q2_2026():
   <header class="post-header">
     <div class="row">
       <span class="tag-pill" style="background:#dc26261a;color:#dc2626;border:1px solid #dc262633;">Report</span>
-      <span class="meta-text">April 2026</span>
+      <span class="meta-text">April 2026 · Updated live</span>
     </div>
     <h1 class="post-title">State of Vibe-Coded Security</h1>
-    <p class="lead">Q2 2026 — aggregate findings from {total_targets:,} deployed apps built with AI coding tools.</p>
+    <p class="lead">We scanned <strong>{total_targets:,} deployed apps</strong> built with AI coding tools. Here's what's leaking — and what's not.</p>
   </header>
   <article>
+
     <div class="stat-grid">
       <div class="stat-box"><div class="num">{total_targets:,}</div><div class="label">Apps scanned</div></div>
       <div class="stat-box"><div class="num" style="color:#dc2626;">{total_crits}</div><div class="label">Critical findings</div></div>
-      <div class="stat-box"><div class="num" style="color:#f97316;">{total_highs}</div><div class="label">High findings</div></div>
+      <div class="stat-box"><div class="num" style="color:#f97316;">{total_highs:,}</div><div class="label">High findings</div></div>
       <div class="stat-box"><div class="num">{total_findings:,}</div><div class="label">Total findings</div></div>
-      <div class="stat-box"><div class="num">{crit_targets}</div><div class="label">Apps with CRITs</div></div>
-      <div class="stat-box"><div class="num">{total_runs:,}</div><div class="label">Scan runs</div></div>
     </div>
+
+    <div class="scan-cta">
+      <h3>Is your app vulnerable?</h3>
+      <p>Paste your URL — quick results in 10 seconds, no signup.</p>
+      <form onsubmit="return _rptScan(event)">
+        <input type="text" id="rpt-url" required placeholder="https://your-app.com">
+        <button type="submit" id="rpt-btn">Scan now</button>
+      </form>
+      <div id="rpt-results" style="margin-top:14px;text-align:left;"></div>
+    </div>
+
+    <h2>The headline number</h2>
+    <p><strong>7% of Lovable and Bolt apps have databases anyone can read.</strong> YC-backed companies, scanned as a control group: <strong>0%</strong>. The tools share the same backend (Supabase), the same framework (React), the same deployment pipeline. The difference is what the developer knows — and what the AI code generator assumes.</p>
 
     <h2>Per-platform CRIT rate</h2>
     <table class="rate-table">
@@ -9470,22 +9491,61 @@ async def report_q2_2026():
     <tr><td>Replit</td><td>194</td><td>4</td><td class="rate">2.1%</td></tr>
     <tr><td>Vercel (v0/AI)</td><td>67</td><td>2</td><td class="rate">3.0%</td></tr>
     <tr><td>Streamlit</td><td>90</td><td>0</td><td class="rate zero">0%</td></tr>
-    <tr><td>Other</td><td>53</td><td>3</td><td class="rate">5.7%</td></tr>
+    <tr><td>Other (Heroku, Render, Fly, Netlify)</td><td>53</td><td>3</td><td class="rate">5.7%</td></tr>
     </tbody></table>
 
-    <h2>Finding breakdown</h2>
-    <p>Top CRIT categories across all scans:</p>
+    <h2>Real cases — real people affected</h2>
+
+    <div class="case">
+      <span class="sev">CRITICAL</span>
+      <h3>Therapist coaching site — 15 tables exposed</h3>
+      <p>Payment methods, future session schedules, subscriber lists, and email delivery logs for paying therapy clients. Built with Lovable.</p>
+    </div>
+    <div class="case">
+      <span class="sev">CRITICAL</span>
+      <h3>Booking platform — 43 tables including customer chat logs</h3>
+      <p>Every customer record, booking request, chat message, and uploaded file. The largest single exposure we found.</p>
+    </div>
+    <div class="case">
+      <span class="sev">CRITICAL</span>
+      <h3>Health booking app — patient data via URL manipulation</h3>
+      <p>Change <code>/api/bookings/1</code> to <code>/api/bookings/2</code> — returns another patient's name, phone, email, and appointment. No auth check. Built with Replit.</p>
+    </div>
+    <div class="case">
+      <span class="sev">CRITICAL</span>
+      <h3>CRM with 22 tables — companies, contacts, customers, partners</h3>
+      <p>An entire business CRM's data readable by anyone with the public anon key. Accounting references, lead sources, manager assignments. Built with Lovable.</p>
+    </div>
+    <div class="case">
+      <span class="sev">CRITICAL</span>
+      <h3>College student management — enrollment records exposed</h3>
+      <p>Batch student data, profiles, subjects, and support tickets for an Indian engineering college. Protected under India's DPDP Act.</p>
+    </div>
+
+    <h2>5 finding categories beyond Supabase RLS</h2>
     <ul>
       <li><strong>Supabase RLS off</strong> — 96% of all CRITs. Tables with real user data readable by anyone with the public anon key.</li>
-      <li><strong>API keys in JS bundles</strong> — OpenAI, Anthropic, Google, Stripe keys shipped client-side. 15% of Bolt.host apps affected.</li>
-      <li><strong>IDOR / broken access control</strong> — sequential IDs on API endpoints returning other users' data.</li>
-      <li><strong>Unauthed APIs</strong> — entire OpenAPI specs with zero security schemes defined.</li>
-      <li><strong>Private key material in production</strong> — PEM-format keys bundled by Webpack/Vite.</li>
+      <li><strong>API keys in JS bundles</strong> — OpenAI, Anthropic, Google, Stripe keys shipped client-side. 15% of Bolt.host apps. One Replit app shipped Anthropic + OpenAI + Google keys simultaneously.</li>
+      <li><strong>IDOR / broken access control</strong> — sequential IDs on API endpoints returning other users' data. Health records, booking PII.</li>
+      <li><strong>Zero-auth APIs</strong> — entire OpenAPI specs with no security schemes. 7–12 public endpoints per app, including destructive operations.</li>
+      <li><strong>Private keys + AI hallucinations</strong> — PEM-format keys bundled by Webpack/Vite. AI-generated code calling SDK functions that don't exist, giving false security confidence.</li>
     </ul>
 
+    <div class="scan-cta" style="background:linear-gradient(135deg, #111827 0%, #1a1020 100%); border-color:#2d1f3d;">
+      <h3>Get the full scan on your app</h3>
+      <p>70+ modules: Supabase RLS deep probe, XSS, IDOR, API key detection, Firebase audit, AI code fingerprinting, OWASP compliance report, and more.</p>
+      <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+        <a href="/signup" style="background:#dc2626;color:white;padding:11px 24px;border-radius:8px;font-weight:600;text-decoration:none;font-size:0.95rem;">Sign up free — no card</a>
+        <a href="/" style="background:transparent;color:#e5e7eb;padding:11px 24px;border-radius:8px;font-weight:600;text-decoration:none;font-size:0.95rem;border:1px solid #1f2937;">Try quick scan</a>
+      </div>
+    </div>
+
     <h2>Methodology</h2>
-    <p>Targets sourced from certificate transparency logs, Google search, and platform directories. All scans are read-only (GET + minimal POST probes). 50+ scanner modules per target. Every CRIT finding verified reproducible before disclosure. Private disclosures sent to all identifiable owners before publication.</p>
-    <p>Scanner: <a href="https://securityscanner.dev" style="color:#dc2626;">securityscanner.dev</a> — open to anyone. One free scan, no card.</p>
+    <p>Targets sourced from certificate transparency logs, Google search, and platform directories. All scans are read-only (GET + minimal POST probes). <strong>70+ scanner modules</strong> per target. Every CRIT finding verified reproducible before disclosure. Private disclosures sent to all identifiable owners before publication.</p>
+
+    <h2>What we scan for</h2>
+    <p>Supabase RLS · Firebase rules · XSS · IDOR · CORS · CSP bypass · Cookie security · GraphQL mutations · WebSocket auth · Open redirect · DNS zone transfer · API key exposure (38 patterns) · JS prototype pollution · Dependency confusion · AI code fingerprinting · LLM hallucination detection · OAuth redirect · JWT weak secrets · Subdomain takeover · Nuclei CVE templates · and more.</p>
+    <p><a href="/blog/what-security-scanner-actually-does" style="color:#dc2626;">Full module-by-module walkthrough →</a></p>
 
     <h2>Detailed write-ups</h2>
     <ul>
@@ -9493,11 +9553,59 @@ async def report_q2_2026():
       <li><a href="/blog/beyond-supabase-rls-five-other-crits" style="color:#dc2626;">Beyond Supabase RLS: 5 other critical vulnerabilities →</a></li>
       <li><a href="/blog/top-5-supabase-rls-mistakes-on-lovable-apps" style="color:#dc2626;">Top 5 Supabase RLS mistakes on Lovable apps →</a></li>
       <li><a href="/blog/top-5-security-issues-on-replit-apps" style="color:#dc2626;">Top 5 security issues on Replit apps →</a></li>
+      <li><a href="/blog/anthropic-key-leaked-case-study" style="color:#dc2626;">When your Anthropic key leaks: a case study →</a></li>
     </ul>
 
-    <p style="margin-top:32px;color:#6b7280;font-size:0.85rem;">This report is updated as we scan more apps. Data as of April 2026. Questions or corrections: <a href="mailto:stefan@securityscanner.dev" style="color:#dc2626;">stefan@securityscanner.dev</a>.</p>
+    <div style="margin-top:32px;padding:20px;background:#111827;border:1px solid #1f2937;border-radius:10px;">
+      <h3 style="font-size:1rem;margin-bottom:8px;">Get the next report</h3>
+      <p style="color:#9ca3af;font-size:0.85rem;margin-bottom:12px;">One email when we publish the next batch scan. No marketing.</p>
+      <form id="rpt-nl" onsubmit="return _rptNl(event)" style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input type="email" id="rpt-nl-email" required placeholder="you@example.com" style="flex:1;min-width:200px;background:#0a0e17;border:1px solid #1f2937;color:#e5e7eb;padding:10px 12px;border-radius:6px;font-size:0.9rem;font-family:inherit;">
+        <button type="submit" style="background:#dc2626;color:white;border:none;padding:10px 18px;border-radius:6px;font-weight:600;font-size:0.9rem;cursor:pointer;font-family:inherit;">Subscribe</button>
+      </form>
+      <div id="rpt-nl-msg" style="margin-top:8px;font-size:0.82rem;color:#9ca3af;"></div>
+    </div>
+
+    <p style="margin-top:28px;color:#6b7280;font-size:0.82rem;">This report pulls live data from our scanner database. Questions, corrections, or press inquiries: <a href="mailto:stefan@securityscanner.dev" style="color:#dc2626;">stefan@securityscanner.dev</a>.</p>
   </article>
 </div>
+<script>
+async function _rptScan(e) {{
+  e.preventDefault();
+  const btn=document.getElementById('rpt-btn'),input=document.getElementById('rpt-url'),results=document.getElementById('rpt-results');
+  let host=input.value.trim().replace(/^https?:\\/\\//,'').replace(/\\/.*/,'');
+  if(!host) return false;
+  btn.disabled=true; btn.textContent='Scanning...';
+  results.innerHTML='<p style="color:#9ca3af;">Scanning '+host+'...</p>';
+  try {{
+    const r=await fetch('/api/quick-scan',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{host}})}});
+    const d=await r.json();
+    if(!r.ok){{ results.innerHTML='<p style="color:#dc2626;">'+d.error+'</p>'; btn.disabled=false; btn.textContent='Scan now'; return false; }}
+    let html='<div style="background:#0a0e17;border:1px solid #1f2937;border-radius:8px;padding:16px;">';
+    d.findings.forEach(f=>{{
+      const icon=f.pass?'\\u2705':f.severity==='CRITICAL'||f.severity==='HIGH'?'\\u274C':'\\u26A0\\uFE0F';
+      html+='<div style="padding:5px 0;border-bottom:1px solid #1f2937;">'+icon+' '+f.title+'</div>';
+    }});
+    html+='<div style="margin-top:12px;text-align:center;"><a href="/signup" style="background:#dc2626;color:white;padding:10px 20px;border-radius:8px;font-weight:600;text-decoration:none;display:inline-block;">Get full 70-module scan free \\u2192</a></div></div>';
+    results.innerHTML=html;
+  }} catch(err) {{ results.innerHTML='<p style="color:#dc2626;">Error \\u2014 try again</p>'; }}
+  btn.disabled=false; btn.textContent='Scan again';
+  return false;
+}}
+async function _rptNl(e) {{
+  e.preventDefault();
+  const email=document.getElementById('rpt-nl-email').value.trim();
+  const msg=document.getElementById('rpt-nl-msg');
+  try {{
+    const r=await fetch('/api/newsletter',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{email,source:'q2-report'}})}});
+    const d=await r.json();
+    msg.style.color=r.ok?'#22c55e':'#dc2626';
+    msg.textContent=r.ok?(d.message||'Subscribed!'):(d.error||'Error');
+    if(r.ok) document.getElementById('rpt-nl-email').value='';
+  }} catch(err) {{ msg.style.color='#dc2626'; msg.textContent='Network error'; }}
+  return false;
+}}
+</script>
 </body></html>""")
 
 

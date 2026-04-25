@@ -7223,6 +7223,30 @@ async function api(path, opts) {
 }
 
 function esc(s) { return (s||"").toString().replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+async function _getBadge(target) {
+  const r = await api(`/api/badge-url?target=${encodeURIComponent(target)}`);
+  if (r && r.badge_url) {
+    const html = `<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-top:10px;">
+      <p style="font-size:0.85rem;margin-bottom:8px;">Embed this badge on your site:</p>
+      <div class="copy-code">${esc(r.embed_html)}<button class="copy-btn" onclick="navigator.clipboard.writeText(\`${r.embed_html.replace(/`/g,'')}\`).then(()=>this.textContent='Copied!')">Copy</button></div>
+      <div style="margin-top:8px;"><img src="${r.badge_url}" alt="Security Scanner badge"></div>
+    </div>`;
+    const el = document.createElement('div'); el.innerHTML = html;
+    event.target.parentElement.appendChild(el.firstElementChild);
+    event.target.disabled = true;
+  }
+}
+async function _suppressFinding(btn, findingId) {
+  const action = btn.textContent.includes('Suppress') ? 'suppress' : 'unsuppress';
+  const r = await api(`/api/findings/${findingId}/${action}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({reason: 'accepted_risk'})
+  });
+  if (r && r.ok) {
+    btn.innerHTML = action === 'suppress' ? '&#10003; Suppressed' : '&#128683; Suppress';
+    btn.style.color = action === 'suppress' ? 'var(--success)' : '';
+  }
+}
 function _copyFix(btn, target, sev, title, desc, evidence) {
   const prompt = `Fix this security issue on ${target}:\n\n[${sev}] ${title}\n\nDescription: ${desc}\n\nEvidence: ${evidence}\n\nPlease implement a fix for this vulnerability.`;
   navigator.clipboard.writeText(prompt).then(() => {
@@ -7292,7 +7316,7 @@ VIEWS.overview = async () => {
 
     <div class="card">
       <h2>Scanning capabilities</h2>
-      <div style="color:var(--text-muted);font-size:0.85rem;margin-bottom:16px;">40+ modules run on every scan, organized into 5 categories.</div>
+      <div style="color:var(--text-muted);font-size:0.85rem;margin-bottom:16px;">70+ modules run on every scan, organized into 5 categories.</div>
       <div class="grid grid-cards" style="gap:12px;">
         ${[
           // Network + transport
@@ -7431,12 +7455,18 @@ function _renderTargetCard(runId, target, findings, gradeFor, diff) {
                 ${f.description ? `<dt>Description</dt><dd>${esc(f.description)}</dd>` : ''}
                 ${f.evidence ? `<dt>Evidence</dt><dd style="font-family:'SF Mono',Menlo,monospace;font-size:0.82rem;white-space:pre-wrap;word-break:break-all;background:#0a0e17;padding:8px 10px;border-radius:4px;border:1px solid #1f2937;">${esc(f.evidence)}</dd>` : ''}
                 <dt>Category</dt><dd>${esc(f.category)}</dd>
-                <button class="btn btn-outline btn-sm" style="margin-top:10px;" onclick="event.stopPropagation();_copyFix(this,'${esc(target).replace(/'/g,"\\'")}','${f.severity}',\`${esc(f.title).replace(/`/g,"\\`")}\`,\`${esc(f.description||"").replace(/`/g,"\\`")}\`,\`${esc(f.evidence||"").replace(/`/g,"\\`")}\`)">&#128203; Copy fix to Cursor</button>
+                <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;">
+                  <button class="btn btn-outline btn-sm" onclick="event.stopPropagation();_copyFix(this,'${esc(target).replace(/'/g,"\\'")}','${f.severity}',\`${esc(f.title).replace(/`/g,"\\`")}\`,\`${esc(f.description||"").replace(/`/g,"\\`")}\`,\`${esc(f.evidence||"").replace(/`/g,"\\`")}\`)">&#128203; Copy fix to Cursor</button>
+                  <button class="btn btn-outline btn-sm" onclick="event.stopPropagation();_suppressFinding(this,${f.id})">${f.suppressed ? '&#10003; Suppressed' : '&#128683; Suppress'}</button>
+                </div>
               </div>
             </div>`).join('')).join('')}
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-          <a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">&#128196; Download fix (.md)</a>
-          <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/pdf?target=${encodeURIComponent(target)}" target="_blank">&#128462; Export PDF report</a>
+          <a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">&#128196; Fix (.md)</a>
+          <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/pdf?target=${encodeURIComponent(target)}" target="_blank">&#128462; PDF</a>
+          <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/compliance/pdf" target="_blank">&#127919; OWASP Report</a>
+          <button class="btn btn-outline btn-sm" onclick="_getBadge('${esc(target)}')">&#127942; Get Badge</button>
+          <a class="btn btn-outline btn-sm" href="/scan/${encodeURIComponent(target)}" target="_blank">&#127760; Public Page</a>
         </div>
       </div>
     </div>`;
@@ -8290,11 +8320,11 @@ _LANDING_HTML = """<!DOCTYPE html>
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://securityscanner.dev/">
 <meta property="og:title" content="Security Scanner — AI-native vulnerability scanning">
-<meta property="og:description" content="Scan any deployed web app. 50+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
+<meta property="og:description" content="Scan any deployed web app. 70+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
 <meta property="og:image" content="https://securityscanner.dev/og.png">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Security Scanner — AI-native vulnerability scanning">
-<meta name="twitter:description" content="Scan any deployed web app. 50+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
+<meta name="twitter:description" content="Scan any deployed web app. 70+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
 <meta name="twitter:image" content="https://securityscanner.dev/og.png">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -8462,7 +8492,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape')closeNav();});
 <section class="hero">
   <div class="container">
     <h1>Security scans for the<br><span>vibe-coding</span> era.</h1>
-    <p>Scan any deployed app. 50+ modules: Supabase RLS probe, AI-key detection, GraphQL audit, subdomain takeover, prompt-injection probing, WAF fingerprint, nuclei CVE, and more.</p>
+    <p>Scan any deployed app. 70+ modules: Supabase RLS probe, AI-key detection, XSS testing, GraphQL audit, Firebase deep probe, subdomain takeover, IDOR detection, AI code fingerprinting, OWASP compliance reports, and more. PDF reports, CI/CD webhooks, Slack/Discord alerts.</p>
     <div id="quick-scan" style="margin:28px auto 0;max-width:560px;">
       <form id="qs-form" onsubmit="return runQuickScan(event)" style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;">
         <input type="text" id="qs-url" required placeholder="https://your-app.com" style="flex:1;min-width:240px;background:#111827;border:1px solid #1f2937;color:#e5e7eb;padding:13px 16px;border-radius:8px;font-size:1rem;font-family:inherit;">
@@ -8500,7 +8530,7 @@ async function runQuickScan(e) {
       html += ' <span style="color:#d1d5db;font-size:0.88rem;">' + f.title + '</span></div></div>';
     });
     html += '<div style="margin-top:18px;padding-top:14px;border-top:1px solid #1f2937;text-align:center;">';
-    html += '<div style="color:#9ca3af;font-size:0.85rem;margin-bottom:12px;">This is a quick preview (6 checks). The full scan runs <strong>50+ modules</strong> including Supabase RLS probe, nuclei CVE templates, subdomain takeover, and AI-powered analysis.</div>';
+    html += '<div style="color:#9ca3af;font-size:0.85rem;margin-bottom:12px;">This is a quick preview (6 checks). The full scan runs <strong>70+ modules</strong> including Supabase RLS probe, nuclei CVE templates, subdomain takeover, and AI-powered analysis.</div>';
     html += '<a href="/signup" class="btn btn-primary" style="display:inline-flex;padding:10px 22px;">Get the full scan free →</a>';
     html += '</div></div>';
     results.innerHTML = html;
@@ -8541,7 +8571,7 @@ async function runQuickScan(e) {
       </div>
       <div class="step">
         <div class="num">STEP 2</div>
-        <h3>We run 40+ modules</h3>
+        <h3>We run 70+ modules</h3>
         <p>Transport &amp; headers, Supabase RLS probe with real table names from your JS bundle, GraphQL introspection audit, AI-key leak detection (Anthropic, OpenAI, AWS, Stripe), subdomain takeover (Vercel, Netlify, Unbounce), CORS / CSP / TLS / nuclei 8k+ CVE templates, prompt-injection probing, and more.</p>
       </div>
       <div class="step">
@@ -8612,7 +8642,7 @@ async function runQuickScan(e) {
 
 <section id="capabilities">
   <div class="container">
-    <h2>50+ checks on every scan</h2>
+    <h2>70+ checks on every scan</h2>
     <p class="sub">Organized into 7 categories. <a href="/blog/what-security-scanner-actually-does" style="color:#dc2626;">Full module-level walkthrough →</a></p>
     <div class="caps">
 
@@ -8989,11 +9019,33 @@ async def sitemap_xml():
         ("https://securityscanner.dev/", "1.0", "weekly"),
         ("https://securityscanner.dev/blog", "0.9", "weekly"),
         ("https://securityscanner.dev/docs/api", "0.8", "monthly"),
+        ("https://securityscanner.dev/reports/2026-q2", "0.8", "monthly"),
         ("https://securityscanner.dev/contact", "0.5", "yearly"),
         ("https://securityscanner.dev/privacy", "0.3", "yearly"),
         ("https://securityscanner.dev/terms", "0.3", "yearly"),
         ("https://securityscanner.dev/changelog", "0.6", "weekly"),
         ("https://securityscanner.dev/status", "0.4", "weekly"),
+        # Platform landing pages
+        ("https://securityscanner.dev/for/lovable", "0.8", "monthly"),
+        ("https://securityscanner.dev/for/bolt", "0.8", "monthly"),
+        ("https://securityscanner.dev/for/replit", "0.8", "monthly"),
+        ("https://securityscanner.dev/for/vercel", "0.8", "monthly"),
+        # Free tool pages
+        ("https://securityscanner.dev/tools/supabase-rls-check", "0.7", "monthly"),
+        ("https://securityscanner.dev/tools/header-check", "0.7", "monthly"),
+        ("https://securityscanner.dev/tools/xss-check", "0.7", "monthly"),
+        ("https://securityscanner.dev/tools/ssl-check", "0.7", "monthly"),
+        ("https://securityscanner.dev/tools/api-key-check", "0.7", "monthly"),
+        # Vulnerability reference
+        ("https://securityscanner.dev/vulns/supabase-rls", "0.6", "monthly"),
+        ("https://securityscanner.dev/vulns/exposed-env", "0.6", "monthly"),
+        ("https://securityscanner.dev/vulns/idor", "0.6", "monthly"),
+        ("https://securityscanner.dev/vulns/api-key-leak", "0.6", "monthly"),
+        ("https://securityscanner.dev/vulns/subdomain-takeover", "0.6", "monthly"),
+        # Integration docs
+        ("https://securityscanner.dev/docs/integrations/github-actions", "0.7", "monthly"),
+        ("https://securityscanner.dev/docs/integrations/vercel-deploy", "0.7", "monthly"),
+        ("https://securityscanner.dev/docs/integrations/cursor-mcp", "0.7", "monthly"),
     ]
     posts_xml = "".join(
         f"  <url><loc>https://securityscanner.dev/blog/{p['slug']}</loc>"
@@ -9115,7 +9167,7 @@ def _generate_og_image() -> bytes:
               fill=(209, 213, 219), font=sub_font)
     draw.text((60, 540), "securityscanner.dev",
               fill=(220, 38, 38), font=sub_font)
-    draw.text((60, 580), "50+ checks · MCP · Custom GPT · API",
+    draw.text((60, 580), "70+ checks · MCP · Custom GPT · API",
               fill=(107, 114, 128), font=tag_font)
     import io
     buf = io.BytesIO()
@@ -9151,7 +9203,7 @@ async def og_image():
 
 _CHANGELOG_ENTRIES = [
     ("2026-04-15", [
-        "New: 'What we check' capabilities section on the homepage — 50+ modules across 7 categories",
+        "New: 'What we check' capabilities section on the homepage — 70+ modules across 7 categories",
         "New: blog redesign with hero + card grid + tags + reading time",
         "New: /.well-known/security.txt for responsible-disclosure researchers",
         "New: per-user hourly scan rate-limit + email-verify gate + target-add flood detection",

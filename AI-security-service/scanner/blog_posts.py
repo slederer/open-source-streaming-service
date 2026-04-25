@@ -202,7 +202,7 @@ CREATE POLICY "authenticated_only" ON &lt;table&gt;
 
 <p>Targets sourced from: certificate transparency logs (<code>*.lovable.app</code>, <code>*.bolt.host</code>, <code>*.replit.app</code>, <code>*.bolt.new</code>, <code>*.tempo.new</code>, <code>*.emergent.sh</code>) for the vibe-coded cohort; YC's public directory for the YC cohort. All 226 unique — no overlap with our previous 150-target batch.</p>
 
-<p>Scanner: our standard full-scan module set (50+ checks including <code>supabase-audit</code>, <code>baas-detect</code>, <code>secret-scan</code>, <code>nuclei</code>, <code>subdomain-takeover</code>, <code>github-dork</code>, AI-triage).</p>
+<p>Scanner: our standard full-scan module set (70+ checks including <code>supabase-audit</code>, <code>baas-detect</code>, <code>secret-scan</code>, <code>nuclei</code>, <code>subdomain-takeover</code>, <code>github-dork</code>, AI-triage).</p>
 
 <p>Every CRIT was verified reproducible before disclosure — we re-ran the exact curl command the scanner used, confirmed a real row came back, and used that specific command in the disclosure email to the owner.</p>
 
@@ -227,7 +227,7 @@ CREATE POLICY "authenticated_only" ON &lt;table&gt;
 <p>Then we scanned everything we'd shipped with AI assistants over the previous year. The hit rate was noticeably higher.</p>
 
 <h2>What Security Scanner does</h2>
-<p>You point it at a URL. It runs 50+ modules against that URL in parallel — from classic ones like nmap + TLS audit + nuclei to the ones that matter for vibe-coded apps specifically:</p>
+<p>You point it at a URL. It runs 70+ modules against that URL in parallel — from classic ones like nmap + TLS audit + nuclei to the ones that matter for vibe-coded apps specifically:</p>
 
 <ul>
   <li>Extracts Supabase anon keys from JS bundles and probes every real table name for Row Level Security misconfigurations</li>
@@ -252,7 +252,7 @@ CREATE POLICY "authenticated_only" ON &lt;table&gt;
         "tag": "Product",
         "excerpt": "No marketing fluff — a direct walkthrough of every module we run.",
         "body": """
-<p>When you scan an app, we run 50+ modules organized into 7 categories. Here's each one, what it looks for, and what severity it can produce.</p>
+<p>When you scan an app, we run 70+ modules organized into 7 categories. Here's each one, what it looks for, and what severity it can produce.</p>
 
 <h2>1. Transport & network</h2>
 <ul>

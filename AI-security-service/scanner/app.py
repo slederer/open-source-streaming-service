@@ -2681,6 +2681,12 @@ try:
         scan_target_open_redirect, scan_target_csp_bypass,
         scan_target_hsts_preload, scan_target_zone_transfer,
         scan_target_supabase_edge, scan_target_dep_confusion,
+        scan_target_signup_takeover, scan_target_auth_bypass,
+        scan_target_mass_assign, scan_target_payment_bypass,
+        scan_target_admin_panel, scan_target_login_bruteforce,
+        scan_target_pii_exposure, scan_target_error_leak,
+        scan_target_sqli_basic, scan_target_ssti,
+        scan_target_api_enum,
     )
     from scanner.ai_triage import (
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -2708,6 +2714,12 @@ except ImportError:
         scan_target_open_redirect, scan_target_csp_bypass,
         scan_target_hsts_preload, scan_target_zone_transfer,
         scan_target_supabase_edge, scan_target_dep_confusion,
+        scan_target_signup_takeover, scan_target_auth_bypass,
+        scan_target_mass_assign, scan_target_payment_bypass,
+        scan_target_admin_panel, scan_target_login_bruteforce,
+        scan_target_pii_exposure, scan_target_error_leak,
+        scan_target_sqli_basic, scan_target_ssti,
+        scan_target_api_enum,
     )
     from scanner_ai_triage import (  # type: ignore
         scan_target_ai_triage, scan_target_ai_openapi_deep,

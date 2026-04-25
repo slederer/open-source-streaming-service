@@ -2811,7 +2811,18 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
     preserve the 'canceled' status so the UI can show partial results.
     """
     seen = set()
-    scan_modules = [(n, globals()[fname]) for n, _, fname in SCAN_MODULES]
+    # Gate AI modules behind paid plans to control API costs.
+    # Free plan skips ai_openapi, ai_js, ai_triage (saves ~$0.15/scan).
+    _ai_modules = {"ai_openapi", "ai_js", "ai_triage"}
+    _user_plan = "free"
+    if user_id:
+        _u = get_user_by_id(user_id)
+        _user_plan = (_u or {}).get("plan", "free")
+    _ai_allowed = PLAN_LIMITS.get(_user_plan, PLAN_LIMITS["free"]).get("ai_analysis", False)
+    scan_modules = [
+        (n, globals()[fname]) for n, _, fname in SCAN_MODULES
+        if _ai_allowed or n not in _ai_modules
+    ]
     total = len(scan_modules)
     completed = []
     canceled = False
@@ -8348,9 +8359,11 @@ _LANDING_HTML = """<!DOCTYPE html>
   .nav-dropdown { position: relative; display: inline-block; }
   .nav-dropdown > a { cursor: pointer; }
   .nav-dropdown > a::after { content: ' ▾'; font-size: 0.7rem; }
-  .nav-dropdown-menu { display: none; position: absolute; top: 100%; left: 0; background: #111827; border: 1px solid #1f2937; border-radius: 8px; min-width: 180px; padding: 6px 0; z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.4); margin-top: 8px; }
+  .nav-dropdown-menu { display: none; position: absolute; top: 100%; left: -12px; background: #111827; border: 1px solid #1f2937; border-radius: 8px; min-width: 180px; padding: 6px 0; z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.4); padding-top: 12px; }
+  /* Bridge the gap so hover doesn't break when moving to menu */
+  .nav-dropdown::after { content: ''; position: absolute; top: 100%; left: 0; width: 100%; height: 16px; }
   .nav-dropdown:hover .nav-dropdown-menu, .nav-dropdown.open .nav-dropdown-menu { display: block; }
-  .nav-dropdown-menu a { display: block; padding: 8px 16px; font-size: 0.85rem; color: #d1d5db !important; white-space: nowrap; }
+  .nav-dropdown-menu a { display: block; padding: 10px 16px; font-size: 0.88rem; color: #d1d5db !important; white-space: nowrap; transition: background 0.1s; }
   .nav-dropdown-menu a:hover { background: #1f2937; color: #e5e7eb !important; }
 
   .hero { padding: 96px 0 88px; text-align: center; background: radial-gradient(circle at 50% 0%, #1f2937 0%, #0a0e17 70%); }

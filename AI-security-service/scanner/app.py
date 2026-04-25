@@ -2869,6 +2869,31 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
         except Exception as _e:
             print(f"[scan] notify hook failed for run={run_id}: {_e}", flush=True)
 
+    # Webhook notifications (Slack/Discord) — fire for any monitors with alert_webhook
+    if user_id:
+        try:
+            with get_db() as _db:
+                _target = _db.execute("SELECT target FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+                if _target:
+                    _host = _target[0]
+                    _run_row = _db.execute("SELECT summary_json FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+                    _summary = json.loads(_run_row[0]) if _run_row and _run_row[0] else {}
+                    _grade = _summary.get("risk_grade", "?")
+                    _monitors = _db.execute(
+                        "SELECT alert_webhook FROM monitors WHERE user_id=? AND target=? AND is_active=1 AND alert_webhook IS NOT NULL AND alert_webhook != ''",
+                        (user_id, _host),
+                    ).fetchall()
+                    for _m in _monitors:
+                        import asyncio as _aio
+                        try:
+                            _aio.get_event_loop().create_task(
+                                _send_webhook_notification(_m[0], _host, run_id, _grade, _summary)
+                            )
+                        except RuntimeError:
+                            pass
+        except Exception as _e:
+            print(f"[scan] webhook notify failed for run={run_id}: {_e}", flush=True)
+
 
 # ── Remediation Helpers ──────────────────────────────────────────────────────
 
@@ -9293,6 +9318,220 @@ async def _do_unsubscribe(email: str, token: str) -> bool:
             (email, "user_unsub"),
         )
     return True
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Trust badge — embeddable SVG showing pass/fail + grade
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/badges/{badge_id}.svg")
+async def trust_badge(badge_id: str):
+    """Embeddable SVG badge. badge_id = first 12 chars of SHA256(host).
+    Returns a shield-style badge with the latest scan grade."""
+    import hashlib as _hl_badge
+    with get_db() as db:
+        # Find the target by hash prefix
+        targets = db.execute("SELECT DISTINCT host FROM targets").fetchall()
+        target_host = None
+        for row in targets:
+            h = _hl_badge.sha256(row[0].encode()).hexdigest()[:12]
+            if h == badge_id:
+                target_host = row[0]
+                break
+        if not target_host:
+            # Return a "not found" badge
+            svg = _badge_svg("Security Scanner", "not found", "#6b7280")
+            return Response(content=svg, media_type="image/svg+xml",
+                            headers={"Cache-Control": "public, max-age=3600"})
+
+        # Get latest completed scan for this target
+        run = db.execute(
+            "SELECT summary_json, finished_at FROM scan_runs "
+            "WHERE target=? AND status='completed' ORDER BY finished_at DESC LIMIT 1",
+            (target_host,),
+        ).fetchone()
+
+    if not run or not run[0]:
+        svg = _badge_svg("Security Scanner", "no scan", "#6b7280")
+    else:
+        import json as _j
+        summary = _j.loads(run[0])
+        grade = summary.get("risk_grade", "?")
+        date = (run[1] or "")[:10]
+        color = {"A": "#22c55e", "B": "#3b82f6", "C": "#eab308", "D": "#f97316", "F": "#dc2626"}.get(grade, "#6b7280")
+        svg = _badge_svg(f"security scan", f"grade {grade}", color)
+
+    return Response(content=svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=3600"})
+
+
+def _badge_svg(label: str, value: str, color: str) -> str:
+    """Generate a shields.io-style SVG badge."""
+    label_w = len(label) * 6.5 + 12
+    value_w = len(value) * 7 + 12
+    total_w = label_w + value_w
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{total_w}" height="20" role="img">
+  <linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-color="#bbb" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
+  <clipPath id="r"><rect width="{total_w}" height="20" rx="3" fill="#fff"/></clipPath>
+  <g clip-path="url(#r)">
+    <rect width="{label_w}" height="20" fill="#555"/>
+    <rect x="{label_w}" width="{value_w}" height="20" fill="{color}"/>
+    <rect width="{total_w}" height="20" fill="url(#s)"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,sans-serif" text-rendering="geometricPrecision" font-size="11">
+    <text x="{label_w/2}" y="14">{label}</text>
+    <text x="{label_w + value_w/2}" y="14" font-weight="bold">{value}</text>
+  </g>
+</svg>'''
+
+
+@app.get("/api/badge-url")
+async def get_badge_url(request: Request):
+    """Return the badge embed URL for a user's target."""
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    target = request.query_params.get("target", "")
+    if not target:
+        return JSONResponse({"error": "target required"}, status_code=400)
+    import hashlib as _hl_b
+    badge_id = _hl_b.sha256(target.encode()).hexdigest()[:12]
+    url = f"https://securityscanner.dev/badges/{badge_id}.svg"
+    embed = f'<a href="https://securityscanner.dev"><img src="{url}" alt="Security Scanner"></a>'
+    return {"badge_url": url, "embed_html": embed, "markdown": f"[![Security Scanner]({url})](https://securityscanner.dev)"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CI/CD webhook — trigger a scan via POST with API key auth
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.post("/v1/webhook/scan")
+async def webhook_scan(request: Request, background_tasks: BackgroundTasks):
+    """Trigger a scan via webhook. Auth via API key in Authorization header.
+    Intended for CI/CD pipelines (GitHub Actions, Vercel deploy hooks, etc.)."""
+    user = require_auth_any(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized — include Authorization: Bearer sk-sec-..."}, status_code=401)
+
+    body = await request.json()
+    host = (body.get("host") or "").strip()
+    if not host:
+        return JSONResponse({"error": "host required"}, status_code=400)
+    host = re.sub(r"^https?://", "", host).rstrip("/").split("/")[0]
+
+    min_grade = (body.get("min_grade") or "").upper()
+    callback_url = body.get("callback_url", "")
+
+    ok, reason = validate_scan_target(host, allow_unresolvable=True)
+    if not ok:
+        return JSONResponse({"error": f"Invalid target: {reason}"}, status_code=400)
+
+    allowed, reason = can_user_scan(user["user_id"])
+    if not allowed:
+        return JSONResponse({"error": reason}, status_code=402)
+
+    # Auto-create target
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM targets WHERE host=? AND user_id=?",
+                          (host, user["user_id"])).fetchone():
+            db.execute("INSERT INTO targets (host, label, added_at, user_id) VALUES (?,?,?,?)",
+                       (host, host, datetime.now(timezone.utc).isoformat(), user["user_id"]))
+
+    run_id = str(uuid.uuid4())[:8]
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO scan_runs (id, started_at, status, targets, target, scan_type, user_id) "
+            "VALUES (?, ?, 'running', ?, ?, 'full', ?)",
+            (run_id, now, json.dumps([host]), host, user["user_id"]),
+        )
+
+    async def _run_and_callback():
+        async with _SCAN_SEM:
+            await asyncio.to_thread(run_full_scan, run_id, [{"ip": host, "name": host}], user["user_id"])
+        # Post-scan: check grade threshold + fire callback
+        if callback_url or min_grade:
+            with get_db() as db:
+                run = db.execute("SELECT summary_json FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+            summary = json.loads(run[0]) if run and run[0] else {}
+            grade = summary.get("risk_grade", "F")
+            grade_order = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+            passed = not min_grade or grade_order.get(grade, 4) <= grade_order.get(min_grade, 4)
+            result = {
+                "run_id": run_id, "host": host, "grade": grade,
+                "passed": passed, "min_grade": min_grade or None,
+                "report_url": f"https://securityscanner.dev/#scan-detail/{run_id}",
+                "summary": summary,
+            }
+            if callback_url:
+                try:
+                    import httpx
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        await client.post(callback_url, json=result)
+                except Exception:
+                    pass
+
+    background_tasks.add_task(_run_and_callback)
+
+    return {
+        "run_id": run_id, "status": "running", "host": host,
+        "poll_url": f"https://securityscanner.dev/v1/scan/{run_id}",
+        "report_url": f"https://securityscanner.dev/#scan-detail/{run_id}",
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Slack/Discord notification helpers
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _send_webhook_notification(webhook_url: str, host: str, run_id: str,
+                                      grade: str, summary: dict):
+    """Send a rich notification to Slack or Discord webhook."""
+    if not webhook_url:
+        return
+    counts = summary.get("severity_counts", summary)
+    crit = counts.get("critical", counts.get("CRITICAL", 0))
+    high = counts.get("high", counts.get("HIGH", 0))
+    med = counts.get("medium", counts.get("MEDIUM", 0))
+    report_url = f"https://securityscanner.dev/#scan-detail/{run_id}"
+
+    is_discord = "discord.com/api/webhooks" in webhook_url
+
+    if is_discord:
+        color_map = {"A": 0x22c55e, "B": 0x3b82f6, "C": 0xeab308, "D": 0xf97316, "F": 0xdc2626}
+        payload = {
+            "embeds": [{
+                "title": f"Security Scan: {host} — Grade {grade}",
+                "url": report_url,
+                "color": color_map.get(grade, 0x6b7280),
+                "fields": [
+                    {"name": "Critical", "value": str(crit), "inline": True},
+                    {"name": "High", "value": str(high), "inline": True},
+                    {"name": "Medium", "value": str(med), "inline": True},
+                ],
+                "footer": {"text": "Security Scanner · securityscanner.dev"},
+            }]
+        }
+    else:
+        # Slack format
+        emoji = {"A": ":white_check_mark:", "B": ":large_blue_circle:", "C": ":warning:",
+                 "D": ":orange_circle:", "F": ":red_circle:"}.get(grade, ":grey_question:")
+        payload = {
+            "text": f"{emoji} *Security Scan: {host}* — Grade *{grade}*",
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn",
+                    "text": f"{emoji} *Security Scan Complete: {host}*\n"
+                            f"Grade: *{grade}* | CRIT: {crit} | HIGH: {high} | MED: {med}\n"
+                            f"<{report_url}|View full report>"}},
+            ],
+        }
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(webhook_url, json=payload)
+    except Exception:
+        pass
 
 
 @app.get("/unsubscribe", response_class=HTMLResponse)

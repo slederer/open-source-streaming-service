@@ -7223,17 +7223,20 @@ async function api(path, opts) {
 }
 
 function esc(s) { return (s||"").toString().replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-async function _getBadge(target) {
+async function _getBadge(btn, target) {
+  btn.disabled = true; btn.textContent = 'Loading...';
   const r = await api(`/api/badge-url?target=${encodeURIComponent(target)}`);
   if (r && r.badge_url) {
-    const html = `<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-top:10px;">
-      <p style="font-size:0.85rem;margin-bottom:8px;">Embed this badge on your site:</p>
-      <div class="copy-code">${esc(r.embed_html)}<button class="copy-btn" onclick="navigator.clipboard.writeText(\`${r.embed_html.replace(/`/g,'')}\`).then(()=>this.textContent='Copied!')">Copy</button></div>
-      <div style="margin-top:8px;"><img src="${r.badge_url}" alt="Security Scanner badge"></div>
-    </div>`;
-    const el = document.createElement('div'); el.innerHTML = html;
-    event.target.parentElement.appendChild(el.firstElementChild);
-    event.target.disabled = true;
+    const container = document.createElement('div');
+    container.style.cssText = 'background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-top:10px;';
+    container.innerHTML = `<p style="font-size:0.85rem;margin-bottom:8px;">Embed this badge on your site:</p>
+      <div class="copy-code">${esc(r.embed_html)}<button class="copy-btn" onclick="navigator.clipboard.writeText(this.previousSibling.textContent.trim()).then(()=>this.textContent='Copied!')">Copy</button></div>
+      <p style="font-size:0.8rem;color:var(--text-muted);margin-top:6px;">Markdown: <code>${esc(r.markdown)}</code></p>
+      <div style="margin-top:8px;"><img src="${r.badge_url}" alt="Security Scanner badge"></div>`;
+    btn.parentElement.appendChild(container);
+    btn.textContent = '✓ Badge ready';
+  } else {
+    btn.textContent = 'Error'; btn.disabled = false;
   }
 }
 async function _suppressFinding(btn, findingId) {
@@ -7465,7 +7468,7 @@ function _renderTargetCard(runId, target, findings, gradeFor, diff) {
           <a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">&#128196; Fix (.md)</a>
           <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/pdf?target=${encodeURIComponent(target)}" target="_blank">&#128462; PDF</a>
           <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/compliance/pdf" target="_blank">&#127919; OWASP Report</a>
-          <button class="btn btn-outline btn-sm" onclick="_getBadge('${esc(target)}')">&#127942; Get Badge</button>
+          <button class="btn btn-outline btn-sm" onclick="_getBadge(this,'${esc(target)}')">&#127942; Get Badge</button>
           <a class="btn btn-outline btn-sm" href="/scan/${encodeURIComponent(target)}" target="_blank">&#127760; Public Page</a>
         </div>
       </div>
@@ -8341,6 +8344,15 @@ _LANDING_HTML = """<!DOCTYPE html>
   nav .cta { background: #dc2626; color: white !important; padding: 9px 18px; border-radius: 7px; font-weight: 600; font-size: 0.9rem; }
   nav .cta:hover { background: #b91c1c; }
 
+  /* Dropdown menu */
+  .nav-dropdown { position: relative; display: inline-block; }
+  .nav-dropdown > a { cursor: pointer; }
+  .nav-dropdown > a::after { content: ' ▾'; font-size: 0.7rem; }
+  .nav-dropdown-menu { display: none; position: absolute; top: 100%; left: 0; background: #111827; border: 1px solid #1f2937; border-radius: 8px; min-width: 180px; padding: 6px 0; z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.4); margin-top: 8px; }
+  .nav-dropdown:hover .nav-dropdown-menu { display: block; }
+  .nav-dropdown-menu a { display: block; padding: 8px 16px; font-size: 0.85rem; color: #d1d5db !important; white-space: nowrap; }
+  .nav-dropdown-menu a:hover { background: #1f2937; color: #e5e7eb !important; }
+
   .hero { padding: 96px 0 88px; text-align: center; background: radial-gradient(circle at 50% 0%, #1f2937 0%, #0a0e17 70%); }
   .hero h1 { font-size: 3.4rem; font-weight: 800; letter-spacing: -0.03em; line-height: 1.08; margin-bottom: 22px; }
   .hero h1 span { color: #dc2626; }
@@ -8426,6 +8438,9 @@ _LANDING_HTML = """<!DOCTYPE html>
     nav .links a:last-child { border-bottom: 0; }
     nav .links a.cta { background: #dc2626; color: white !important; border-bottom: 0; text-align: center; border-radius: 8px; margin-top: 12px; padding: 12px 16px; }
     nav .links .signin { margin-top: 8px; }
+    .nav-dropdown > a::after { content: ' ▾'; }
+    .nav-dropdown-menu { position: static; display: block; background: transparent; border: 0; box-shadow: none; padding: 0; margin: 0; min-width: 0; }
+    .nav-dropdown-menu a { padding: 10px 8px 10px 24px; border-bottom: 1px solid #1f2937; font-size: 0.9rem; }
     body.nav-open nav .links { transform: translateX(0); }
 
     /* Backdrop */
@@ -8476,6 +8491,16 @@ _LANDING_HTML = """<!DOCTYPE html>
     </button>
     <a href="#how" onclick="closeNav()">How it works</a>
     <a href="#pricing" onclick="closeNav()">Pricing</a>
+    <span class="nav-dropdown">
+      <a>Platforms</a>
+      <div class="nav-dropdown-menu">
+        <a href="/for/lovable">Lovable</a>
+        <a href="/for/bolt">Bolt</a>
+        <a href="/for/replit">Replit</a>
+        <a href="/for/vercel">Vercel / v0</a>
+        <a href="/for/cursor">Cursor</a>
+      </div>
+    </span>
     <a href="/blog">Blog</a>
     <a href="/reports/2026-q2">Q2 Report</a>
     <a href="/docs/api">API</a>

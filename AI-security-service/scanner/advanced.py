@@ -2539,9 +2539,36 @@ def scan_target_graphql_mutations(run_id: str, ip: str, name: str) -> list[dict]
 # ═════════════════════════════════════════════════════════════════════════════
 
 def scan_target_websocket(run_id: str, ip: str, name: str) -> list[dict]:
-    """Check if WebSocket endpoints accept connections without authentication."""
+    """Check if WebSocket endpoints accept connections without authentication.
+    Skips platform-level WS endpoints (Lovable/Bolt/Replit/Vercel/Streamlit
+    all accept WS upgrades at the infrastructure level — not an app finding)."""
     findings: list[dict] = []
+
+    # Skip platforms where WS upgrade is infrastructure-level, not app-level
+    platform_suffixes = (
+        ".lovable.app", ".bolt.host", ".bolt.new", ".replit.app",
+        ".vercel.app", ".netlify.app", ".streamlit.app",
+        ".herokuapp.com", ".onrender.com", ".fly.dev",
+    )
+    if any(ip.endswith(s) for s in platform_suffixes):
+        return findings
+
     ws_paths = ["/ws", "/socket", "/realtime", "/live", "/cable", "/hub"]
+
+    # First: check if the app actually references websockets in its HTML/JS
+    try:
+        html = subprocess.run(
+            ["curl", "-sk", "-m", "5", f"https://{ip}/"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout
+    except Exception:
+        return findings
+
+    # Only probe if the app explicitly uses websockets
+    ws_indicators = ["WebSocket", "wss://", "ws://", "socket.io", "ActionCable",
+                     "SignalR", "phoenix/socket", "cable.js"]
+    if not any(ind.lower() in html.lower() for ind in ws_indicators):
+        return findings
 
     for path in ws_paths:
         try:
@@ -2566,6 +2593,7 @@ def scan_target_websocket(run_id: str, ip: str, name: str) -> list[dict]:
                     "evidence": f"GET {ip}{path} with Upgrade: websocket → HTTP {code}",
                     "tool": "websocket-probe",
                 })
+                return findings  # One finding is enough — no need to report all 6 paths
         except Exception:
             continue
     return findings
@@ -2594,7 +2622,13 @@ def scan_target_open_redirect(run_id: str, ip: str, name: str) -> list[dict]:
             if "location:" in headers:
                 loc_line = [l for l in r.stdout.splitlines() if l.lower().startswith("location:")][0]
                 location = loc_line.split(":", 1)[1].strip()
-                if "evil.example.com" in location:
+                # Must actually redirect TO evil.example.com, not just pass it as a query param.
+                # A redirect to "https://same-site.com/login?next=https://evil.example.com" is NOT
+                # an open redirect — it's a same-domain redirect that preserves query params.
+                from urllib.parse import urlparse
+                parsed = urlparse(location)
+                redirect_host = parsed.hostname or ""
+                if redirect_host == "evil.example.com":
                     findings.append({
                         "target": ip, "severity": "HIGH", "category": "application",
                         "title": f"Open redirect via ?{param}= on /login",

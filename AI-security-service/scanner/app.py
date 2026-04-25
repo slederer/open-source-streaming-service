@@ -8709,43 +8709,50 @@ async function runQuickScan(e) {
       <div class="cap">
         <div class="head"><span class="ic" style="background:#14532d;color:#86efac;">&#128279;</span><span class="name">Application surface</span></div>
         <ul>
-          <li><strong>Exposed endpoints</strong><small>/docs, /redoc, /.env, /.git, /actuator/env, /terraform.tfstate, /docker-compose.yml — 25 paths</small></li>
+          <li><strong>Exposed endpoints</strong><small>/.env, /.git, /docs, /actuator, /terraform.tfstate — 25+ paths</small></li>
+          <li><strong>Admin panel exposure</strong><small>/admin, /dashboard, /_admin, /cms + admin API endpoints</small></li>
+          <li><strong>API enumeration</strong><small>/api/v2, /api/internal, /api/debug — flags auth regressions</small></li>
           <li><strong>OpenAPI audit</strong><small>parses /openapi.json, flags missing security on every operation</small></li>
-          <li><strong>API fuzz</strong><small>SQL / NoSQL / LDAP injection signatures</small></li>
-          <li><strong>SQL injection</strong><small>boolean-based + error-based SQLi detection on parameterized endpoints</small></li>
-          <li><strong>SSTI probe</strong><small>server-side template injection in Jinja2, Mako, ERB, FreeMarker</small></li>
-          <li><strong>GraphQL probe</strong><small>introspection + password-field detection + dangerous mutations + Hasura anonymous-role audit</small></li>
+          <li><strong>GraphQL probe</strong><small>introspection, dangerous mutations, Hasura anonymous-role audit</small></li>
           <li><strong>CORS + CSP audit</strong><small>wildcard-origin + credentials, unsafe-eval / unsafe-inline</small></li>
-          <li><strong>Rate limit probe</strong><small>brute-force resistance check on auth paths</small></li>
-          <li><strong>API enumeration</strong><small>discovers /api/v2, /api/internal, /api/debug, /api/beta — flags auth regressions</small></li>
           <li><strong>Error leak probe</strong><small>triggers verbose errors to find stack traces, file paths, DB details</small></li>
         </ul>
       </div>
 
       <div class="cap">
-        <div class="head"><span class="ic" style="background:#7c2d12;color:#fdba74;">&#128273;</span><span class="name">Auth &amp; session</span></div>
+        <div class="head"><span class="ic" style="background:#7c2d12;color:#fdba74;">&#128273;</span><span class="name">Auth &amp; access control</span></div>
         <ul>
-          <li><strong>JWT audit</strong><small>alg=none acceptance, HS256 weak-secret crack against ~35 common values</small></li>
-          <li><strong>OAuth probe</strong><small>open-redirect on redirect_uri across 7 common paths</small></li>
-          <li><strong>Session entropy</strong><small>Shannon entropy + sequential-token detection on Set-Cookie</small></li>
-          <li><strong>Auth probes</strong><small>username enumeration, weak-password acceptance</small></li>
-          <li><strong>Auth bypass</strong><small>tests 35+ sensitive API endpoints (/api/users, /api/admin, /api/billing) without auth tokens</small></li>
-          <li><strong>Signup mass-assignment</strong><small>probes register endpoints for role=admin, isAdmin=true privilege escalation</small></li>
-          <li><strong>Mass assignment</strong><small>PATCH/PUT endpoints tested for privilege escalation via extra fields</small></li>
-          <li><strong>Login brute-force</strong><small>rate limiting on login, signup, password-reset endpoints</small></li>
-          <li><strong>Payment webhook bypass</strong><small>sends unsigned Stripe/Paddle events — flags missing signature verification</small></li>
-          <li><strong>Admin panel exposure</strong><small>probes /admin, /dashboard, /_admin, /cms + admin API endpoints</small></li>
-          <li><strong>PII exposure</strong><small>scans API list endpoints for leaked emails, phones, password hashes, SSNs</small></li>
-          <li><strong>IDOR / BOLA sweep</strong><small>3-ID sweep on discovered endpoints, PII-leak detection in response bodies</small></li>
+          <li><strong>Auth bypass</strong><small>tests 35+ sensitive endpoints without auth tokens</small></li>
+          <li><strong>Signup mass-assignment</strong><small>probes register endpoints for role=admin privilege escalation</small></li>
+          <li><strong>Mass assignment</strong><small>PATCH/PUT with extra fields (role, isAdmin, plan)</small></li>
+          <li><strong>IDOR / BOLA sweep</strong><small>3-ID sweep on discovered endpoints, PII-leak detection</small></li>
+          <li><strong>PII exposure</strong><small>scans API list endpoints for leaked emails, phones, password hashes</small></li>
+          <li><strong>JWT audit</strong><small>alg=none, HS256 weak-secret crack, session entropy</small></li>
+          <li><strong>Login brute-force</strong><small>rate limiting on login, signup, password-reset</small></li>
         </ul>
       </div>
 
       <div class="cap">
-        <div class="head"><span class="ic" style="background:#7f1d1d;color:#fca5a5;">&#128275;</span><span class="name">Secrets in client bundles</span></div>
+        <div class="head"><span class="ic" style="background:#991b1b;color:#fecaca;">&#9889;</span><span class="name">Injection &amp; exploits</span></div>
         <ul>
-          <li><strong>38 provider patterns</strong><small>Anthropic <code>sk-ant-*</code>, OpenAI <code>sk-proj-*</code>, AWS <code>AKIA*</code>, Stripe <code>sk_live_*</code>, GitHub <code>ghp_*</code>, Google <code>AIza*</code>, Clerk, Pinecone, Weaviate, LangSmith, Supabase, npm, PyPI, Vercel, Netlify, Cloudflare, Heroku, Digital Ocean, Azure, GCP service-account JSON</small></li>
-          <li><strong>Supabase service_role detection</strong><small>decodes JWT payload to flag the catastrophic admin key (regex can't tell it apart from anon)</small></li>
-          <li><strong>Hardcoded passwords + private keys</strong><small>PEM blocks, DB connection strings with embedded credentials</small></li>
+          <li><strong>SQL injection</strong><small>boolean-based + error-based SQLi on parameterized endpoints</small></li>
+          <li><strong>XSS probe</strong><small>reflected XSS with 3 payloads on discovered parameters</small></li>
+          <li><strong>SSTI probe</strong><small>template injection in Jinja2, Mako, ERB, FreeMarker</small></li>
+          <li><strong>API fuzz</strong><small>SQL / NoSQL / LDAP injection signatures</small></li>
+          <li><strong>Payment webhook bypass</strong><small>unsigned Stripe/Paddle events — missing signature verification</small></li>
+          <li><strong>OAuth redirect</strong><small>open-redirect on redirect_uri across 7 common paths</small></li>
+          <li><strong>SSRF probe</strong><small>fetch-URL endpoints tested against AWS metadata</small></li>
+        </ul>
+      </div>
+
+      <div class="cap">
+        <div class="head"><span class="ic" style="background:#7f1d1d;color:#fca5a5;">&#128275;</span><span class="name">Secrets &amp; data exposure</span></div>
+        <ul>
+          <li><strong>38 provider patterns</strong><small>Anthropic, OpenAI, AWS, Stripe, GitHub, Google, Clerk, Supabase, and 30 more</small></li>
+          <li><strong>Supabase service_role</strong><small>decodes JWT payload to flag the catastrophic admin key</small></li>
+          <li><strong>Hardcoded credentials</strong><small>PEM blocks, DB connection strings with embedded passwords</small></li>
+          <li><strong>Source map exposure</strong><small>detects .js.map files that reveal original source code</small></li>
+          <li><strong>Cookie security</strong><small>missing HttpOnly, Secure, SameSite flags</small></li>
         </ul>
       </div>
 
@@ -8773,16 +8780,14 @@ async function runQuickScan(e) {
       </div>
 
       <div class="cap">
-        <div class="head"><span class="ic" style="background:#312e81;color:#a5b4fc;">&#129504;</span><span class="name">AI-assisted modules</span></div>
+        <div class="head"><span class="ic" style="background:#312e81;color:#a5b4fc;">&#129504;</span><span class="name">AI &amp; CVE modules</span></div>
         <ul>
-          <li><strong>OpenAPI deep-audit</strong><small>Sonnet classifies every endpoint, scanner live-probes only the unauthed GETs</small></li>
-          <li><strong>JS analyzer</strong><small>extracts API endpoints + auth patterns + secrets from the bundle, probes each</small></li>
-          <li><strong>Finding triage</strong><small>post-processes AI-originated findings against known false-positive patterns (180-second budget per target)</small></li>
-          <li><strong>Prompt-injection probe</strong><small>2 minimal canary probes per discovered chat endpoint, scanner-labeled</small></li>
-          <li><strong>Nuclei CVE templates</strong><small>8000+ community templates (log4j, spring4shell, etc.)</small></li>
-          <li><strong>JS library CVE</strong><small>vulnerable jQuery / lodash / moment versions by banner + @version</small></li>
-          <li><strong>Typosquat npm deps</strong><small>known-typosquatted package imports in the bundle</small></li>
-          <li><strong>OSINT dorks</strong><small>Google + GitHub searches for secrets near the target's domain</small></li>
+          <li><strong>OpenAPI deep-audit</strong><small>Sonnet classifies every endpoint, live-probes unauthed GETs</small></li>
+          <li><strong>JS bundle analyzer</strong><small>extracts endpoints + auth patterns + secrets, probes each</small></li>
+          <li><strong>AI finding triage</strong><small>demotes false positives, re-verifies uncertain findings</small></li>
+          <li><strong>Prompt-injection probe</strong><small>canary probes on discovered chat endpoints</small></li>
+          <li><strong>Nuclei CVE templates</strong><small>8000+ templates (log4j, spring4shell, etc.)</small></li>
+          <li><strong>JS library CVE + typosquat</strong><small>vulnerable versions + known-typosquatted npm packages</small></li>
         </ul>
       </div>
 

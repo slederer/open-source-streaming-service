@@ -2775,6 +2775,17 @@ SCAN_MODULES = [
     ("zone_transfer",   "DNS zone transfer attempt",         "scan_target_zone_transfer"),
     ("supabase_edge",   "Supabase Edge Function probe",      "scan_target_supabase_edge"),
     ("dep_confusion",   "Dependency confusion check",        "scan_target_dep_confusion"),
+    ("signup_takeover", "Signup mass-assignment probe",      "scan_target_signup_takeover"),
+    ("auth_bypass",     "Missing auth on API endpoints",     "scan_target_auth_bypass"),
+    ("mass_assign",     "Mass assignment on update endpoints","scan_target_mass_assign"),
+    ("payment_bypass",  "Payment webhook signature bypass",  "scan_target_payment_bypass"),
+    ("admin_panel",     "Exposed admin/internal dashboards", "scan_target_admin_panel"),
+    ("login_bruteforce","Login brute-force resistance",     "scan_target_login_bruteforce"),
+    ("pii_exposure",    "PII exposure in API responses",    "scan_target_pii_exposure"),
+    ("error_leak",      "Verbose error information leakage","scan_target_error_leak"),
+    ("sqli_basic",      "SQL injection detection",          "scan_target_sqli_basic"),
+    ("ssti_probe",      "Server-side template injection",   "scan_target_ssti"),
+    ("api_enum",        "API version & internal endpoints", "scan_target_api_enum"),
     # Structured AI modules (replaces the retired `ai_chain` fuzzy reasoner).
     # Each has narrow structured I/O and live-verifies its own claims before
     # emitting a finding.
@@ -7330,7 +7341,7 @@ VIEWS.overview = async () => {
 
     <div class="card">
       <h2>Scanning capabilities</h2>
-      <div style="color:var(--text-muted);font-size:0.85rem;margin-bottom:16px;">70+ modules run on every scan, organized into 5 categories.</div>
+      <div style="color:var(--text-muted);font-size:0.85rem;margin-bottom:16px;">80+ modules run on every scan, organized into 5 categories.</div>
       <div class="grid grid-cards" style="gap:12px;">
         ${[
           // Network + transport
@@ -8334,11 +8345,11 @@ _LANDING_HTML = """<!DOCTYPE html>
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://securityscanner.dev/">
 <meta property="og:title" content="Security Scanner — AI-native vulnerability scanning">
-<meta property="og:description" content="Scan any deployed web app. 70+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
+<meta property="og:description" content="Scan any deployed web app. 80+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
 <meta property="og:image" content="https://securityscanner.dev/og.png">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Security Scanner — AI-native vulnerability scanning">
-<meta name="twitter:description" content="Scan any deployed web app. 70+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
+<meta name="twitter:description" content="Scan any deployed web app. 80+ modules. AI-powered fix instructions your Claude Code / Cursor / Cline can execute directly.">
 <meta name="twitter:image" content="https://securityscanner.dev/og.png">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -8530,7 +8541,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape')closeNav();});
 <section class="hero">
   <div class="container">
     <h1>Security scans for the<br><span>vibe-coding</span> era.</h1>
-    <p>Scan any deployed app. 70+ modules: Supabase RLS probe, AI-key detection, XSS testing, GraphQL audit, Firebase deep probe, subdomain takeover, IDOR detection, AI code fingerprinting, OWASP compliance reports, and more. PDF reports, CI/CD webhooks, Slack/Discord alerts.</p>
+    <p>Scan any deployed app. 80+ modules: Supabase RLS probe, AI-key detection, XSS testing, GraphQL audit, Firebase deep probe, subdomain takeover, IDOR detection, AI code fingerprinting, OWASP compliance reports, and more. PDF reports, CI/CD webhooks, Slack/Discord alerts.</p>
     <div id="quick-scan" style="margin:28px auto 0;max-width:560px;">
       <form id="qs-form" onsubmit="return runQuickScan(event)" style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;">
         <input type="text" id="qs-url" required placeholder="https://your-app.com" style="flex:1;min-width:240px;background:#111827;border:1px solid #1f2937;color:#e5e7eb;padding:13px 16px;border-radius:8px;font-size:1rem;font-family:inherit;">
@@ -8568,7 +8579,7 @@ async function runQuickScan(e) {
       html += ' <span style="color:#d1d5db;font-size:0.88rem;">' + f.title + '</span></div></div>';
     });
     html += '<div style="margin-top:18px;padding-top:14px;border-top:1px solid #1f2937;text-align:center;">';
-    html += '<div style="color:#9ca3af;font-size:0.85rem;margin-bottom:12px;">This is a quick preview (6 checks). The full scan runs <strong>70+ modules</strong> including Supabase RLS probe, nuclei CVE templates, subdomain takeover, and AI-powered analysis.</div>';
+    html += '<div style="color:#9ca3af;font-size:0.85rem;margin-bottom:12px;">This is a quick preview (6 checks). The full scan runs <strong>80+ modules</strong> including Supabase RLS probe, nuclei CVE templates, subdomain takeover, and AI-powered analysis.</div>';
     html += '<a href="/signup" class="btn btn-primary" style="display:inline-flex;padding:10px 22px;">Get the full scan free →</a>';
     html += '</div></div>';
     results.innerHTML = html;
@@ -8609,7 +8620,7 @@ async function runQuickScan(e) {
       </div>
       <div class="step">
         <div class="num">STEP 2</div>
-        <h3>We run 70+ modules</h3>
+        <h3>We run 80+ modules</h3>
         <p>Transport &amp; headers, Supabase RLS probe with real table names from your JS bundle, GraphQL introspection audit, AI-key leak detection (Anthropic, OpenAI, AWS, Stripe), subdomain takeover (Vercel, Netlify, Unbounce), CORS / CSP / TLS / nuclei 8k+ CVE templates, prompt-injection probing, and more.</p>
       </div>
       <div class="step">
@@ -8680,7 +8691,7 @@ async function runQuickScan(e) {
 
 <section id="capabilities">
   <div class="container">
-    <h2>70+ checks on every scan</h2>
+    <h2>80+ checks on every scan</h2>
     <p class="sub">Organized into 7 categories. <a href="/blog/what-security-scanner-actually-does" style="color:#dc2626;">Full module-level walkthrough →</a></p>
     <div class="caps">
 
@@ -9205,7 +9216,7 @@ def _generate_og_image() -> bytes:
               fill=(209, 213, 219), font=sub_font)
     draw.text((60, 540), "securityscanner.dev",
               fill=(220, 38, 38), font=sub_font)
-    draw.text((60, 580), "70+ checks · MCP · Custom GPT · API",
+    draw.text((60, 580), "80+ checks · MCP · Custom GPT · API",
               fill=(107, 114, 128), font=tag_font)
     import io
     buf = io.BytesIO()
@@ -9244,7 +9255,7 @@ _CHANGELOG_ENTRIES = [
         "New: 14 scan modules — XSS probe, cookie audit, Firebase deep probe, unsafe JS patterns, "
         "AI code fingerprinting, hallucination detection, GraphQL mutation testing, WebSocket probe, "
         "open redirect, CSP bypass analysis, HSTS preload check, DNS zone transfer, Supabase Edge "
-        "Function probe, dependency confusion check. Scanner now runs 70+ modules.",
+        "Function probe, dependency confusion check. Scanner now runs 80+ modules.",
         "New: PDF export for scan reports + OWASP Top 10 compliance report (PDF)",
         "New: 'Copy fix to Cursor' button on every finding",
         "New: trust badge — embeddable SVG showing your scan grade",
@@ -9277,7 +9288,7 @@ _CHANGELOG_ENTRIES = [
         "Fix: ChatGPT OAuth flow (preserve ?next= through Google round-trip, SameSite=None cookies)",
     ]),
     ("2026-04-15", [
-        "New: 'What we check' capabilities section on the homepage — 70+ modules across 7 categories",
+        "New: 'What we check' capabilities section on the homepage — 80+ modules across 7 categories",
         "New: blog redesign with hero + card grid + tags + reading time",
         "New: /.well-known/security.txt for responsible-disclosure researchers",
         "New: per-user hourly scan rate-limit + email-verify gate + target-add flood detection",
@@ -9533,7 +9544,7 @@ async def report_q2_2026():
 
     <div class="scan-cta" style="background:linear-gradient(135deg, #111827 0%, #1a1020 100%); border-color:#2d1f3d;">
       <h3>Get the full scan on your app</h3>
-      <p>70+ modules: Supabase RLS deep probe, XSS, IDOR, API key detection, Firebase audit, AI code fingerprinting, OWASP compliance report, and more.</p>
+      <p>80+ modules: Supabase RLS deep probe, XSS, IDOR, API key detection, Firebase audit, AI code fingerprinting, OWASP compliance report, and more.</p>
       <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
         <a href="/signup" style="background:#dc2626;color:white;padding:11px 24px;border-radius:8px;font-weight:600;text-decoration:none;font-size:0.95rem;">Sign up free — no card</a>
         <a href="/" style="background:transparent;color:#e5e7eb;padding:11px 24px;border-radius:8px;font-weight:600;text-decoration:none;font-size:0.95rem;border:1px solid #1f2937;">Try quick scan</a>
@@ -9839,7 +9850,7 @@ async def tool_page(tool_slug: str):
   <div id="qs-results" style="margin-top:20px;"></div>
 </div>
 <h2>What this checks</h2>
-<p>This free tool runs a quick scan focused on {tool['check']}. For a comprehensive audit covering 70+ modules (Supabase RLS, IDOR, subdomain takeover, nuclei CVE templates, and more), <a href="/signup">sign up for the full scan</a> — one free, no card.</p>
+<p>This free tool runs a quick scan focused on {tool['check']}. For a comprehensive audit covering 80+ modules (Supabase RLS, IDOR, subdomain takeover, nuclei CVE templates, and more), <a href="/signup">sign up for the full scan</a> — one free, no card.</p>
 <h2>Related</h2>
 <ul>
 <li><a href="/blog/top-5-supabase-rls-mistakes-on-lovable-apps">Top 5 Supabase RLS mistakes on Lovable apps</a></li>

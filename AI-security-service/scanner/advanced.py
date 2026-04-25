@@ -2930,3 +2930,1153 @@ def scan_target_dep_confusion(run_id: str, ip: str, name: str) -> list[dict]:
         except Exception:
             continue
     return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Signup mass-assignment / privilege escalation probe
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_signup_takeover(run_id: str, ip: str, name: str) -> list[dict]:
+    """Probe signup/register endpoints for mass-assignment vulnerabilities.
+
+    AI-generated backends commonly accept any JSON field on the signup endpoint,
+    allowing an attacker to set role=admin, isAdmin=true, or plan=enterprise
+    during account creation.  GET-safe: we POST with a disposable probe email
+    and check what the server echoes back — we never use the account.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    signup_paths = [
+        "/api/auth/signup", "/api/auth/register", "/api/register",
+        "/api/signup", "/api/users", "/api/v1/auth/signup",
+        "/api/v1/register", "/api/v1/signup", "/auth/register",
+        "/auth/signup", "/api/auth/sign-up", "/api/user/register",
+    ]
+
+    # Probe email unique per run to avoid collisions
+    probe_email = f"secprobe+{run_id[:8]}@probe.invalid"
+    # Escalation fields that AI-generated code commonly accepts
+    escalation_fields = {
+        "role": "admin", "isAdmin": True, "is_admin": True,
+        "is_premium": True, "plan": "enterprise", "type": "admin",
+        "permissions": ["*"], "admin": True, "userRole": "admin",
+        "account_type": "admin", "subscription": "pro",
+    }
+
+    base_body = {
+        "email": probe_email,
+        "password": "ProbeTest1234!",
+        "name": "Security Probe",
+    }
+    payload = {**base_body, **escalation_fields}
+    payload_json = json.dumps(payload)
+
+    for path in signup_paths:
+        url = f"https://{ip}{path}"
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "8", "-A", _UA,
+                 "-X", "POST", "-H", "Content-Type: application/json",
+                 "-d", payload_json, url],
+                capture_output=True, text=True, timeout=12,
+            )
+        except Exception:
+            continue
+
+        status_m = re.search(r"HTTP/\S+\s+(\d+)", r.stderr or "")
+        status = status_m.group(1) if status_m else ""
+        body = (r.stdout or "")[:8000]
+
+        # Skip non-responsive or clearly wrong endpoints
+        if status not in ("200", "201", "202"):
+            continue
+        if not body.strip():
+            continue
+
+        # Check if the response echoes back any escalation field values
+        body_lower = body.lower()
+        escalated = []
+        for field, val in escalation_fields.items():
+            val_str = str(val).lower()
+            # Look for the field name AND value appearing in the response
+            if field.lower() in body_lower and val_str in body_lower:
+                escalated.append(f"{field}={val}")
+
+        if escalated:
+            findings.append({
+                "target": ip, "severity": "CRITICAL", "category": "auth",
+                "title": f"Mass assignment on signup — privilege escalation at {path}",
+                "description": (
+                    f"The signup endpoint at {path} accepted and echoed back "
+                    f"privilege escalation fields: {', '.join(escalated)}. "
+                    "An attacker can create an admin account by adding extra "
+                    "fields to the signup request. Fix: whitelist allowed "
+                    "fields on the server side (email, password, name only)."
+                ),
+                "evidence": f"POST {url}\nPayload included: {', '.join(escalated)}\nResponse: {body[:500]}",
+                "tool": "signup-probe",
+            })
+            continue
+
+        # Check if signup returns internal/sensitive fields (over-exposure)
+        internal_fields = [
+            '"_id"', '"id":', '"created_at"', '"createdAt"',
+            '"updated_at"', '"role"', '"password_hash"', '"hashed_password"',
+            '"salt"', '"token"', '"apiKey"', '"api_key"',
+        ]
+        exposed = [f for f in internal_fields if f in body]
+        if len(exposed) >= 3:
+            findings.append({
+                "target": ip, "severity": "HIGH", "category": "auth",
+                "title": f"Signup response over-exposes internal fields at {path}",
+                "description": (
+                    f"The signup endpoint at {path} returns internal fields "
+                    f"in its response body: {', '.join(exposed[:5])}. "
+                    "This leaks implementation details and may expose "
+                    "sensitive data. Fix: return only necessary fields."
+                ),
+                "evidence": f"POST {url}\nResponse contains: {', '.join(exposed)}\nBody: {body[:300]}",
+                "tool": "signup-probe",
+            })
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Missing authentication on API endpoints
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_auth_bypass(run_id: str, ip: str, name: str) -> list[dict]:
+    """Test whether sensitive API endpoints respond with real data when called
+    without any authentication token.
+
+    AI-generated backends often forget to add auth middleware to API routes,
+    especially admin/settings/billing endpoints.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    # Collect endpoints discovered during this scan run
+    discovered_paths = set()
+    try:
+        for f in _db_find_run_findings(run_id):
+            ev = f.get("evidence", "")
+            for m in re.findall(r"(?:GET|POST|PUT|PATCH)\s+(\/api/\S+)", ev):
+                discovered_paths.add(m.split("?")[0])
+            for m in re.findall(r"https?://[^/]+(\/api/\S+)", ev):
+                discovered_paths.add(m.split("?")[0])
+    except Exception:
+        pass
+
+    # Generic sensitive endpoints — the ones most likely to be unprotected
+    sensitive = [
+        "/api/users", "/api/admin", "/api/admin/users",
+        "/api/settings", "/api/config", "/api/billing",
+        "/api/dashboard", "/api/analytics", "/api/internal",
+        "/api/internal/users", "/api/accounts",
+        "/api/orders", "/api/payments", "/api/invoices",
+        "/api/v1/users", "/api/v1/admin", "/api/v1/settings",
+        "/api/customers", "/api/team", "/api/members",
+        "/api/profiles", "/api/user/me", "/api/me",
+    ]
+    # Merge discovered + generic, limit total probes
+    all_paths = list(dict.fromkeys(list(discovered_paths)[:15] + sensitive))[:35]
+
+    # Build SPA baseline — avoid false positives from SPA fallback
+    spa_hash = None
+    try:
+        _, _, root_body = _curl(f"https://{ip}/", timeout=5)
+        _, _, random_body = _curl(f"https://{ip}/__probe_{hashlib.md5(run_id.encode()).hexdigest()[:8]}", timeout=5)
+        if root_body and random_body:
+            rh = hashlib.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
+            nh = hashlib.sha256(random_body.encode("utf-8", errors="replace")).hexdigest()
+            if rh == nh:
+                spa_hash = rh
+    except Exception:
+        pass
+
+    pii_regexes = [re.compile(p) for p in _PII_MARKERS]
+    admin_paths = {"/api/admin", "/api/admin/users", "/api/internal",
+                   "/api/internal/users", "/api/v1/admin"}
+
+    for path in all_paths:
+        url = f"https://{ip}{path}"
+        try:
+            status, ctype, body = _curl(url, timeout=5, max_bytes=30_000)
+        except Exception:
+            continue
+
+        if status != "200" or not body.strip():
+            continue
+        if "json" not in (ctype or "").lower():
+            continue
+
+        # SPA fallback check
+        if spa_hash:
+            bh = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+            if bh == spa_hash:
+                continue
+
+        # Must look like real data (array of objects or object with data)
+        body_stripped = body.strip()
+        if not (body_stripped.startswith("[") or body_stripped.startswith("{")):
+            continue
+        # Skip trivial responses (health checks, empty objects)
+        if len(body_stripped) < 50:
+            continue
+        # Skip if it looks like an error/status response
+        if any(k in body_stripped[:200].lower() for k in ['"error"', '"message":"not', '"status":"error']):
+            continue
+
+        # Check for PII in response
+        has_pii = False
+        for pr in pii_regexes:
+            if pr.search(body[:4000]):
+                has_pii = True
+                break
+
+        is_admin = path in admin_paths
+
+        if is_admin or has_pii:
+            sev = "CRITICAL"
+            title_prefix = "Admin API" if is_admin else "API with PII"
+            findings.append({
+                "target": ip, "severity": sev, "category": "auth",
+                "title": f"{title_prefix} accessible without authentication: {path}",
+                "description": (
+                    f"The endpoint {path} returns real data (including "
+                    + ("PII such as emails/phone numbers" if has_pii else "admin-level content")
+                    + ") without any authentication token. An attacker can "
+                    "access this data directly. Fix: add authentication "
+                    "middleware to this route."
+                ),
+                "evidence": f"GET {url} (no Authorization header)\nStatus: 200\nBody: {body[:500]}",
+                "tool": "auth-bypass",
+            })
+        else:
+            # Still flag non-admin unauthenticated APIs returning data
+            # Only if response looks like multi-record data (array or paginated)
+            if body_stripped.startswith("[") and body_stripped.count("{") >= 2:
+                findings.append({
+                    "target": ip, "severity": "HIGH", "category": "auth",
+                    "title": f"API endpoint accessible without authentication: {path}",
+                    "description": (
+                        f"The endpoint {path} returns a list of records without "
+                        "requiring any authentication. Review whether this data "
+                        "should be publicly accessible. Fix: add auth middleware."
+                    ),
+                    "evidence": f"GET {url} (no Authorization header)\nStatus: 200\n{len(body)} bytes, starts with array\nBody: {body[:300]}",
+                    "tool": "auth-bypass",
+                })
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Mass assignment / attribute injection on update endpoints
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_mass_assign(run_id: str, ip: str, name: str) -> list[dict]:
+    """Test PATCH/PUT endpoints for mass-assignment: send extra privilege
+    escalation fields and check if the server echoes them back.
+
+    Conservative approach: we only flag when the response body explicitly
+    contains our injected values, suggesting the server accepted them.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    update_paths = [
+        "/api/user/me", "/api/profile", "/api/account",
+        "/api/settings", "/api/v1/user/me", "/api/v1/profile",
+        "/api/me", "/api/user", "/api/users/me",
+    ]
+
+    escalation = {
+        "role": "admin", "isAdmin": True, "is_admin": True,
+        "plan": "enterprise", "permissions": ["*"],
+        "balance": 999999, "credits": 999999,
+        "subscription_tier": "enterprise",
+    }
+    escalation_json = json.dumps(escalation)
+
+    for path in update_paths:
+        url = f"https://{ip}{path}"
+        for method in ["PATCH", "PUT"]:
+            try:
+                r = subprocess.run(
+                    ["curl", "-sk", "-m", "6", "-A", _UA,
+                     "-X", method, "-H", "Content-Type: application/json",
+                     "-d", escalation_json, url],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except Exception:
+                continue
+
+            status_m = re.search(r"HTTP/\S+\s+(\d+)", r.stderr or "")
+            status = status_m.group(1) if status_m else ""
+            body = (r.stdout or "")[:5000]
+
+            # We only care about successful responses
+            if status not in ("200", "201", "202"):
+                continue
+            if not body.strip() or "json" not in (r.stderr or "").lower():
+                continue
+
+            body_lower = body.lower()
+            accepted = []
+            for field, val in escalation.items():
+                val_str = json.dumps(val).lower().strip('"')
+                if field.lower() in body_lower and val_str in body_lower:
+                    accepted.append(f"{field}={val}")
+
+            if accepted:
+                findings.append({
+                    "target": ip, "severity": "CRITICAL", "category": "auth",
+                    "title": f"Mass assignment accepted on {method} {path}",
+                    "description": (
+                        f"The endpoint accepted privilege escalation fields: "
+                        f"{', '.join(accepted)}. An attacker can escalate "
+                        "their account to admin or modify billing/plan fields "
+                        "by including extra fields in update requests. "
+                        "Fix: whitelist mutable fields on the server side."
+                    ),
+                    "evidence": f"{method} {url}\nAccepted fields: {', '.join(accepted)}\nResponse: {body[:400]}",
+                    "tool": "mass-assign",
+                })
+                break  # Don't test PUT if PATCH already found it
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Payment webhook signature bypass (Stripe / Paddle / LemonSqueezy)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_payment_bypass(run_id: str, ip: str, name: str) -> list[dict]:
+    """Check if payment webhook endpoints accept unsigned payloads.
+
+    AI-generated payment integration code almost never verifies webhook
+    signatures. An attacker can send a fake checkout.session.completed event
+    to mark any order as paid without actually paying.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    webhook_paths = [
+        "/api/webhooks/stripe", "/api/webhook/stripe", "/api/stripe/webhook",
+        "/api/stripe", "/api/payments/webhook", "/webhooks/stripe",
+        "/api/billing/webhook", "/api/webhook", "/api/webhooks",
+        "/api/webhooks/payment", "/api/payment/webhook",
+        "/webhook/stripe", "/stripe/webhook",
+        # Paddle / LemonSqueezy variants
+        "/api/webhooks/paddle", "/api/webhooks/lemonsqueezy",
+        "/api/webhook/paddle", "/api/webhook/lemonsqueezy",
+    ]
+
+    # Minimal fake Stripe checkout.session.completed event
+    fake_event = json.dumps({
+        "id": "evt_secprobe_test",
+        "object": "event",
+        "type": "checkout.session.completed",
+        "data": {
+            "object": {
+                "id": "cs_secprobe_test",
+                "object": "checkout.session",
+                "customer": "cus_secprobe",
+                "payment_status": "paid",
+                "amount_total": 100,
+                "currency": "usd",
+                "metadata": {},
+            }
+        },
+        "livemode": False,
+    })
+
+    for path in webhook_paths:
+        url = f"https://{ip}{path}"
+        try:
+            # Send WITHOUT Stripe-Signature header — if accepted, it's vulnerable
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "8", "-A", _UA,
+                 "-X", "POST", "-H", "Content-Type: application/json",
+                 "-w", "\n%{http_code}", "-d", fake_event, url],
+                capture_output=True, text=True, timeout=12,
+            )
+        except Exception:
+            continue
+
+        output = (r.stdout or "").strip()
+        # Extract status code from -w output
+        lines = output.rsplit("\n", 1)
+        body = lines[0] if len(lines) > 1 else ""
+        status = lines[-1].strip() if lines else ""
+
+        if not status:
+            continue
+
+        # Skip endpoints that don't exist
+        if status in ("404", "405", "000", ""):
+            continue
+
+        body_lower = body.lower()
+
+        # 401/403/400 mentioning signature = properly secured
+        if status in ("400", "401", "403"):
+            if any(kw in body_lower for kw in ["signature", "webhook_secret", "signing", "stripe-signature", "unauthorized"]):
+                continue  # Properly rejecting — good
+            # 400/401/403 without signature mention is ambiguous, skip
+            continue
+
+        # 200/201/202 = webhook accepted without signature verification
+        if status in ("200", "201", "202"):
+            # Extra check: response shouldn't look like a generic SPA/404 page
+            if "<html" in body_lower and "checkout" not in body_lower:
+                continue
+            if len(body) < 5 and body.strip() in ("", "ok", "OK", "{}"):
+                # Many webhook handlers just return 200 with empty body
+                pass
+
+            findings.append({
+                "target": ip, "severity": "CRITICAL", "category": "auth",
+                "title": f"Payment webhook accepts unsigned events at {path}",
+                "description": (
+                    f"The webhook endpoint {path} returned HTTP {status} when "
+                    "sent a fake Stripe checkout.session.completed event "
+                    "WITHOUT a Stripe-Signature header. An attacker can "
+                    "forge payment events to mark orders as paid, unlock "
+                    "premium features, or credit accounts without paying. "
+                    "Fix: verify the Stripe-Signature header using your "
+                    "webhook secret before processing any event. See "
+                    "https://stripe.com/docs/webhooks/signatures"
+                ),
+                "evidence": f"POST {url} (no Stripe-Signature header)\nStatus: {status}\nBody: {body[:300]}",
+                "tool": "payment-bypass",
+            })
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Exposed admin/internal dashboards
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_admin_panel(run_id: str, ip: str, name: str) -> list[dict]:
+    """Probe for admin panels, internal dashboards, and admin API endpoints
+    that are accessible without authentication.
+
+    Uses SPA-fallback fingerprinting to suppress false positives from
+    single-page apps that serve index.html for all unknown paths.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    admin_paths = {
+        # HTML dashboards
+        "/admin":           ("text/html", ["dashboard", "admin panel", "users", "settings", "manage"]),
+        "/admin/dashboard": ("text/html", ["dashboard", "statistics", "analytics", "users"]),
+        "/_admin":          ("text/html", ["admin", "dashboard", "manage"]),
+        "/backstage":       ("text/html", ["backstage", "admin", "content"]),
+        "/cms":             ("text/html", ["cms", "content", "pages", "editor"]),
+        "/panel":           ("text/html", ["panel", "admin", "dashboard"]),
+        "/internal":        ("text/html", ["internal", "admin", "dashboard"]),
+        "/wp-admin":        ("text/html", ["wordpress", "wp-admin", "dashboard"]),
+        "/phpmyadmin":      ("text/html", ["phpmyadmin", "mysql", "database"]),
+        # API endpoints
+        "/api/admin/users": ("application/json", ['"email"', '"id"', '"name"']),
+        "/api/admin/settings": ("application/json", ['"setting"', '"key"', '"value"']),
+        "/api/internal/users": ("application/json", ['"email"', '"id"']),
+        "/api/admin/dashboard": ("application/json", ['"total"', '"count"', '"revenue"', '"users"']),
+    }
+
+    # SPA baseline
+    spa_hash = None
+    try:
+        _, _, root_body = _curl(f"https://{ip}/", timeout=5)
+        rand_path = f"/__probe_admin_{hashlib.md5(run_id.encode()).hexdigest()[:8]}"
+        _, _, rand_body = _curl(f"https://{ip}{rand_path}", timeout=5)
+        if root_body and rand_body:
+            rh = hashlib.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
+            nh = hashlib.sha256(rand_body.encode("utf-8", errors="replace")).hexdigest()
+            if rh == nh:
+                spa_hash = rh
+    except Exception:
+        pass
+
+    for path, (expected_ct, markers) in admin_paths.items():
+        url = f"https://{ip}{path}"
+        try:
+            status, ctype, body = _curl(url, timeout=6, max_bytes=50_000)
+        except Exception:
+            continue
+
+        if status != "200" or not body.strip():
+            continue
+
+        # SPA fallback check
+        if spa_hash:
+            bh = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+            if bh == spa_hash:
+                continue
+
+        # Content type must match expectation
+        if expected_ct == "application/json" and "json" not in (ctype or ""):
+            continue
+        if expected_ct == "text/html" and "html" not in (ctype or ""):
+            continue
+
+        # At least one marker must be present
+        body_lower = body[:8000].lower()
+        matched_markers = [m for m in markers if m.lower() in body_lower]
+        if not matched_markers:
+            continue
+
+        # Determine if it's a login page (requires auth) vs open dashboard
+        is_login = any(kw in body_lower for kw in ["login", "sign in", "password", "log in", "authenticate"])
+        has_data = any(kw in body_lower for kw in ["users", "dashboard", "analytics", "revenue", "orders", '"email"'])
+
+        if is_login and not has_data:
+            findings.append({
+                "target": ip, "severity": "LOW", "category": "disclosure",
+                "title": f"Admin login page exposed at {path}",
+                "description": (
+                    f"An admin login page is accessible at {path}. While it "
+                    "requires authentication, exposing the admin URL allows "
+                    "targeted brute-force attacks. Consider restricting access "
+                    "by IP or moving to a non-guessable path."
+                ),
+                "evidence": f"GET {url}\nStatus: 200\nMarkers: {', '.join(matched_markers)}",
+                "tool": "admin-panel",
+            })
+        else:
+            sev = "CRITICAL" if "json" in (ctype or "") else "HIGH"
+            findings.append({
+                "target": ip, "severity": sev, "category": "auth",
+                "title": f"Admin dashboard accessible without authentication: {path}",
+                "description": (
+                    f"The admin panel at {path} is accessible without any "
+                    "authentication. It contains: " +
+                    ", ".join(matched_markers[:3]) + ". An attacker can "
+                    "access administrative functions directly. "
+                    "Fix: add authentication middleware to all admin routes."
+                ),
+                "evidence": f"GET {url} (no auth)\nStatus: 200\nContent-Type: {ctype}\nBody: {body[:500]}",
+                "tool": "admin-panel",
+            })
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Login endpoint brute-force resistance
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_login_bruteforce(run_id: str, ip: str, name: str) -> list[dict]:
+    """Test login / auth endpoints specifically for rate limiting.
+
+    The existing ratelimit module tests the root path. This module targets
+    auth endpoints where missing rate limits are HIGH severity because they
+    enable credential stuffing and brute-force attacks.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    auth_endpoints = [
+        ("/api/auth/login",          "login"),
+        ("/api/login",               "login"),
+        ("/api/auth/signin",         "login"),
+        ("/api/v1/auth/login",       "login"),
+        ("/auth/login",              "login"),
+        ("/login",                   "login"),
+        ("/api/auth/forgot-password","reset"),
+        ("/api/forgot-password",     "reset"),
+        ("/api/auth/reset-password", "reset"),
+        ("/api/v1/auth/forgot-password", "reset"),
+    ]
+
+    dummy_login = json.dumps({"email": "probe@test.invalid", "password": "WrongPass123!"})
+    dummy_reset = json.dumps({"email": "probe@test.invalid"})
+
+    for path, kind in auth_endpoints:
+        url = f"https://{ip}{path}"
+        payload = dummy_login if kind == "login" else dummy_reset
+
+        # First check if endpoint exists at all
+        try:
+            r0 = subprocess.run(
+                ["curl", "-sk", "-m", "5", "-A", _UA,
+                 "-X", "POST", "-H", "Content-Type: application/json",
+                 "-w", "\n%{http_code}", "-d", payload, url],
+                capture_output=True, text=True, timeout=8,
+            )
+        except Exception:
+            continue
+
+        lines0 = (r0.stdout or "").strip().rsplit("\n", 1)
+        status0 = lines0[-1].strip() if lines0 else ""
+        # Skip non-existent endpoints
+        if status0 in ("404", "405", "000", "301", "302", ""):
+            continue
+        # Skip SPA fallback (HTML response to API POST)
+        body0 = lines0[0] if len(lines0) > 1 else ""
+        if "<html" in body0.lower() and "login" not in body0.lower():
+            continue
+
+        # Now send 20 rapid requests and check for rate limiting
+        got_429 = False
+        got_lockout = False
+        for _ in range(20):
+            try:
+                r = subprocess.run(
+                    ["curl", "-sk", "-m", "4", "-A", _UA,
+                     "-X", "POST", "-H", "Content-Type: application/json",
+                     "-w", "\n%{http_code}", "-d", payload, url],
+                    capture_output=True, text=True, timeout=7,
+                )
+            except Exception:
+                continue
+
+            rlines = (r.stdout or "").strip().rsplit("\n", 1)
+            rstatus = rlines[-1].strip() if rlines else ""
+            rbody = (rlines[0] if len(rlines) > 1 else "").lower()
+
+            if rstatus == "429":
+                got_429 = True
+                break
+            if any(kw in rbody for kw in ["rate limit", "too many", "locked", "blocked", "try again later", "captcha"]):
+                got_lockout = True
+                break
+
+        if not got_429 and not got_lockout:
+            sev = "HIGH" if kind == "login" else "MEDIUM"
+            findings.append({
+                "target": ip, "severity": sev, "category": "auth",
+                "title": f"No rate limiting on {kind} endpoint: {path}",
+                "description": (
+                    f"20 rapid POST requests to {path} with invalid credentials "
+                    "produced no 429 response, no lockout message, and no CAPTCHA. "
+                    + ("An attacker can brute-force user passwords at unlimited speed. "
+                       if kind == "login" else
+                       "An attacker can enumerate valid email addresses at unlimited speed. ")
+                    + "Fix: implement rate limiting (e.g., 5 attempts per minute per IP) "
+                    "and account lockout after repeated failures."
+                ),
+                "evidence": f"POST {url} × 20 — all returned HTTP {status0}, no throttling detected",
+                "tool": "login-bruteforce",
+            })
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — PII exposure in API list endpoints
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_pii_exposure(run_id: str, ip: str, name: str) -> list[dict]:
+    """Scan API list/collection endpoints for PII leaked in response bodies.
+
+    AI-generated APIs commonly return full user objects (including email,
+    phone, password hashes) on list endpoints without field filtering.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    list_endpoints = [
+        "/api/users", "/api/customers", "/api/profiles",
+        "/api/members", "/api/team", "/api/people",
+        "/api/v1/users", "/api/v1/customers",
+        "/api/contacts", "/api/employees", "/api/staff",
+        "/api/subscribers", "/api/leads",
+    ]
+
+    pii_patterns = {
+        "email": re.compile(r"[A-Za-z0-9._+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}"),
+        "phone": re.compile(r'"(?:phone|mobile|telephone)"\s*:\s*"\+?\d[\d\s()-]{7,}'),
+        "password_hash": re.compile(r'"\$2[aby]\$\d{2}\$|"sha256\$|"pbkdf2[_:]'),
+        "ssn": re.compile(r'"(?:ssn|social_security)"\s*:\s*"\d{3}-?\d{2}-?\d{4}"'),
+        "address": re.compile(r'"(?:address|street|street_address)"\s*:\s*"[^"]{10,}"'),
+        "credit_card": re.compile(r'"(?:card_number|creditCard|cc_number)"\s*:\s*"\d'),
+    }
+
+    # SPA baseline
+    spa_hash = None
+    try:
+        _, _, root_body = _curl(f"https://{ip}/", timeout=5)
+        _, _, rand_body = _curl(f"https://{ip}/__probe_pii_{hashlib.md5(run_id.encode()).hexdigest()[:8]}", timeout=5)
+        if root_body and rand_body:
+            rh = hashlib.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
+            nh = hashlib.sha256(rand_body.encode("utf-8", errors="replace")).hexdigest()
+            if rh == nh:
+                spa_hash = rh
+    except Exception:
+        pass
+
+    for path in list_endpoints:
+        url = f"https://{ip}{path}"
+        try:
+            status, ctype, body = _curl(url, timeout=6, max_bytes=50_000)
+        except Exception:
+            continue
+
+        if status != "200" or not body.strip():
+            continue
+        if "json" not in (ctype or "").lower():
+            continue
+        if spa_hash:
+            bh = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+            if bh == spa_hash:
+                continue
+
+        # Must be an array of objects (multi-record)
+        if not body.strip().startswith("["):
+            continue
+
+        # Check for PII types
+        found_pii = {}
+        for pii_type, pattern in pii_patterns.items():
+            matches = pattern.findall(body[:10000])
+            if matches:
+                found_pii[pii_type] = len(matches)
+
+        if not found_pii:
+            continue
+
+        # Count unique emails to gauge severity
+        emails = pii_patterns["email"].findall(body[:10000])
+        unique_emails = len(set(emails))
+
+        has_sensitive = any(k in found_pii for k in ["password_hash", "ssn", "credit_card"])
+        sev = "CRITICAL" if has_sensitive or unique_emails > 5 else "HIGH"
+
+        pii_summary = ", ".join(f"{k}: {v} instances" for k, v in found_pii.items())
+        findings.append({
+            "target": ip, "severity": sev, "category": "auth",
+            "title": f"PII exposed in unauthenticated API: {path}",
+            "description": (
+                f"The endpoint {path} returns user data containing PII "
+                f"without authentication: {pii_summary}. "
+                + (f"{unique_emails} unique email addresses found. " if unique_emails > 1 else "")
+                + ("Password hashes are exposed — this is a critical data breach. " if "password_hash" in found_pii else "")
+                + "Fix: require authentication and filter sensitive fields "
+                "from API responses."
+            ),
+            "evidence": f"GET {url} (no auth)\nPII found: {pii_summary}\nBody sample: {body[:400]}",
+            "tool": "pii-exposure",
+        })
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Trigger verbose error messages
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_error_leak(run_id: str, ip: str, name: str) -> list[dict]:
+    """Actively trigger error conditions and check for information leakage
+    in error responses (stack traces, file paths, DB errors, internal IPs).
+
+    This complements the passive verbose_errors module by sending malformed
+    input to discovered endpoints.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    # Collect endpoints from this scan run
+    target_paths = set()
+    try:
+        for f in _db_find_run_findings(run_id):
+            ev = f.get("evidence", "")
+            for m in re.findall(r"https?://[^/]+(\/\S+)", ev):
+                p = m.split("?")[0]
+                if "/api/" in p:
+                    target_paths.add(p)
+    except Exception:
+        pass
+
+    # Add generic endpoints
+    generic = ["/api/users/invalid", "/api/user/0", "/api/v1/users/-1",
+               "/api/config", "/api/settings", "/api/data"]
+    target_paths = list(target_paths)[:10] + generic
+
+    # Error-triggering payloads
+    payloads = [
+        ("sqlerr", "?id=' OR '1'='1", None),
+        ("traversal", "?file=../../../etc/passwd", None),
+        ("invalidjson", None, "{{{invalid json"),
+        ("longstr", None, json.dumps({"input": "A" * 10000})),
+        ("typeerr", "?id[]=1&id[]=2", None),
+    ]
+
+    # Patterns indicating information leakage
+    leak_patterns = {
+        "stack_trace": re.compile(r"(?:Traceback|at\s+\S+\.(?:js|ts|py|java):\d+|Error:.*\n\s+at\s+|File\s+\"/.+\",\s+line\s+\d+)"),
+        "file_path": re.compile(r"(?:/home/\w+/|/app/|/var/www/|/usr/src/|C:\\\\Users\\\\)[\w/\\.-]+"),
+        "db_error": re.compile(r"(?:SQLSTATE|mysql_|pg_|sqlite3\.|MongoError|Sequelize|Prisma.*error|relation\s+\"\w+\"\s+does\s+not\s+exist)"),
+        "internal_ip": re.compile(r"(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})"),
+        "framework_version": re.compile(r"(?:Express/\d|Django/\d|Flask/\d|Next\.js/\d|Rails/\d|Laravel/\d|Werkzeug/\d|uvicorn|fastapi)"),
+    }
+
+    seen_leaks = set()  # Deduplicate findings per leak type
+
+    for path in target_paths[:15]:
+        for payload_name, qs, post_body in payloads:
+            if qs:
+                url = f"https://{ip}{path}{qs}"
+                try:
+                    status, ctype, body = _curl(url, timeout=5, max_bytes=20_000)
+                except Exception:
+                    continue
+            elif post_body:
+                url = f"https://{ip}{path}"
+                try:
+                    r = subprocess.run(
+                        ["curl", "-sk", "-m", "5", "-A", _UA,
+                         "-X", "POST", "-H", "Content-Type: application/json",
+                         "-d", post_body, url],
+                        capture_output=True, text=True, timeout=8,
+                    )
+                    body = (r.stdout or "")[:10000]
+                    status = ""
+                    for ln in (r.stderr or "").splitlines():
+                        sm = re.match(r"HTTP/\S+\s+(\d+)", ln)
+                        if sm:
+                            status = sm.group(1)
+                except Exception:
+                    continue
+            else:
+                continue
+
+            if not body:
+                continue
+
+            for leak_type, pattern in leak_patterns.items():
+                if leak_type in seen_leaks:
+                    continue
+                match = pattern.search(body)
+                if match:
+                    seen_leaks.add(leak_type)
+                    sev = "HIGH" if leak_type in ("stack_trace", "db_error") else "MEDIUM"
+                    findings.append({
+                        "target": ip, "severity": sev, "category": "disclosure",
+                        "title": f"Information leak via error response: {leak_type.replace('_', ' ')}",
+                        "description": (
+                            f"Sending malformed input ({payload_name}) to {path} "
+                            f"triggered a verbose error response containing {leak_type.replace('_', ' ')}. "
+                            "This reveals internal implementation details to attackers. "
+                            "Fix: implement a generic error handler that returns "
+                            "sanitized error messages in production."
+                        ),
+                        "evidence": f"Trigger: {payload_name} on {path}\nMatched: {match.group()[:200]}\nBody: {body[:300]}",
+                        "tool": "error-leak",
+                    })
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Basic SQL injection detection
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_sqli_basic(run_id: str, ip: str, name: str) -> list[dict]:
+    """Test for basic SQL injection using boolean-based and error-based techniques.
+
+    Only flags when we have differential evidence (different responses for
+    true vs false conditions), not just on error messages.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    # Collect endpoints with query params from this scan run
+    parameterized = set()
+    try:
+        for f in _db_find_run_findings(run_id):
+            ev = f.get("evidence", "")
+            for m in re.findall(r"https?://[^/]+(\/[^\s\"']+\?\w+=)", ev):
+                parameterized.add(m.split("?")[0])
+    except Exception:
+        pass
+
+    # Add generic endpoints with common ID params
+    generic = [
+        "/api/users?id=1", "/api/user?id=1", "/api/v1/users?id=1",
+        "/api/products?id=1", "/api/items?id=1", "/api/posts?id=1",
+        "/api/orders?id=1", "/api/data?id=1",
+    ]
+
+    # Test each endpoint
+    tested = set()
+    for raw in list(parameterized)[:8] + generic:
+        base_path = raw.split("?")[0]
+        if base_path in tested:
+            continue
+        tested.add(base_path)
+
+        base_url = f"https://{ip}{base_path}"
+
+        # Boolean-based: compare true vs false condition
+        true_url = f"{base_url}?id=1' OR '1'='1"
+        false_url = f"{base_url}?id=1' OR '1'='2"
+
+        try:
+            _, _, body_true = _curl(true_url, timeout=5, max_bytes=20_000)
+            _, _, body_false = _curl(false_url, timeout=5, max_bytes=20_000)
+        except Exception:
+            continue
+
+        if not body_true or not body_false:
+            continue
+
+        # If both return HTML that looks like an SPA, skip
+        if "<html" in body_true.lower()[:200] and "<html" in body_false.lower()[:200]:
+            continue
+
+        len_diff = abs(len(body_true) - len(body_false))
+        # Significant size difference suggests SQL injection
+        if len_diff > 100 and len(body_true) > 50 and len(body_false) > 50:
+            # Verify: send a normal request and compare
+            try:
+                _, _, body_normal = _curl(f"{base_url}?id=1", timeout=5, max_bytes=20_000)
+            except Exception:
+                body_normal = ""
+
+            # True condition should match normal, false should differ
+            if body_normal and abs(len(body_true) - len(body_normal)) < 50:
+                findings.append({
+                    "target": ip, "severity": "CRITICAL", "category": "exploit",
+                    "title": f"SQL injection (boolean-based) at {base_path}",
+                    "description": (
+                        f"Boolean-based SQL injection detected at {base_path}. "
+                        f"OR '1'='1' returned {len(body_true)} bytes vs "
+                        f"OR '1'='2' returned {len(body_false)} bytes "
+                        f"(diff: {len_diff}). The application appears to "
+                        "concatenate user input directly into SQL queries. "
+                        "Fix: use parameterized queries / prepared statements."
+                    ),
+                    "evidence": (
+                        f"TRUE:  {true_url} → {len(body_true)} bytes\n"
+                        f"FALSE: {false_url} → {len(body_false)} bytes\n"
+                        f"NORMAL: ?id=1 → {len(body_normal)} bytes"
+                    ),
+                    "tool": "sqli-probe",
+                })
+                continue
+
+        # Error-based: check for SQL error messages
+        sqli_url = f"{base_url}?id=1'"
+        try:
+            _, _, body_err = _curl(sqli_url, timeout=5, max_bytes=10_000)
+        except Exception:
+            continue
+
+        if body_err:
+            sql_errors = [
+                "syntax error", "mysql_", "pg_query", "sqlite3.",
+                "SQLSTATE", "unclosed quotation", "unterminated string",
+                "SQL syntax", "ORA-", "Microsoft SQL", "near \"'\"",
+            ]
+            for err in sql_errors:
+                if err.lower() in body_err.lower():
+                    findings.append({
+                        "target": ip, "severity": "HIGH", "category": "exploit",
+                        "title": f"SQL injection (error-based) at {base_path}",
+                        "description": (
+                            f"Injecting a single quote into {base_path}?id=1' "
+                            f"triggered a SQL error message containing '{err}'. "
+                            "This confirms the application concatenates user input "
+                            "into SQL queries. Fix: use parameterized queries."
+                        ),
+                        "evidence": f"GET {sqli_url}\nSQL error: {err}\nBody: {body_err[:400]}",
+                        "tool": "sqli-probe",
+                    })
+                    break
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Server-side template injection (SSTI)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_ssti(run_id: str, ip: str, name: str) -> list[dict]:
+    """Test for server-side template injection by injecting math expressions
+    in various template syntaxes and checking if the result (49) appears.
+
+    Only uses benign payloads (arithmetic). Never attempts file access or
+    command execution.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    # Collect endpoints with query params
+    target_paths = set()
+    try:
+        for f in _db_find_run_findings(run_id):
+            ev = f.get("evidence", "")
+            for m in re.findall(r"https?://[^/]+(\/[^\s\"']+\?\w+=)", ev):
+                target_paths.add(m.split("?")[0])
+    except Exception:
+        pass
+
+    # Generic endpoints
+    generic = ["/api/search", "/api/render", "/api/template",
+               "/api/preview", "/api/email/preview", "/search"]
+    all_paths = list(target_paths)[:8] + generic
+
+    # Template injection payloads — all evaluate to 49
+    payloads = [
+        ("jinja2/twig", "{{7*7}}"),
+        ("mako",        "${7*7}"),
+        ("erb",         "<%= 7*7 %>"),
+        ("ruby",        "#{7*7}"),
+        ("freemarker",  "${7*7}"),
+    ]
+
+    for path in all_paths:
+        # First get a baseline response
+        base_url = f"https://{ip}{path}?q=test_baseline_12345"
+        try:
+            _, _, baseline = _curl(base_url, timeout=5, max_bytes=10_000)
+        except Exception:
+            continue
+
+        # Skip if baseline already contains "49" (would be a false positive)
+        if "49" in (baseline or ""):
+            continue
+
+        for engine, payload in payloads:
+            test_url = f"https://{ip}{path}?q={urllib.parse.quote(payload)}"
+            try:
+                status, ctype, body = _curl(test_url, timeout=5, max_bytes=10_000)
+            except Exception:
+                continue
+
+            if not body or status not in ("200", ""):
+                continue
+
+            # Check if "49" appears in response but not in baseline
+            if "49" in body:
+                findings.append({
+                    "target": ip, "severity": "CRITICAL", "category": "exploit",
+                    "title": f"Server-side template injection ({engine}) at {path}",
+                    "description": (
+                        f"Injecting {payload} into {path} returned a response "
+                        "containing '49', confirming the server evaluates "
+                        "user input as a template expression. This can lead "
+                        "to remote code execution. "
+                        "Fix: never pass user input directly into template "
+                        "engines. Use sandboxed rendering or escape all input."
+                    ),
+                    "evidence": f"GET {test_url}\nPayload: {payload}\nResponse contains '49'\nBody: {body[:400]}",
+                    "tool": "ssti-probe",
+                })
+                break  # One confirmed SSTI per path is enough
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — API version / internal endpoint enumeration
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_api_enum(run_id: str, ip: str, name: str) -> list[dict]:
+    """Enumerate API versions and internal endpoints. Flag when alternate
+    versions have weaker auth than the main API, or when internal/debug
+    endpoints are exposed.
+    """
+    findings: list[dict] = []
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return findings
+
+    # SPA baseline
+    spa_hash = None
+    try:
+        _, _, root_body = _curl(f"https://{ip}/", timeout=5)
+        _, _, rand_body = _curl(f"https://{ip}/__probe_enum_{hashlib.md5(run_id.encode()).hexdigest()[:8]}", timeout=5)
+        if root_body and rand_body:
+            rh = hashlib.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
+            nh = hashlib.sha256(rand_body.encode("utf-8", errors="replace")).hexdigest()
+            if rh == nh:
+                spa_hash = rh
+    except Exception:
+        pass
+
+    version_paths = [
+        ("/api/v1/", "version"),
+        ("/api/v2/", "version"),
+        ("/api/v3/", "version"),
+        ("/api/beta/", "beta"),
+        ("/api/internal/", "internal"),
+        ("/api/debug/", "debug"),
+        ("/api/test/", "test"),
+        ("/api/dev/", "dev"),
+        ("/api/staging/", "staging"),
+        ("/api/private/", "private"),
+        ("/_internal/", "internal"),
+        ("/debug/", "debug"),
+    ]
+
+    for path, kind in version_paths:
+        url = f"https://{ip}{path}"
+        try:
+            status, ctype, body = _curl(url, timeout=5, max_bytes=20_000)
+        except Exception:
+            continue
+
+        if status != "200" or not body.strip():
+            continue
+        if spa_hash:
+            bh = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+            if bh == spa_hash:
+                continue
+
+        # Must return JSON (API, not HTML page)
+        if "json" not in (ctype or "").lower():
+            # Exception for debug/internal HTML pages
+            if kind not in ("debug", "internal"):
+                continue
+
+        body_stripped = body.strip()
+        if len(body_stripped) < 20:
+            continue
+
+        if kind in ("internal", "debug", "test", "dev", "staging", "private"):
+            sev = "HIGH"
+            findings.append({
+                "target": ip, "severity": sev, "category": "disclosure",
+                "title": f"Exposed {kind} API endpoint: {path}",
+                "description": (
+                    f"The {kind} endpoint {path} is publicly accessible "
+                    "and returns data. Internal/debug endpoints often bypass "
+                    "authentication and expose sensitive information. "
+                    "Fix: restrict access to internal endpoints by IP or remove them."
+                ),
+                "evidence": f"GET {url}\nStatus: 200\nBody: {body[:400]}",
+                "tool": "api-enum",
+            })
+        elif kind in ("version", "beta"):
+            # Check if this version has different behavior (content) than expected
+            findings.append({
+                "target": ip, "severity": "MEDIUM", "category": "disclosure",
+                "title": f"Alternate API version accessible: {path}",
+                "description": (
+                    f"The API version at {path} is accessible. Multiple "
+                    "exposed API versions increase attack surface — older "
+                    "versions may have unpatched vulnerabilities or weaker "
+                    "authentication. Fix: disable unused API versions."
+                ),
+                "evidence": f"GET {url}\nStatus: 200\nBody: {body[:300]}",
+                "tool": "api-enum",
+            })
+
+    return findings

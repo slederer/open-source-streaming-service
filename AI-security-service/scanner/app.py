@@ -2677,6 +2677,10 @@ try:
         scan_target_xss, scan_target_cookies,
         scan_target_firebase_deep, scan_target_js_unsafe,
         scan_target_ai_fingerprint,
+        scan_target_graphql_mutations, scan_target_websocket,
+        scan_target_open_redirect, scan_target_csp_bypass,
+        scan_target_hsts_preload, scan_target_zone_transfer,
+        scan_target_supabase_edge, scan_target_dep_confusion,
     )
     from scanner.ai_triage import (
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -2700,6 +2704,10 @@ except ImportError:
         scan_target_xss, scan_target_cookies,
         scan_target_firebase_deep, scan_target_js_unsafe,
         scan_target_ai_fingerprint,
+        scan_target_graphql_mutations, scan_target_websocket,
+        scan_target_open_redirect, scan_target_csp_bypass,
+        scan_target_hsts_preload, scan_target_zone_transfer,
+        scan_target_supabase_edge, scan_target_dep_confusion,
     )
     from scanner_ai_triage import (  # type: ignore
         scan_target_ai_triage, scan_target_ai_openapi_deep,
@@ -2759,6 +2767,14 @@ SCAN_MODULES = [
     ("firebase_deep",   "Firebase rules deep probe",        "scan_target_firebase_deep"),
     ("js_unsafe",       "Unsafe JS patterns (eval, etc.)",  "scan_target_js_unsafe"),
     ("ai_fingerprint",  "AI code fingerprint + hallucination detection", "scan_target_ai_fingerprint"),
+    ("graphql_mutation", "GraphQL dangerous mutation probe",  "scan_target_graphql_mutations"),
+    ("websocket",       "WebSocket unauthenticated probe",   "scan_target_websocket"),
+    ("open_redirect",   "Open redirect detection",           "scan_target_open_redirect"),
+    ("csp_bypass",      "CSP bypass analysis",               "scan_target_csp_bypass"),
+    ("hsts_preload",    "HSTS preload list check",           "scan_target_hsts_preload"),
+    ("zone_transfer",   "DNS zone transfer attempt",         "scan_target_zone_transfer"),
+    ("supabase_edge",   "Supabase Edge Function probe",      "scan_target_supabase_edge"),
+    ("dep_confusion",   "Dependency confusion check",        "scan_target_dep_confusion"),
     # Structured AI modules (replaces the retired `ai_chain` fuzzy reasoner).
     # Each has narrow structured I/O and live-verifies its own claims before
     # emitting a finding.
@@ -9470,6 +9486,383 @@ async def quick_scan(request: Request):
         pass
 
     return {"host": host, "findings": findings, "full_scan_url": f"https://securityscanner.dev/signup"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SEO Pages — platform-specific landing pages, tool pages, vuln reference
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SEO_CSS = """
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.6; }
+  a { color: #dc2626; text-decoration: none; } a:hover { text-decoration: underline; }
+  .wrap { max-width: 800px; margin: 0 auto; padding: 60px 24px; }
+  h1 { font-size: 2.2rem; font-weight: 800; letter-spacing: -0.03em; margin-bottom: 12px; }
+  h2 { font-size: 1.3rem; font-weight: 700; margin-top: 32px; margin-bottom: 12px; }
+  p { color: #d1d5db; margin-bottom: 14px; font-size: 0.95rem; }
+  .hero-stat { display: inline-flex; align-items: baseline; gap: 6px; background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 8px 16px; margin: 4px; }
+  .hero-stat .num { font-size: 1.4rem; font-weight: 700; color: #dc2626; }
+  .hero-stat .label { font-size: 0.8rem; color: #9ca3af; }
+  .cta { display: inline-block; background: #dc2626; color: white !important; padding: 12px 24px; border-radius: 8px; font-weight: 600; margin-top: 20px; text-decoration: none !important; }
+  .cta:hover { background: #b91c1c; }
+  pre { background: #111827; border: 1px solid #1f2937; padding: 14px; border-radius: 8px; font-size: 0.82rem; overflow-x: auto; color: #d1d5db; margin: 14px 0; }
+  ul { margin-left: 20px; color: #d1d5db; margin-bottom: 14px; } li { margin-bottom: 6px; }
+  nav { padding: 16px 24px; border-bottom: 1px solid #1f2937; max-width: 900px; margin: 0 auto; }
+  nav a { color: #9ca3af; font-size: 0.85rem; margin-right: 16px; } nav a.logo { color: #e5e7eb; font-weight: 700; }
+  nav a.logo span { color: #dc2626; }
+"""
+
+def _seo_nav():
+    return '<nav><a href="/" class="logo"><span>&#9632;</span> Security Scanner</a><a href="/blog">Blog</a><a href="/reports/2026-q2">Q2 Report</a><a href="/docs/api">API</a><a href="/signup">Sign up</a></nav>'
+
+_PLATFORM_DATA = {
+    "lovable": {"name": "Lovable", "domain": "lovable.app", "scanned": 476, "crits": 34, "rate": "7.1%", "top_issue": "Supabase RLS off on tables with real user data"},
+    "bolt": {"name": "Bolt", "domain": "bolt.host", "scanned": 289, "crits": 21, "rate": "7.3%", "top_issue": "Supabase RLS off + hardcoded API keys in JS bundles (15% of apps)"},
+    "replit": {"name": "Replit", "domain": "replit.app", "scanned": 194, "crits": 4, "rate": "2.1%", "top_issue": "IDOR vulnerabilities leaking booking and health data"},
+    "vercel": {"name": "Vercel / v0", "domain": "vercel.app", "scanned": 67, "crits": 2, "rate": "3.0%", "top_issue": "Hardcoded API keys in JS bundles (27% of AI-generated apps)"},
+    "cursor": {"name": "Cursor", "domain": "", "scanned": 0, "crits": 0, "rate": "N/A", "top_issue": "AI-generated code with missing auth middleware"},
+}
+
+
+@app.get("/for/{platform}", response_class=HTMLResponse)
+async def platform_landing(platform: str):
+    data = _PLATFORM_DATA.get(platform)
+    if not data:
+        return HTMLResponse("Platform not found", status_code=404)
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Security Scanner for {data['name']} Apps</title>
+<meta name="description" content="Scan your {data['name']} app for security vulnerabilities. {data['rate']} of {data['name']} apps have critical issues.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta property="og:title" content="Security Scanner for {data['name']} Apps">
+<meta property="og:description" content="{data['rate']} of {data['name']} apps have critical vulnerabilities. Scan yours free.">
+<meta property="og:image" content="https://securityscanner.dev/og.png">
+<style>{_SEO_CSS}</style></head><body>
+{_seo_nav()}
+<div class="wrap">
+<h1>Security Scanner for {data['name']} Apps</h1>
+<p>We scanned {data['scanned']} {data['name']} apps. <strong>{data['rate']}</strong> had critical vulnerabilities. Is yours secure?</p>
+<div style="margin:20px 0;">
+  <span class="hero-stat"><span class="num">{data['scanned']}</span><span class="label">apps scanned</span></span>
+  <span class="hero-stat"><span class="num">{data['crits']}</span><span class="label">with CRITs</span></span>
+  <span class="hero-stat"><span class="num">{data['rate']}</span><span class="label">CRIT rate</span></span>
+</div>
+<p>Top issue: <strong>{data['top_issue']}</strong></p>
+<h2>What we check on {data['name']} apps</h2>
+<ul>
+<li><strong>Supabase RLS</strong> — extracts real table names from your JS bundle, tests each with the anon key</li>
+<li><strong>API keys in bundles</strong> — OpenAI, Anthropic, Stripe, Google, AWS keys shipped client-side</li>
+<li><strong>Authentication</strong> — IDOR, OAuth misconfig, session entropy, JWT weak secrets</li>
+<li><strong>Infrastructure</strong> — exposed /.env, /.git, subdomain takeover, DNS issues</li>
+<li><strong>AI code quality</strong> — hallucinated functions, unsafe eval(), hardcoded credentials</li>
+<li><strong>70+ total modules</strong> — nuclei CVE templates, XSS, CORS, CSP bypass, and more</li>
+</ul>
+<h2>Try it free</h2>
+<p>Paste your {data['name']} app URL on our homepage for a quick 10-second scan. For the full 70-module audit, sign up — one free scan, no card.</p>
+<a href="/" class="cta">Scan your {data['name']} app free →</a>
+<h2>Research</h2>
+<ul>
+<li><a href="/blog/lovable-vs-bolt-vs-replit-rls">Lovable vs Bolt vs Replit: per-platform RLS breakdown</a></li>
+<li><a href="/blog/beyond-supabase-rls-five-other-crits">Beyond Supabase RLS: 5 other critical vulnerabilities</a></li>
+<li><a href="/reports/2026-q2">Q2 2026 State of Vibe-Coded Security report</a></li>
+</ul>
+</div></body></html>""")
+
+
+# Tool pages — individual free scanners
+_TOOL_PAGES = {
+    "supabase-rls-check": {"title": "Supabase RLS Check", "desc": "Check if your Supabase tables have Row Level Security enabled", "check": "Supabase RLS"},
+    "header-check": {"title": "Security Headers Check", "desc": "Test your site for missing security headers (HSTS, CSP, X-Frame-Options)", "check": "security headers"},
+    "xss-check": {"title": "XSS Vulnerability Check", "desc": "Test your site for reflected Cross-Site Scripting vulnerabilities", "check": "XSS"},
+    "ssl-check": {"title": "SSL/TLS Certificate Check", "desc": "Verify your SSL certificate validity, chain, and expiry", "check": "SSL/TLS"},
+    "api-key-check": {"title": "Exposed API Key Check", "desc": "Scan your JS bundles for leaked API keys (OpenAI, Stripe, AWS, etc.)", "check": "exposed API keys"},
+}
+
+
+@app.get("/tools/{tool_slug}", response_class=HTMLResponse)
+async def tool_page(tool_slug: str):
+    tool = _TOOL_PAGES.get(tool_slug)
+    if not tool:
+        return HTMLResponse("Tool not found", status_code=404)
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{tool['title']} — Free Online Tool | Security Scanner</title>
+<meta name="description" content="{tool['desc']}. Free, no signup required.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta property="og:title" content="{tool['title']} — Free Online Tool">
+<meta property="og:description" content="{tool['desc']}">
+<meta property="og:image" content="https://securityscanner.dev/og.png">
+<style>{_SEO_CSS}</style></head><body>
+{_seo_nav()}
+<div class="wrap">
+<h1>{tool['title']}</h1>
+<p>{tool['desc']}. Enter your URL below — results in 10 seconds.</p>
+<div style="margin:24px 0;">
+  <form onsubmit="return runQuickScan(event)" style="display:flex;gap:8px;flex-wrap:wrap;">
+    <input type="text" id="qs-url" required placeholder="https://your-app.com" style="flex:1;min-width:240px;background:#111827;border:1px solid #1f2937;color:#e5e7eb;padding:12px 14px;border-radius:8px;font-size:0.95rem;">
+    <button type="submit" id="qs-btn" class="cta" style="margin-top:0;">Check now</button>
+  </form>
+  <div id="qs-results" style="margin-top:20px;"></div>
+</div>
+<h2>What this checks</h2>
+<p>This free tool runs a quick scan focused on {tool['check']}. For a comprehensive audit covering 70+ modules (Supabase RLS, IDOR, subdomain takeover, nuclei CVE templates, and more), <a href="/signup">sign up for the full scan</a> — one free, no card.</p>
+<h2>Related</h2>
+<ul>
+<li><a href="/blog/top-5-supabase-rls-mistakes-on-lovable-apps">Top 5 Supabase RLS mistakes on Lovable apps</a></li>
+<li><a href="/blog/beyond-supabase-rls-five-other-crits">Beyond Supabase RLS: 5 other critical vulnerabilities</a></li>
+<li><a href="/reports/2026-q2">Full Q2 2026 security report</a></li>
+</ul>
+</div>
+<script>
+async function runQuickScan(e) {{
+  e.preventDefault();
+  const btn=document.getElementById('qs-btn'),input=document.getElementById('qs-url'),results=document.getElementById('qs-results');
+  let host=input.value.trim().replace(/^https?:\\/\\//,'').replace(/\\/.*/,'');
+  if(!host) return false;
+  btn.disabled=true; btn.textContent='Scanning...';
+  results.innerHTML='<p style="color:#9ca3af;">Scanning '+host+'...</p>';
+  try {{
+    const r=await fetch('/api/quick-scan',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{host}})}});
+    const d=await r.json();
+    if(!r.ok) {{ results.innerHTML='<p style="color:#dc2626;">'+d.error+'</p>'; btn.disabled=false; btn.textContent='Check now'; return false; }}
+    let html='<div style="background:#111827;border:1px solid #1f2937;border-radius:10px;padding:20px;">';
+    d.findings.forEach(f => {{
+      const icon=f.pass?'✅':f.severity==='CRITICAL'||f.severity==='HIGH'?'❌':'⚠️';
+      html+='<div style="padding:6px 0;border-bottom:1px solid #1f2937;">'+icon+' '+f.title+'</div>';
+    }});
+    html+='<div style="margin-top:14px;text-align:center;"><a href="/signup" class="cta">Get full 70-module scan free →</a></div></div>';
+    results.innerHTML=html;
+  }} catch(err) {{ results.innerHTML='<p style="color:#dc2626;">Error — try again</p>'; }}
+  btn.disabled=false; btn.textContent='Check again';
+  return false;
+}}
+</script></body></html>""")
+
+
+# Vulnerability reference pages
+_VULN_PAGES = {
+    "supabase-rls": {"title": "Supabase Row Level Security (RLS) Misconfiguration", "severity": "CRITICAL",
+        "desc": "Supabase ships new tables with RLS OFF by default. The public anon key (shipped in every JS bundle) becomes a full SELECT credential.",
+        "fix": "ALTER TABLE <table> ENABLE ROW LEVEL SECURITY;\nCREATE POLICY \"auth_only\" ON <table> FOR SELECT USING (auth.uid() IS NOT NULL);"},
+    "exposed-env": {"title": "Exposed .env File", "severity": "CRITICAL",
+        "desc": "The .env file containing API keys, database credentials, and secrets is publicly accessible at the production URL.",
+        "fix": "Add .env to .gitignore AND your deploy tool's ignore list. Rotate every secret in the file immediately."},
+    "idor": {"title": "Insecure Direct Object Reference (IDOR)", "severity": "CRITICAL",
+        "desc": "API endpoints return other users' data when the resource ID is changed (e.g., /api/bookings/1 → /api/bookings/2).",
+        "fix": "Add authorization middleware: verify the requesting user owns the resource before returning it."},
+    "api-key-leak": {"title": "API Key Leaked in JavaScript Bundle", "severity": "HIGH",
+        "desc": "API keys (OpenAI, Anthropic, Stripe, AWS, etc.) are embedded in client-side JavaScript, accessible to any visitor.",
+        "fix": "Move API calls to a server-side route (Next.js API route, edge function). Never ship secret keys in client code."},
+    "subdomain-takeover": {"title": "Subdomain Takeover", "severity": "CRITICAL",
+        "desc": "A subdomain has a CNAME pointing to a service (Vercel, Netlify, Heroku) where the target resource no longer exists. An attacker can claim it.",
+        "fix": "Remove the dangling CNAME record from your DNS, or re-create the resource at the target service."},
+}
+
+
+@app.get("/vulns/{vuln_slug}", response_class=HTMLResponse)
+async def vuln_page(vuln_slug: str):
+    vuln = _VULN_PAGES.get(vuln_slug)
+    if not vuln:
+        return HTMLResponse("Vulnerability not found", status_code=404)
+    sev_color = {"CRITICAL": "#dc2626", "HIGH": "#f97316", "MEDIUM": "#eab308"}.get(vuln["severity"], "#6b7280")
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{vuln['title']} — Vulnerability Reference | Security Scanner</title>
+<meta name="description" content="{vuln['desc'][:150]}">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>{_SEO_CSS}</style></head><body>
+{_seo_nav()}
+<div class="wrap">
+<div style="margin-bottom:8px;"><span style="background:{sev_color}1a;color:{sev_color};padding:3px 10px;border-radius:4px;font-size:0.75rem;font-weight:700;">{vuln['severity']}</span></div>
+<h1>{vuln['title']}</h1>
+<h2>What is it?</h2>
+<p>{vuln['desc']}</p>
+<h2>How to fix</h2>
+<pre>{vuln['fix']}</pre>
+<h2>Scan for this vulnerability</h2>
+<p>Security Scanner automatically checks for this issue as part of its 70+ module scan. <a href="/">Try it free</a> — no signup needed for the quick scan.</p>
+<a href="/" class="cta">Check your app now →</a>
+<h2>Related reading</h2>
+<ul>
+<li><a href="/blog/top-5-supabase-rls-mistakes-on-lovable-apps">Top 5 Supabase RLS mistakes</a></li>
+<li><a href="/blog/beyond-supabase-rls-five-other-crits">Beyond Supabase RLS: 5 other critical vulnerabilities</a></li>
+<li><a href="/reports/2026-q2">Q2 2026 State of Vibe-Coded Security</a></li>
+</ul>
+</div></body></html>""")
+
+
+# Integration docs pages
+_INTEGRATION_PAGES = {
+    "github-actions": {"title": "GitHub Actions Integration", "desc": "Auto-scan on every push to main",
+        "code": """name: Security Scan
+on:
+  push:
+    branches: [main]
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger scan
+        run: |
+          RESULT=$(curl -s -X POST https://securityscanner.dev/v1/webhook/scan \\
+            -H "Authorization: Bearer ${{ secrets.SCANNER_API_KEY }}" \\
+            -H "Content-Type: application/json" \\
+            -d '{"host": "your-app.com", "min_grade": "B", "callback_url": ""}')
+          echo "$RESULT"
+          RUN_ID=$(echo $RESULT | jq -r .run_id)
+          echo "Scan started: $RUN_ID"
+          # Poll for completion
+          for i in $(seq 1 60); do
+            STATUS=$(curl -s https://securityscanner.dev/v1/scan/$RUN_ID \\
+              -H "Authorization: Bearer ${{ secrets.SCANNER_API_KEY }}" | jq -r .status)
+            [ "$STATUS" = "completed" ] && break
+            sleep 10
+          done"""},
+    "vercel-deploy": {"title": "Vercel Deploy Hook", "desc": "Scan after every Vercel deployment",
+        "code": """// In your Vercel project settings, add a Deploy Hook:
+// POST https://securityscanner.dev/v1/webhook/scan
+// With headers:
+//   Authorization: Bearer sk-sec-YOUR_API_KEY
+//   Content-Type: application/json
+// Body:
+//   {"host": "your-app.vercel.app", "min_grade": "B"}"""},
+    "cursor-mcp": {"title": "Cursor MCP Integration", "desc": "Run security scans from Cursor",
+        "code": """// Add to .cursor/mcp.json:
+{
+  "mcpServers": {
+    "security-scanner": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-remote", "https://securityscanner.dev/v1/mcp"],
+      "env": {
+        "API_KEY": "sk-sec-YOUR_API_KEY"
+      }
+    }
+  }
+}"""},
+}
+
+
+@app.get("/docs/integrations/{slug}", response_class=HTMLResponse)
+async def integration_doc(slug: str):
+    doc = _INTEGRATION_PAGES.get(slug)
+    if not doc:
+        return HTMLResponse("Integration not found", status_code=404)
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{doc['title']} — Security Scanner Docs</title>
+<meta name="description" content="{doc['desc']}. Set up in 5 minutes.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>{_SEO_CSS}</style></head><body>
+{_seo_nav()}
+<div class="wrap">
+<h1>{doc['title']}</h1>
+<p>{doc['desc']}. Set up in 5 minutes.</p>
+<h2>Setup</h2>
+<pre>{doc['code']}</pre>
+<h2>Prerequisites</h2>
+<ul>
+<li>A Security Scanner API key — get one at <a href="/signup">securityscanner.dev/signup</a></li>
+<li>Your deployed app URL</li>
+</ul>
+<h2>How it works</h2>
+<p>The webhook triggers a full 70-module scan on your deployed URL. When the scan completes, you can check the grade and findings via the API or dashboard. Set <code>min_grade</code> to fail the pipeline if security drops below your threshold.</p>
+<a href="/docs/api" class="cta">Full API docs →</a>
+</div></body></html>""")
+
+
+# Public scan results page (SEO-indexed)
+@app.get("/scan/{host}", response_class=HTMLResponse)
+async def public_scan_page(host: str):
+    """Public scan results page — shows latest scan for a host (if any public scan exists)."""
+    with get_db() as db:
+        run = db.execute(
+            "SELECT id, started_at, status, summary_json FROM scan_runs "
+            "WHERE target=? AND status='completed' ORDER BY finished_at DESC LIMIT 1",
+            (host,),
+        ).fetchone()
+    if not run:
+        return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Scan {host} — Security Scanner</title>
+<style>{_SEO_CSS}</style></head><body>
+{_seo_nav()}
+<div class="wrap">
+<h1>No scan results for {host}</h1>
+<p>We haven't scanned this host yet, or the results aren't public.</p>
+<a href="/" class="cta">Scan {host} now →</a>
+</div></body></html>""")
+
+    run = dict(run)
+    summary = json.loads(run.get("summary_json") or "{}") if run.get("summary_json") else {}
+    grade = summary.get("risk_grade", "?")
+    grade_color = {"A": "#22c55e", "B": "#3b82f6", "C": "#eab308", "D": "#f97316", "F": "#dc2626"}.get(grade, "#6b7280")
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Security Scan: {host} — Grade {grade} | Security Scanner</title>
+<meta name="description" content="Security scan results for {host}. Grade: {grade}. {summary.get('critical',0)} critical, {summary.get('high',0)} high findings.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta property="og:title" content="Security Scan: {host} — Grade {grade}">
+<meta property="og:description" content="{summary.get('critical',0)} critical, {summary.get('high',0)} high, {summary.get('medium',0)} medium findings">
+<style>{_SEO_CSS}</style></head><body>
+{_seo_nav()}
+<div class="wrap">
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:20px;">
+  <div style="width:56px;height:56px;border-radius:12px;background:{grade_color};display:flex;align-items:center;justify-content:center;font-size:1.5rem;font-weight:800;color:white;">{grade}</div>
+  <div>
+    <h1 style="margin-bottom:2px;">Security Scan: {host}</h1>
+    <p style="margin:0;color:#9ca3af;font-size:0.85rem;">Scanned {run.get('started_at','')[:10]} · Scan #{run['id']}</p>
+  </div>
+</div>
+<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px;">
+  <span class="hero-stat"><span class="num" style="color:#dc2626;">{summary.get('critical',0)}</span><span class="label">Critical</span></span>
+  <span class="hero-stat"><span class="num" style="color:#f97316;">{summary.get('high',0)}</span><span class="label">High</span></span>
+  <span class="hero-stat"><span class="num" style="color:#eab308;">{summary.get('medium',0)}</span><span class="label">Medium</span></span>
+  <span class="hero-stat"><span class="num" style="color:#3b82f6;">{summary.get('low',0)}</span><span class="label">Low</span></span>
+</div>
+<p>This is a summary of the latest automated security scan. For full findings with evidence and fix instructions, <a href="/signup">sign up free</a>.</p>
+<a href="/" class="cta">Run your own scan →</a>
+</div></body></html>""")
+
+
+# ── Finding suppression API ──────────────────────────────────────────────────
+
+@app.post("/api/findings/{finding_id}/suppress")
+async def suppress_finding(request: Request, finding_id: int):
+    """Mark a finding as suppressed (accepted risk / false positive)."""
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    reason = body.get("reason", "accepted_risk")
+    if reason not in ("accepted_risk", "false_positive", "wont_fix"):
+        return JSONResponse({"error": "reason must be: accepted_risk, false_positive, wont_fix"}, status_code=400)
+    with get_db() as db:
+        f = db.execute("SELECT run_id FROM findings WHERE id=?", (finding_id,)).fetchone()
+        if not f:
+            return JSONResponse({"error": "Finding not found"}, status_code=404)
+        if not _verify_run_ownership(f[0], user["user_id"]):
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        db.execute(
+            "UPDATE findings SET suppressed=?, suppressed_reason=?, suppressed_at=? WHERE id=?",
+            (1, reason, datetime.now(timezone.utc).isoformat(), finding_id),
+        )
+    return {"ok": True, "finding_id": finding_id, "suppressed": True, "reason": reason}
+
+
+@app.post("/api/findings/{finding_id}/unsuppress")
+async def unsuppress_finding(request: Request, finding_id: int):
+    """Remove suppression from a finding."""
+    user = get_user(request)
+    if not user:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    with get_db() as db:
+        f = db.execute("SELECT run_id FROM findings WHERE id=?", (finding_id,)).fetchone()
+        if not f:
+            return JSONResponse({"error": "Finding not found"}, status_code=404)
+        if not _verify_run_ownership(f[0], user["user_id"]):
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        db.execute("UPDATE findings SET suppressed=0, suppressed_reason=NULL, suppressed_at=NULL WHERE id=?", (finding_id,))
+    return {"ok": True, "finding_id": finding_id, "suppressed": False}
 
 
 @app.post("/api/newsletter")

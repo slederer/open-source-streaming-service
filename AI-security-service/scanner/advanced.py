@@ -2484,3 +2484,415 @@ def scan_target_ai_fingerprint(run_id: str, ip: str, name: str) -> list[dict]:
                 })
 
     return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — GraphQL mutation testing
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_graphql_mutations(run_id: str, ip: str, name: str) -> list[dict]:
+    """Test GraphQL endpoints for dangerous unauthed mutations."""
+    findings: list[dict] = []
+    gql_paths = ["/graphql", "/api/graphql", "/v1/graphql", "/gql"]
+
+    for path in gql_paths:
+        url = f"https://{ip}{path}"
+        # First check if introspection is enabled
+        introspection_q = '{"query":"{ __schema { mutationType { fields { name } } } }"}'
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "5", "-X", "POST", url,
+                 "-H", "Content-Type: application/json", "-d", introspection_q],
+                capture_output=True, text=True, timeout=8,
+            )
+            if '"fields"' not in r.stdout:
+                continue
+            # Parse mutation names
+            data = json.loads(r.stdout)
+            fields = data.get("data", {}).get("__schema", {}).get("mutationType", {}).get("fields", [])
+            if not fields:
+                continue
+            dangerous = [f["name"] for f in fields if any(
+                kw in f["name"].lower() for kw in
+                ["delete", "remove", "destroy", "drop", "reset", "update_password",
+                 "change_email", "admin", "elevate", "promote"]
+            )]
+            if dangerous:
+                findings.append({
+                    "target": ip, "severity": "HIGH", "category": "application",
+                    "title": f"GraphQL exposes {len(dangerous)} dangerous mutations at {path}",
+                    "description": (
+                        f"The GraphQL endpoint exposes mutations that could modify or destroy data: "
+                        f"{', '.join(dangerous[:5])}. These should require authentication."
+                    ),
+                    "evidence": f"Introspection at {url} reveals mutations: {', '.join(dangerous[:8])}",
+                    "tool": "graphql-mutation",
+                })
+                return findings
+        except Exception:
+            continue
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — WebSocket security check
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_websocket(run_id: str, ip: str, name: str) -> list[dict]:
+    """Check if WebSocket endpoints accept connections without authentication."""
+    findings: list[dict] = []
+    ws_paths = ["/ws", "/socket", "/realtime", "/live", "/cable", "/hub"]
+
+    for path in ws_paths:
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-H", "Upgrade: websocket", "-H", "Connection: Upgrade",
+                 "-H", "Sec-WebSocket-Version: 13",
+                 "-H", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+                 f"https://{ip}{path}"],
+                capture_output=True, text=True, timeout=8,
+            )
+            code = r.stdout.strip()
+            if code in ("101", "200"):
+                findings.append({
+                    "target": ip, "severity": "MEDIUM", "category": "application",
+                    "title": f"WebSocket endpoint {path} accepts unauthenticated upgrade",
+                    "description": (
+                        f"The WebSocket endpoint at {path} responds with HTTP {code} to an "
+                        f"unauthenticated upgrade request. If this carries sensitive data, "
+                        f"require a token in the initial handshake."
+                    ),
+                    "evidence": f"GET {ip}{path} with Upgrade: websocket → HTTP {code}",
+                    "tool": "websocket-probe",
+                })
+        except Exception:
+            continue
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Open redirect detection
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_open_redirect(run_id: str, ip: str, name: str) -> list[dict]:
+    """Test common redirect parameters for open redirect vulnerabilities."""
+    findings: list[dict] = []
+    redirect_params = ["next", "redirect", "url", "return", "returnTo", "redirect_uri",
+                       "continue", "dest", "destination", "go", "target", "redir", "out"]
+    evil_url = "https://evil.example.com/pwned"
+
+    for param in redirect_params:
+        test_url = f"https://{ip}/login?{param}={evil_url}"
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "5", "-o", "/dev/null", "-D", "-", "-L",
+                 "--max-redirs", "0", test_url],
+                capture_output=True, text=True, timeout=8,
+            )
+            headers = r.stdout.lower()
+            if "location:" in headers:
+                loc_line = [l for l in r.stdout.splitlines() if l.lower().startswith("location:")][0]
+                location = loc_line.split(":", 1)[1].strip()
+                if "evil.example.com" in location:
+                    findings.append({
+                        "target": ip, "severity": "HIGH", "category": "application",
+                        "title": f"Open redirect via ?{param}= on /login",
+                        "description": (
+                            f"The application redirects to an attacker-controlled URL when "
+                            f"?{param}= is set to an external domain. An attacker can craft "
+                            f"a link that appears to be on {ip} but redirects to a phishing page."
+                        ),
+                        "evidence": f"GET {test_url}\nLocation: {location}",
+                        "tool": "open-redirect",
+                    })
+                    return findings
+        except Exception:
+            continue
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — CSP bypass analysis
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_csp_bypass(run_id: str, ip: str, name: str) -> list[dict]:
+    """Analyze Content-Security-Policy for bypasses, not just presence."""
+    findings: list[dict] = []
+    try:
+        r = subprocess.run(
+            ["curl", "-skI", "-m", "5", f"https://{ip}/"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except Exception:
+        return findings
+
+    csp = ""
+    for line in r.stdout.splitlines():
+        if line.lower().startswith("content-security-policy:"):
+            csp = line.split(":", 1)[1].strip()
+            break
+
+    if not csp:
+        return findings  # Missing CSP caught by headers module
+
+    weaknesses = []
+    if "'unsafe-inline'" in csp and "script-src" in csp:
+        weaknesses.append("script-src allows 'unsafe-inline' — XSS payloads execute directly")
+    if "'unsafe-eval'" in csp:
+        weaknesses.append("allows 'unsafe-eval' — eval()/Function() callable, defeats CSP purpose")
+    if "data:" in csp and "script-src" in csp:
+        weaknesses.append("script-src allows data: URIs — bypasses CSP via data:text/javascript")
+    if "*.googleapis.com" in csp or "*.cloudflare.com" in csp:
+        weaknesses.append("wildcard CDN domain in CSP — attacker can host payload on same CDN")
+    if "default-src" not in csp and "script-src" not in csp:
+        weaknesses.append("no default-src or script-src — effectively no script restriction")
+
+    if weaknesses:
+        findings.append({
+            "target": ip, "severity": "MEDIUM", "category": "headers",
+            "title": f"CSP present but bypassable ({len(weaknesses)} weakness{'es' if len(weaknesses)>1 else ''})",
+            "description": "\n".join(f"• {w}" for w in weaknesses),
+            "evidence": f"Content-Security-Policy: {csp[:300]}",
+            "tool": "csp-bypass",
+        })
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — HSTS preload check
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_hsts_preload(run_id: str, ip: str, name: str) -> list[dict]:
+    """Check if the domain is on Chrome's HSTS preload list."""
+    findings: list[dict] = []
+    try:
+        r = subprocess.run(
+            ["curl", "-sk", "-m", "5",
+             f"https://hstspreload.org/api/v2/status?domain={ip}"],
+            capture_output=True, text=True, timeout=8,
+        )
+        data = json.loads(r.stdout)
+        status = data.get("status", "unknown")
+        if status == "preloaded":
+            return findings  # Good — no finding needed
+        # Check if HSTS header has preload directive
+        hdr_r = subprocess.run(
+            ["curl", "-skI", "-m", "5", f"https://{ip}/"],
+            capture_output=True, text=True, timeout=8,
+        )
+        has_hsts = any("strict-transport-security" in l.lower() for l in hdr_r.stdout.splitlines())
+        has_preload = any("preload" in l.lower() for l in hdr_r.stdout.splitlines()
+                          if "strict-transport-security" in l.lower())
+        if has_hsts and not has_preload:
+            findings.append({
+                "target": ip, "severity": "LOW", "category": "headers",
+                "title": "HSTS set but not preloaded — first visit still vulnerable",
+                "description": (
+                    "The site sets Strict-Transport-Security but is not on Chrome's HSTS "
+                    "preload list. The very first visit from a new browser can still be "
+                    "intercepted via HTTP. Add 'preload' to the HSTS header and submit "
+                    "at hstspreload.org."
+                ),
+                "evidence": f"hstspreload.org status: {status}",
+                "tool": "hsts-preload",
+            })
+    except Exception:
+        pass
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — DNS zone transfer attempt
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_zone_transfer(run_id: str, ip: str, name: str) -> list[dict]:
+    """Attempt AXFR zone transfer on the domain's nameservers."""
+    findings: list[dict] = []
+    apex = ".".join(ip.split(".")[-2:]) if ip.count(".") >= 2 else ip
+    try:
+        ns_r = subprocess.run(
+            ["dig", "+short", "NS", apex], capture_output=True, text=True, timeout=8,
+        )
+        nameservers = [l.strip().rstrip(".") for l in ns_r.stdout.splitlines() if l.strip()]
+        for ns in nameservers[:3]:
+            try:
+                axfr = subprocess.run(
+                    ["dig", f"@{ns}", apex, "AXFR", "+short"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if axfr.stdout.strip() and "Transfer failed" not in axfr.stdout and len(axfr.stdout) > 50:
+                    findings.append({
+                        "target": ip, "severity": "HIGH", "category": "network",
+                        "title": f"DNS zone transfer allowed on {ns}",
+                        "description": (
+                            f"Nameserver {ns} allows AXFR zone transfers, exposing all DNS "
+                            f"records (subdomains, MX, TXT, internal hosts). This reveals "
+                            f"the full attack surface of the domain."
+                        ),
+                        "evidence": f"dig @{ns} {apex} AXFR → {axfr.stdout[:200]}",
+                        "tool": "zone-transfer",
+                    })
+                    return findings
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Supabase Edge Function probe
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_supabase_edge(run_id: str, ip: str, name: str) -> list[dict]:
+    """Extract .functions.invoke() calls from JS and probe each for auth."""
+    findings: list[dict] = []
+    try:
+        html = subprocess.run(
+            ["curl", "-sk", "-m", "5", f"https://{ip}/"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout
+    except Exception:
+        return findings
+
+    # Find Supabase project ref
+    proj_match = re.search(r'https?://([a-z0-9]+)\.supabase\.co', html)
+    if not proj_match:
+        js_urls = re.findall(r'(?:src|href)=["\']([^"\']*\.js[^"\']*)', html)
+        corpus = html
+        for js_url in js_urls[:3]:
+            if js_url.startswith("/"):
+                full = f"https://{ip}{js_url.split('?')[0]}"
+            elif js_url.startswith("http"):
+                full = js_url.split("?")[0]
+            else:
+                continue
+            try:
+                r = subprocess.run(
+                    ["curl", "-sk", "-m", "8", "--max-filesize", "5000000", full],
+                    capture_output=True, text=True, timeout=12,
+                )
+                corpus += r.stdout
+            except Exception:
+                continue
+        proj_match = re.search(r'https?://([a-z0-9]+)\.supabase\.co', corpus)
+    else:
+        corpus = html
+
+    if not proj_match:
+        return findings
+
+    project = proj_match.group(1)
+
+    # Extract function names from .functions.invoke('name')
+    func_names = re.findall(r"\.functions\.invoke\(['\"]([a-zA-Z0-9_-]+)['\"]", corpus)
+    func_names = list(dict.fromkeys(func_names))  # dedupe preserving order
+
+    anon_key = re.search(r"(eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)", corpus)
+    key = anon_key.group(1) if anon_key else ""
+
+    for fn in func_names[:5]:
+        url = f"https://{project}.supabase.co/functions/v1/{fn}"
+        try:
+            headers = ["-H", f"Authorization: Bearer {key}"] if key else []
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "5", "-X", "POST", url,
+                 "-H", "Content-Type: application/json",
+                 "-d", "{}"] + headers,
+                capture_output=True, text=True, timeout=8,
+            )
+            code_match = subprocess.run(
+                ["curl", "-sk", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-X", "POST", url, "-H", "Content-Type: application/json", "-d", "{}"],
+                capture_output=True, text=True, timeout=8,
+            )
+            status = code_match.stdout.strip()
+            if status in ("200", "201") and len(r.stdout) > 2:
+                findings.append({
+                    "target": ip, "severity": "MEDIUM", "category": "baas",
+                    "title": f"Supabase Edge Function '{fn}' callable without user auth",
+                    "description": (
+                        f"The Edge Function '{fn}' responds to requests with only the "
+                        f"anon key (no user JWT). If this function performs privileged "
+                        f"operations, it should verify auth.uid() inside the function body."
+                    ),
+                    "evidence": f"POST {url} → HTTP {status}, body: {r.stdout[:150]}",
+                    "tool": "supabase-edge",
+                })
+        except Exception:
+            continue
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE — Dependency confusion check
+# ═════════════════════════════════════════════════════════════════════════════
+
+def scan_target_dep_confusion(run_id: str, ip: str, name: str) -> list[dict]:
+    """Check if JS bundle imports scoped packages that might be squattable."""
+    findings: list[dict] = []
+    try:
+        html = subprocess.run(
+            ["curl", "-sk", "-m", "5", f"https://{ip}/"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout
+    except Exception:
+        return findings
+
+    js_urls = re.findall(r'(?:src|href)=["\']([^"\']*\.js[^"\']*)', html)
+    corpus = ""
+    for js_url in js_urls[:3]:
+        if js_url.startswith("/"):
+            full = f"https://{ip}{js_url.split('?')[0]}"
+        elif js_url.startswith("http"):
+            full = js_url.split("?")[0]
+        else:
+            continue
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "8", "--max-filesize", "3000000", full],
+                capture_output=True, text=True, timeout=12,
+            )
+            corpus += r.stdout
+        except Exception:
+            continue
+
+    if not corpus:
+        return findings
+
+    # Look for scoped package imports that look internal/private
+    scoped = re.findall(r"""(?:require|from)\s*\(\s*['"](@[a-z0-9-]+/[a-z0-9._-]+)['"]""", corpus)
+    scoped += re.findall(r"""from\s+['"](@[a-z0-9-]+/[a-z0-9._-]+)['"]""", corpus)
+    scoped = list(set(scoped))
+
+    # Filter to scopes that look like company-internal (not well-known public scopes)
+    public_scopes = {"@types", "@babel", "@testing-library", "@emotion", "@mui",
+                     "@radix-ui", "@tanstack", "@hookform", "@supabase", "@stripe",
+                     "@sentry", "@vercel", "@next", "@react", "@angular", "@vue",
+                     "@nestjs", "@prisma", "@trpc", "@auth", "@clerk", "@firebase"}
+    suspicious = [s for s in scoped if s.split("/")[0] not in public_scopes]
+
+    for pkg in suspicious[:3]:
+        scope = pkg.split("/")[0]
+        try:
+            r = subprocess.run(
+                ["curl", "-sk", "-m", "5",
+                 f"https://registry.npmjs.org/{pkg}"],
+                capture_output=True, text=True, timeout=8,
+            )
+            if '"error":"Not found"' in r.stdout or r.stdout.strip() == "":
+                findings.append({
+                    "target": ip, "severity": "HIGH", "category": "supply-chain",
+                    "title": f"Possible dependency confusion: {pkg} not on npm",
+                    "description": (
+                        f"The bundle imports '{pkg}' which does not exist on the public "
+                        f"npm registry. If this is a private package, an attacker could "
+                        f"register it on npm and inject malicious code (dependency confusion attack)."
+                    ),
+                    "evidence": f"import '{pkg}' found in bundle; npmjs.org returns 404",
+                    "tool": "dep-confusion",
+                })
+        except Exception:
+            continue
+    return findings

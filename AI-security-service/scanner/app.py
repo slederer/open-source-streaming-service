@@ -9273,7 +9273,7 @@ _CHANGELOG_ENTRIES = [
         "New: blog post 'Lovable vs Bolt vs Replit: who's leaking the most Supabase data?'",
         "New: /favicon.svg, OG/Twitter cards, FAQ section, /sitemap.xml, /robots.txt, /blog/rss.xml",
         "New: /changelog, /status, /api/newsletter + signup form in footer",
-        "Fix: blog card clicks (removed nested <a> tags)",
+        "Fix: blog card clicks (removed nested &lt;a&gt; tags)",
         "Fix: ChatGPT OAuth flow (preserve ?next= through Google round-trip, SameSite=None cookies)",
     ]),
     ("2026-04-15", [

@@ -8349,7 +8349,7 @@ _LANDING_HTML = """<!DOCTYPE html>
   .nav-dropdown > a { cursor: pointer; }
   .nav-dropdown > a::after { content: ' ▾'; font-size: 0.7rem; }
   .nav-dropdown-menu { display: none; position: absolute; top: 100%; left: 0; background: #111827; border: 1px solid #1f2937; border-radius: 8px; min-width: 180px; padding: 6px 0; z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.4); margin-top: 8px; }
-  .nav-dropdown:hover .nav-dropdown-menu { display: block; }
+  .nav-dropdown:hover .nav-dropdown-menu, .nav-dropdown.open .nav-dropdown-menu { display: block; }
   .nav-dropdown-menu a { display: block; padding: 8px 16px; font-size: 0.85rem; color: #d1d5db !important; white-space: nowrap; }
   .nav-dropdown-menu a:hover { background: #1f2937; color: #e5e7eb !important; }
 
@@ -8491,16 +8491,16 @@ _LANDING_HTML = """<!DOCTYPE html>
     </button>
     <a href="#how" onclick="closeNav()">How it works</a>
     <a href="#pricing" onclick="closeNav()">Pricing</a>
-    <span class="nav-dropdown">
-      <a>Platforms</a>
+    <div class="nav-dropdown">
+      <a onclick="this.parentElement.classList.toggle('open')">Platforms</a>
       <div class="nav-dropdown-menu">
-        <a href="/for/lovable">Lovable</a>
-        <a href="/for/bolt">Bolt</a>
-        <a href="/for/replit">Replit</a>
-        <a href="/for/vercel">Vercel / v0</a>
-        <a href="/for/cursor">Cursor</a>
+        <a href="/for/lovable" onclick="closeNav()">Lovable</a>
+        <a href="/for/bolt" onclick="closeNav()">Bolt</a>
+        <a href="/for/replit" onclick="closeNav()">Replit</a>
+        <a href="/for/vercel" onclick="closeNav()">Vercel / v0</a>
+        <a href="/for/cursor" onclick="closeNav()">Cursor</a>
       </div>
-    </span>
+    </div>
     <a href="/blog">Blog</a>
     <a href="/reports/2026-q2">Q2 Report</a>
     <a href="/docs/api">API</a>
@@ -9227,6 +9227,42 @@ async def og_image():
 # ═════════════════════════════════════════════════════════════════════════════
 
 _CHANGELOG_ENTRIES = [
+    ("2026-04-25", [
+        "New: 14 scan modules — XSS probe, cookie audit, Firebase deep probe, unsafe JS patterns, "
+        "AI code fingerprinting, hallucination detection, GraphQL mutation testing, WebSocket probe, "
+        "open redirect, CSP bypass analysis, HSTS preload check, DNS zone transfer, Supabase Edge "
+        "Function probe, dependency confusion check. Scanner now runs 70+ modules.",
+        "New: PDF export for scan reports + OWASP Top 10 compliance report (PDF)",
+        "New: 'Copy fix to Cursor' button on every finding",
+        "New: trust badge — embeddable SVG showing your scan grade",
+        "New: CI/CD webhook — trigger scans from GitHub Actions, Vercel, Netlify deploy hooks",
+        "New: Slack/Discord notifications on scan completion",
+        "New: finding suppression — mark findings as accepted risk / false positive / won't fix",
+        "New: disclosure automation API — generates disclosure drafts for CRIT targets",
+        "New: public scan results pages at /scan/{host} (SEO-indexed)",
+    ]),
+    ("2026-04-24", [
+        "New: blog post 'Beyond Supabase RLS: 5 other critical vulnerabilities'",
+        "New: Q2 2026 State of Vibe-Coded Security report at /reports/2026-q2",
+        "New: platform landing pages — /for/lovable, /for/bolt, /for/replit, /for/vercel",
+        "New: free tool pages — /tools/supabase-rls-check, /tools/header-check, /tools/xss-check, "
+        "/tools/ssl-check, /tools/api-key-check",
+        "New: vulnerability reference pages — /vulns/supabase-rls, /vulns/idor, /vulns/api-key-leak, etc.",
+        "New: integration docs — /docs/integrations/github-actions, vercel-deploy, cursor-mcp",
+        "New: Platforms dropdown menu in header navigation",
+        "Fix: github-dork false positive reduction — keyword dorks capped at MEDIUM, min 2 hits required",
+        "Fix: blog post technical accuracy corrections (per-platform rates, table frequencies)",
+    ]),
+    ("2026-04-16", [
+        "New: scan-without-signup quick scan on landing page hero",
+        "New: mobile-responsive landing page (hamburger menu, stacked layout)",
+        "New: mobile-responsive dashboard (sidebar drawer, adapted grids)",
+        "New: blog post 'Lovable vs Bolt vs Replit: who's leaking the most Supabase data?'",
+        "New: /favicon.svg, OG/Twitter cards, FAQ section, /sitemap.xml, /robots.txt, /blog/rss.xml",
+        "New: /changelog, /status, /api/newsletter + signup form in footer",
+        "Fix: blog card clicks (removed nested <a> tags)",
+        "Fix: ChatGPT OAuth flow (preserve ?next= through Google round-trip, SameSite=None cookies)",
+    ]),
     ("2026-04-15", [
         "New: 'What we check' capabilities section on the homepage — 70+ modules across 7 categories",
         "New: blog redesign with hero + card grid + tags + reading time",

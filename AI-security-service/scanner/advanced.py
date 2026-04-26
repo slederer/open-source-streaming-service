@@ -518,17 +518,31 @@ def scan_target_github_org(run_id: str, ip: str, name: str) -> list[dict]:
     )
 
     def _filter_and_rate(results: list, base_sev: str) -> tuple[list, str]:
-        """Drop URLs from target's own org, obvious example repos, or
-        intentional template files. Return (remaining, possibly_demoted_sev)."""
+        """Drop URLs from target's own org, obvious example repos,
+        intentional template files, or results that don't actually reference
+        the target domain (substring match FPs). Return (remaining, possibly_demoted_sev)."""
         filtered = []
         dropped = 0
         for r in results:
             link = (r.get("link") or r.get("url", "")).lower()
+            title = (r.get("title") or "").lower()
+            snippet = (r.get("snippet") or r.get("body", "")).lower()
             if (
                 any(p in link for p in own_repo_path_hints)
                 or any(s in link for s in noise_repo_substrings)
                 or any(link.endswith(b) for b in template_file_basenames)
             ):
+                dropped += 1
+                continue
+            # Verify the result actually references our target domain, not just
+            # substring matches. E.g., searching for "assistant-ui.com" can match
+            # repos about "assistant" that have nothing to do with assistant-ui.com.
+            # Check if the exact domain appears in the title, snippet, or URL path.
+            target_lower = ip.lower()
+            if (target_lower not in link
+                and target_lower not in title
+                and target_lower not in snippet):
+                # The search result doesn't actually mention our domain — FP
                 dropped += 1
                 continue
             filtered.append(r)

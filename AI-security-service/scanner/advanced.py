@@ -2743,7 +2743,15 @@ def scan_target_hsts_preload(run_id: str, ip: str, name: str) -> list[dict]:
 def scan_target_zone_transfer(run_id: str, ip: str, name: str) -> list[dict]:
     """Attempt AXFR zone transfer on the domain's nameservers."""
     findings: list[dict] = []
+    # Skip platform subdomains — zone transfer on their apex is not the app owner's issue
+    _platform_domains = {
+        "lovable.app", "bolt.host", "bolt.new", "vercel.app", "netlify.app",
+        "replit.app", "repl.co", "pages.dev", "tempo.new", "emergent.sh",
+        "streamlit.app", "railway.app", "fly.dev", "render.com", "herokuapp.com",
+    }
     apex = ".".join(ip.split(".")[-2:]) if ip.count(".") >= 2 else ip
+    if apex.lower() in _platform_domains:
+        return findings
     try:
         ns_r = subprocess.run(
             ["dig", "+short", "NS", apex], capture_output=True, text=True, timeout=8,
@@ -3437,6 +3445,21 @@ def scan_target_admin_panel(run_id: str, ip: str, name: str) -> list[dict]:
         if not matched_markers:
             continue
 
+        # Skip known platform default pages (not real admin panels)
+        platform_fps = [
+            "bolt.new</title>",      # Bolt serves /cms and /panel as platform routes
+            "bolt.new\"></title>",
+            "lovable generated project",
+            "lovable app</title>",
+            "replit</title>",
+            "netlify</title>",
+            "vercel</title>",
+            "page not found",
+            "404 not found",
+        ]
+        if any(fp in body_lower for fp in platform_fps):
+            continue
+
         # Determine if it's a login page (requires auth) vs open dashboard
         is_login = any(kw in body_lower for kw in ["login", "sign in", "password", "log in", "authenticate"])
         has_data = any(kw in body_lower for kw in ["users", "dashboard", "analytics", "revenue", "orders", '"email"'])
@@ -3942,6 +3965,20 @@ def scan_target_ssti(run_id: str, ip: str, name: str) -> list[dict]:
         ("freemarker",  "${7*7}"),
     ]
 
+    # SPA fallback fingerprint — many SPAs return index.html for all paths
+    spa_hash = None
+    try:
+        _, _, root_body = _curl(f"https://{ip}/", timeout=5, max_bytes=10_000)
+        rand_path = f"/__ssti_probe_{hashlib.md5(run_id.encode()).hexdigest()[:8]}"
+        _, _, rand_body = _curl(f"https://{ip}{rand_path}", timeout=5, max_bytes=10_000)
+        if root_body and rand_body:
+            rh = hashlib.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
+            nh = hashlib.sha256(rand_body.encode("utf-8", errors="replace")).hexdigest()
+            if rh == nh:
+                spa_hash = rh
+    except Exception:
+        pass
+
     for path in all_paths:
         # First get a baseline response
         base_url = f"https://{ip}{path}?q=test_baseline_12345"
@@ -3950,8 +3987,13 @@ def scan_target_ssti(run_id: str, ip: str, name: str) -> list[dict]:
         except Exception:
             continue
 
+        if not baseline:
+            continue
+
+        baseline_hash = hashlib.sha256(baseline.encode("utf-8", errors="replace")).hexdigest()
+
         # Skip if baseline already contains "49" (would be a false positive)
-        if "49" in (baseline or ""):
+        if "49" in baseline:
             continue
 
         for engine, payload in payloads:
@@ -3964,7 +4006,33 @@ def scan_target_ssti(run_id: str, ip: str, name: str) -> list[dict]:
             if not body or status not in ("200", ""):
                 continue
 
+            # SPA fallback check — if response matches the SPA fingerprint, skip
+            if spa_hash:
+                bh = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+                if bh == spa_hash:
+                    continue
+
+            # If response is identical to baseline, the param was ignored — not SSTI
+            body_hash = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+            if body_hash == baseline_hash:
+                continue
+
             # Check if "49" appears in response but not in baseline
+            # AND response is meaningfully different from baseline (not just SPA junk)
+            if "49" not in body:
+                continue
+
+            # Extra verification: "49" must appear as a standalone token, not buried
+            # in a hash, URL, ID, or random number. Look for it near the injection point
+            # or as a clear value (e.g., ">49<" or "49\n" or " 49 ")
+            import re as _re
+            # Reject if "49" only appears inside long hex strings, URLs, or IDs
+            body_stripped = _re.sub(r'[0-9a-f]{8,}', '', body)  # remove hex
+            body_stripped = _re.sub(r'https?://\S+', '', body_stripped)  # remove URLs
+            body_stripped = _re.sub(r'\d{3,}', '', body_stripped)  # remove 3+ digit numbers
+            if "49" not in body_stripped:
+                continue
+
             if "49" in body:
                 findings.append({
                     "target": ip, "severity": "CRITICAL", "category": "exploit",

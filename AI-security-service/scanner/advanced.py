@@ -476,16 +476,14 @@ def scan_target_github_org(run_id: str, ip: str, name: str, ctx=None) -> list[di
         from scanner_crawl import _search_any, _SearchUnavailable  # type: ignore
 
     # Core dorks targeting GitHub + this domain. Base severity is capped at
-    # MEDIUM for pure keyword dorks ("password", "api_key", "secret") because
-    # those match any tutorial, docs, or example that merely mentions the
-    # target domain — too noisy to ship as HIGH by default. HIGH is reserved
-    # for specific-filename dorks (DATABASE_URL, .env).
+    # All dorks capped at MEDIUM — proximity keyword matching is an investigative
+    # lead, not a confirmed vulnerability. Too many FPs at HIGH.
     dorks = [
-        (f'site:github.com "{ip}" password', "Password keyword near target domain on GitHub", "MEDIUM"),
-        (f'site:github.com "{ip}" api_key', "API key keyword near target domain on GitHub", "MEDIUM"),
-        (f'site:github.com "{ip}" secret', "Secret keyword near target domain on GitHub", "LOW"),
-        (f'site:github.com "{ip}" "DATABASE_URL"', "Database URL near target on GitHub", "HIGH"),
-        (f'site:github.com "{ip}" ".env"', ".env reference near target on GitHub", "MEDIUM"),
+        (f'site:github.com "{ip}" password', "Password near target domain on GitHub", "MEDIUM"),
+        (f'site:github.com "{ip}" api_key', "API key near target domain on GitHub", "MEDIUM"),
+        (f'site:github.com "{ip}" secret', "Secret near target domain on GitHub", "LOW"),
+        (f'site:github.com "{ip}" "DATABASE_URL"', "Database URL near target on GitHub", "MEDIUM"),
+        (f'site:github.com "{ip}" ".env"', ".env reference near target on GitHub", "LOW"),
         (f'site:gist.github.com "{ip}"', "Target domain in public GitHub Gist", "LOW"),
     ]
 

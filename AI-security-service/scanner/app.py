@@ -414,18 +414,25 @@ def scan_target_nmap(run_id: str, ip: str, name: str):
     output = run_cmd(["nmap", "-sV", "-sC", "--top-ports", "100", "-T4", "--open", ip], timeout=120)
     findings = []
 
+    # Standard web ports — not worth reporting as findings
+    _STANDARD_PORTS = {"80", "443", "8080", "8443"}
+
     # Parse open ports
     for match in re.finditer(r"(\d+)/tcp\s+open\s+(\S+)\s*(.*)", output):
         port, service, version = match.groups()
-        findings.append({
-            "target": ip,
-            "severity": "INFO",
-            "category": "infra",
-            "title": f"Open port {port}/tcp ({service})",
-            "description": f"Service: {service} {version.strip()}",
-            "evidence": f"nmap detected {port}/tcp open on {ip}",
-            "tool": "nmap",
-        })
+        # Skip standard web ports — every web app has these
+        if port in _STANDARD_PORTS:
+            pass  # Still check for EOL versions below, just don't emit INFO
+        else:
+            findings.append({
+                "target": ip,
+                "severity": "INFO",
+                "category": "infra",
+                "title": f"Open port {port}/tcp ({service})",
+                "description": f"Service: {service} {version.strip()}",
+                "evidence": f"nmap detected {port}/tcp open on {ip}",
+                "tool": "nmap",
+            })
 
         # Flag old software versions
         version_lower = version.lower()
@@ -449,9 +456,11 @@ def scan_target_nmap(run_id: str, ip: str, name: str):
     return findings, output
 
 
-def scan_target_headers(run_id: str, ip: str, name: str):
-    """Check HTTP security headers."""
+def scan_target_headers(run_id: str, ip: str, name: str, ctx=None):
+    """Check HTTP security headers. Deduplicated: one finding per missing header."""
     findings = []
+    seen_headers = set()  # Track which missing headers we've already reported
+    ctx = ctx or {}
     for scheme in ["http", "https"]:
         for port in [80, 443, 3000, 8080, 8081, 8001]:
             url = f"{scheme}://{ip}:{port}/"
@@ -507,6 +516,10 @@ def scan_target_headers(run_id: str, ip: str, name: str):
             }
             for hdr_lower, hdr_name in required_headers.items():
                 if hdr_lower not in headers_lower and status in ("200", "301", "302", "307"):
+                    # Deduplicate: only report each missing header once (not per-port)
+                    if hdr_name in seen_headers:
+                        continue
+                    seen_headers.add(hdr_name)
                     findings.append({
                         "target": ip, "severity": "MEDIUM", "category": "web",
                         "title": f"Missing {hdr_name} on port {port}",
@@ -1267,12 +1280,16 @@ def scan_target_jwt(run_id: str, ip: str, name: str):
     return findings
 
 
-def scan_target_dns_email(run_id: str, ip: str, name: str):
+def scan_target_dns_email(run_id: str, ip: str, name: str, ctx=None):
     """Audit email-related DNS records for the target's domain."""
     findings = []
+    ctx = ctx or {}
     # Need a domain name to query
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         return findings  # IPs have no domain to audit
+    # Skip platform subdomains — SPF/DMARC/CAA are the platform's responsibility
+    if ctx.get("is_platform_subdomain"):
+        return findings
     domain = ip
     # SPF
     spf = run_cmd(["dig", "+short", "TXT", domain], timeout=10)
@@ -2489,9 +2506,13 @@ def scan_target_graphql(run_id: str, ip: str, name: str):
     return findings
 
 
-def scan_target_accessibility(run_id: str, ip: str, name: str):
+def scan_target_accessibility(run_id: str, ip: str, name: str, ctx=None):
     """Privacy / compliance signals: cookie banner, privacy policy, tracker audit."""
     findings = []
+    ctx = ctx or {}
+    # Skip on platform subdomains — privacy policy is the platform's concern
+    if ctx.get("is_platform_subdomain"):
+        return findings
     for scheme, port in [("https", 443), ("http", 80), ("http", 3000), ("http", 8080)]:
         base = f"{scheme}://{ip}" if port in (80, 443) else f"{scheme}://{ip}:{port}"
         html = run_cmd(["curl", "-sk", "-m", "5", base + "/"], timeout=8)
@@ -2938,6 +2959,11 @@ def _post_scan_fp_filter(run_id: str, ctx: dict):
         # api-enum returning HTML = SPA fallback, not real debug/internal endpoints
         "tool='api-enum' AND evidence LIKE '%<!DOCTYPE html>%'",
         "tool='api-enum' AND evidence LIKE '%<!doctype html>%'",
+        # Operational noise that should be metadata, not findings
+        "tool='crawler' AND severity='INFO' AND title LIKE 'Crawled %'",
+        "tool='ai-triage' AND severity='INFO' AND title LIKE 'AI triage:%'",
+        "tool='waf-cdn' AND severity='INFO' AND title LIKE 'Edge / CDN%'",
+        "tool='subdomain-deep' AND severity='INFO' AND title LIKE 'Deep subdomain scan: 0 %'",
     ]
     try:
         with get_db() as db:

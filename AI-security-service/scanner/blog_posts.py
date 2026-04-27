@@ -607,6 +607,112 @@ WHERE c.relkind = 'r'
 <p>We kept the scanner's secret-regex list up to date as providers add new prefix formats. If you know of a format we're missing, email us at <a href="mailto:stefan@securityscanner.dev">stefan@securityscanner.dev</a>.</p>
 """,
     },
+    {
+        "slug": "your-vibe-coded-app-is-probably-violating-gdpr",
+        "title": "Your vibe-coded app is probably violating GDPR right now",
+        "date": "2026-04-27",
+        "tag": "Research",
+        "excerpt": (
+            "We scanned 3,030 vibe-coded apps and found 120 with critical vulnerabilities. "
+            "92 had user data — names, emails, phone numbers — readable by anyone. "
+            "Under GDPR, every one of these is a reportable data breach. Under CCPA, consumers can sue directly."
+        ),
+        "body": """
+<p>Last weekend we scanned 3,030 deployed apps built with Lovable, Bolt, Replit, Vercel, and Netlify. 120 of them (4%) had critical vulnerabilities. But the legal exposure is worse than the technical one.</p>
+
+<p>92 apps had Supabase tables containing user data — profiles, registrations, orders, clients — readable by anyone with the public anon key. 3 more had API endpoints returning real PII (names, emails, phone numbers) without any authentication. 2 had payment webhooks accepting unsigned events.</p>
+
+<p>Under current privacy law, every one of these is a potential violation that carries real financial penalties.</p>
+
+<h2>What we found</h2>
+
+<p>Our 80+ module scanner found 306 critical findings across 120 apps. The data exposed includes:</p>
+
+<ul>
+<li><strong>Newsletter subscriber emails</strong> — readable via the Supabase anon key on a math tutoring app</li>
+<li><strong>Client names, emails, and phone numbers</strong> — 16 financial clients on a net worth tracking app, accessible via <code>GET /api/contacts</code> with no auth</li>
+<li><strong>Personal trainer client data</strong> — 18 emails and 15 phone numbers on a fitness app</li>
+<li><strong>Job applicant registrations</strong> — emails and phone numbers on a job board, readable via anon key</li>
+<li><strong>Restaurant orders and customer data</strong> — on multiple food/delivery apps</li>
+<li><strong>User profiles with phone numbers</strong> — on an editing platform</li>
+<li><strong>CRM leads</strong> — a Firestore collection of sales leads readable without authentication</li>
+</ul>
+
+<p>None of these apps require authentication to access this data. In most cases, a single <code>curl</code> command returns the full dataset.</p>
+
+<h2>GDPR: up to 20 million euros</h2>
+
+<p>The EU's General Data Protection Regulation applies to any app that processes data of EU residents — regardless of where the developer is based. The relevant provisions:</p>
+
+<ul>
+<li><strong>Article 32</strong> requires "appropriate technical and organisational measures" to ensure security. An open Supabase table with no RLS is the opposite of appropriate.</li>
+<li><strong>Article 33</strong> requires breach notification to the supervisory authority within <strong>72 hours</strong> of becoming aware. If you're reading this and your app is affected, the clock may have started.</li>
+<li><strong>Article 34</strong> requires notification to affected individuals if the breach is "likely to result in a high risk" — leaked email addresses and phone numbers qualify.</li>
+<li><strong>Fines</strong> under Article 83: up to <strong>&euro;20 million or 4% of global annual revenue</strong>, whichever is higher.</li>
+</ul>
+
+<p>"I didn't know the data was exposed" is not a defense. Under GDPR, the data controller is responsible for security regardless of their technical expertise. The regulation explicitly requires data protection by design and by default (Article 25). An AI-generated app that ships with zero access controls fails this test by definition.</p>
+
+<h2>CCPA/CPRA: consumers can sue you directly</h2>
+
+<p>California's privacy laws give consumers a private right of action for data breaches:</p>
+
+<ul>
+<li><strong>Statutory damages</strong> of $100 to $750 per consumer per incident — no need to prove actual harm</li>
+<li><strong>$7,500 per intentional violation</strong>, $2,500 per unintentional (enforced by the AG)</li>
+<li>Applies to any business that collects personal information of California residents</li>
+</ul>
+
+<p>The net worth tracking app we found had 16 records with real names, emails, and phone numbers. If any of those people are California residents, the statutory damages alone could reach $12,000 from a single unauthenticated API call. A class action could multiply that.</p>
+
+<h2>The US state patchwork</h2>
+
+<p>Beyond California, 20+ US states now have comprehensive privacy laws with security requirements: Texas, Florida, Oregon, Montana, Colorado, Connecticut, Virginia, and more. Most follow the same pattern — they require "reasonable security measures" and impose penalties for breaches. An app with no access controls on its user database fails every reasonable interpretation of "reasonable."</p>
+
+<p>Brazil's LGPD carries fines up to 2% of revenue. One of the apps we found with exposed PII had Portuguese-language content and likely processes Brazilian user data.</p>
+
+<h2>Why vibe-coded apps are uniquely exposed</h2>
+
+<p>Traditional apps go through some version of a security review before production — even if it's informal. Vibe-coded apps skip every checkpoint:</p>
+
+<ol>
+<li><strong>The AI doesn't think about data protection.</strong> When you prompt "build me a fitness tracker with user accounts," the AI builds the CRUD, the UI, the routing — and ships with Supabase tables wide open. It optimized for "it works," not "it's compliant."</li>
+<li><strong>Supabase's anon key is designed to be public</strong>, but Row Level Security is opt-in. The AI doesn't enable it because the app works without it during development. By the time real users sign up, the vulnerability is in production.</li>
+<li><strong>No privacy-by-design review happens.</strong> There's no DPO, no privacy impact assessment, no data processing agreement with Supabase. The app goes from prompt to deployed in an afternoon.</li>
+<li><strong>The developer often doesn't know what GDPR requires</strong>, and the AI doesn't tell them. When was the last time an LLM said "before we deploy, let's complete a Data Protection Impact Assessment"?</li>
+<li><strong>There's no cyber liability insurance.</strong> Most vibe-coded apps are built by solo founders or small teams. A single GDPR complaint could cost more than the app will ever earn.</li>
+</ol>
+
+<h2>The scale of the problem</h2>
+
+<p>We scanned 3,030 apps in one weekend. There are hundreds of thousands of vibe-coded apps deployed right now — Lovable alone has 8 million users. If our 4% critical rate holds across the ecosystem, that's tens of thousands of apps exposing user data in violation of privacy law.</p>
+
+<p>And it's accelerating. The Georgia Tech Vibe Security Radar tracked 35 CVEs from AI-generated code in March 2026 alone — up from 6 in January. Every week, more apps are built and deployed without security review.</p>
+
+<h2>The 72-hour problem</h2>
+
+<p>Here's the uncomfortable part: once you know your app has exposed personal data, you may have a legal obligation to report it. Under GDPR Article 33, the 72-hour notification clock starts when the controller "becomes aware" of the breach.</p>
+
+<p>If you've read this far and you're running a vibe-coded app with Supabase — check your RLS policies right now. If any table with user data has RLS disabled, and any EU resident has used your app, you likely have a reporting obligation.</p>
+
+<h2>What to do right now</h2>
+
+<ol>
+<li><strong>Enable RLS on every Supabase table</strong> — open your Supabase dashboard, go to Authentication &rarr; Policies, and enable RLS on each table. Lovable has a guide for this.</li>
+<li><strong>Audit your API endpoints</strong> — try accessing <code>/api/users</code>, <code>/api/contacts</code>, <code>/api/orders</code> without a login token. If they return data, add auth middleware.</li>
+<li><strong>Check your webhook signature verification</strong> — if you use Stripe, Paddle, or LemonSqueezy, make sure you're verifying the webhook signature before processing events.</li>
+<li><strong>Add a privacy policy</strong> — if you collect any user data, you need one. Most vibe-coded apps don't have one.</li>
+<li><strong>Consider breach notification</strong> — if user data was exposed and you have EU users, consult a lawyer about your GDPR notification obligations.</li>
+<li><strong>Scan your app</strong> — we offer a free scan at <a href="https://securityscanner.dev">securityscanner.dev</a> that checks for RLS misconfigurations, exposed APIs, payment webhook bypass, and 80+ other issues.</li>
+</ol>
+
+<h2>Methodology</h2>
+
+<p>We scanned 3,030 apps across Lovable (838), Bolt (917), Netlify (564), Vercel (448), Replit (223), and others (40). Each scan ran 80+ non-destructive modules including Supabase RLS probing (extracts table names from JS bundles, tests each with the anon key), authentication bypass testing, payment webhook verification, and PII exposure detection. All findings were verified with reproducible evidence. Responsible disclosures were sent to identifiable app owners.</p>
+
+<p>Full results: <a href="/reports/2026-q2">Q2 2026 Security Report</a></p>
+""",
+    },
 ]
 
 

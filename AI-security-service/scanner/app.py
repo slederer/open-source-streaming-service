@@ -2845,7 +2845,7 @@ _PLATFORM_DEFAULT_PATHS = {
 }
 
 _PLATFORM_KNOWN_KEYS = {
-    "bolt": {"sdk-ye5YC6vB6I5SoRX"},
+    "bolt": {"sdk-ye5YC6vB6I5SoRX", "ta1kDK49qdEDEfd8KYxI37mW0GPkLKn1"},
 }
 
 _PLATFORM_APEX_DOMAINS = {
@@ -2921,14 +2921,23 @@ def _build_scan_context(ip: str, run_id: str) -> dict:
 def _post_scan_fp_filter(run_id: str, ctx: dict):
     """Safety-net: suppress known FP patterns after all modules have run."""
     suppressions = [
-        # Bolt SDK key appearing in any finding
+        # Bolt SDK keys appearing in any finding
         "evidence LIKE '%sdk-ye5YC%'",
+        "evidence LIKE '%ta1kDK49qdEDEfd8KYxI37mW0GPkLKn1%'",
         # Bolt.new platform default page in admin-panel
         "tool='admin-panel' AND evidence LIKE '%Bolt.new%'",
         # Login-bruteforce returning 429 means rate limiting IS working
         "tool='login-bruteforce' AND evidence LIKE '%returned HTTP 429%'",
         # Login-bruteforce returning 502 = server error, not meaningful
         "tool='login-bruteforce' AND evidence LIKE '%returned HTTP 502%'",
+        # "password":"text" is a form field type attribute, not a leaked password
+        "tool='secret-scan' AND evidence LIKE '%\"password\":\"text\"%'",
+        # Infra-leak returning full HTML pages = SPA fallback, not real config files
+        "tool='infra-leak' AND severity='HIGH' AND evidence LIKE '%<!DOCTYPE html>%'",
+        "tool='infra-leak' AND severity='HIGH' AND evidence LIKE '%<!doctype html>%'",
+        # api-enum returning HTML = SPA fallback, not real debug/internal endpoints
+        "tool='api-enum' AND evidence LIKE '%<!DOCTYPE html>%'",
+        "tool='api-enum' AND evidence LIKE '%<!doctype html>%'",
     ]
     try:
         with get_db() as db:

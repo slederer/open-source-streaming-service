@@ -461,11 +461,15 @@ def scan_target_takeover(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE 5 — GitHub secret scan (via Serper/SerpAPI dorking)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_github_org(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_github_org(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Use Google dorking to find `site:github.com <target-domain>` results
     that contain secret patterns. Much cheaper than cloning their whole org
     and scanning from scratch."""
     findings = []
+    ctx = ctx or {}
+    # Platform subdomain dorks are noise — Google matches the platform name
+    if ctx.get("is_platform_subdomain"):
+        return findings
     try:
         from scanner.crawl import _search_any, _SearchUnavailable
     except ImportError:
@@ -2754,18 +2758,14 @@ def scan_target_hsts_preload(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — DNS zone transfer attempt
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_zone_transfer(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_zone_transfer(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Attempt AXFR zone transfer on the domain's nameservers."""
     findings: list[dict] = []
+    ctx = ctx or {}
     # Skip platform subdomains — zone transfer on their apex is not the app owner's issue
-    _platform_domains = {
-        "lovable.app", "bolt.host", "bolt.new", "vercel.app", "netlify.app",
-        "replit.app", "repl.co", "pages.dev", "tempo.new", "emergent.sh",
-        "streamlit.app", "railway.app", "fly.dev", "render.com", "herokuapp.com",
-    }
-    apex = ".".join(ip.split(".")[-2:]) if ip.count(".") >= 2 else ip
-    if apex.lower() in _platform_domains:
+    if ctx.get("is_platform_subdomain"):
         return findings
+    apex = ".".join(ip.split(".")[-2:]) if ip.count(".") >= 2 else ip
     try:
         ns_r = subprocess.run(
             ["dig", "+short", "NS", apex], capture_output=True, text=True, timeout=8,
@@ -2958,7 +2958,7 @@ def scan_target_dep_confusion(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — Signup mass-assignment / privilege escalation probe
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_signup_takeover(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_signup_takeover(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Probe signup/register endpoints for mass-assignment vulnerabilities.
 
     AI-generated backends commonly accept any JSON field on the signup endpoint,
@@ -3070,7 +3070,7 @@ def scan_target_signup_takeover(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — Missing authentication on API endpoints
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_auth_bypass(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_auth_bypass(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Test whether sensitive API endpoints respond with real data when called
     without any authentication token.
 
@@ -3080,6 +3080,7 @@ def scan_target_auth_bypass(run_id: str, ip: str, name: str) -> list[dict]:
     findings: list[dict] = []
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         return findings
+    ctx = ctx or {}
 
     # Collect endpoints discovered during this scan run
     discovered_paths = set()
@@ -3107,18 +3108,8 @@ def scan_target_auth_bypass(run_id: str, ip: str, name: str) -> list[dict]:
     # Merge discovered + generic, limit total probes
     all_paths = list(dict.fromkeys(list(discovered_paths)[:15] + sensitive))[:35]
 
-    # Build SPA baseline — avoid false positives from SPA fallback
-    spa_hash = None
-    try:
-        _, _, root_body = _curl(f"https://{ip}/", timeout=5)
-        _, _, random_body = _curl(f"https://{ip}/__probe_{hashlib.md5(run_id.encode()).hexdigest()[:8]}", timeout=5)
-        if root_body and random_body:
-            rh = hashlib.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
-            nh = hashlib.sha256(random_body.encode("utf-8", errors="replace")).hexdigest()
-            if rh == nh:
-                spa_hash = rh
-    except Exception:
-        pass
+    # Use shared SPA hash from ctx
+    spa_hash = ctx.get("spa_fallback_hash")
 
     pii_regexes = [re.compile(p) for p in _PII_MARKERS]
     admin_paths = {"/api/admin", "/api/admin/users", "/api/internal",
@@ -3201,7 +3192,7 @@ def scan_target_auth_bypass(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — Mass assignment / attribute injection on update endpoints
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_mass_assign(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_mass_assign(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Test PATCH/PUT endpoints for mass-assignment: send extra privilege
     escalation fields and check if the server echoes them back.
 
@@ -3279,7 +3270,7 @@ def scan_target_mass_assign(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — Payment webhook signature bypass (Stripe / Paddle / LemonSqueezy)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_payment_bypass(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_payment_bypass(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Check if payment webhook endpoints accept unsigned payloads.
 
     AI-generated payment integration code almost never verifies webhook
@@ -3388,7 +3379,7 @@ def scan_target_payment_bypass(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — Exposed admin/internal dashboards
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_admin_panel(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_admin_panel(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Probe for admin panels, internal dashboards, and admin API endpoints
     that are accessible without authentication.
 
@@ -3398,6 +3389,7 @@ def scan_target_admin_panel(run_id: str, ip: str, name: str) -> list[dict]:
     findings: list[dict] = []
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         return findings
+    ctx = ctx or {}
 
     admin_paths = {
         # HTML dashboards
@@ -3417,21 +3409,14 @@ def scan_target_admin_panel(run_id: str, ip: str, name: str) -> list[dict]:
         "/api/admin/dashboard": ("application/json", ['"total"', '"count"', '"revenue"', '"users"']),
     }
 
-    # SPA baseline
-    spa_hash = None
-    try:
-        _, _, root_body = _curl(f"https://{ip}/", timeout=5)
-        rand_path = f"/__probe_admin_{hashlib.md5(run_id.encode()).hexdigest()[:8]}"
-        _, _, rand_body = _curl(f"https://{ip}{rand_path}", timeout=5)
-        if root_body and rand_body:
-            rh = hashlib.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
-            nh = hashlib.sha256(rand_body.encode("utf-8", errors="replace")).hexdigest()
-            if rh == nh:
-                spa_hash = rh
-    except Exception:
-        pass
+    # Use shared SPA hash from ctx, or compute if not available
+    spa_hash = ctx.get("spa_fallback_hash")
+    # Skip paths that are known platform defaults
+    platform_skip = ctx.get("platform_default_paths", set())
 
     for path, (expected_ct, markers) in admin_paths.items():
+        if path in platform_skip:
+            continue
         url = f"https://{ip}{path}"
         try:
             status, ctype, body = _curl(url, timeout=6, max_bytes=50_000)
@@ -3514,7 +3499,7 @@ def scan_target_admin_panel(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — Login endpoint brute-force resistance
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_login_bruteforce(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_login_bruteforce(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Test login / auth endpoints specifically for rate limiting.
 
     The existing ratelimit module tests the root path. This module targets
@@ -3524,6 +3509,8 @@ def scan_target_login_bruteforce(run_id: str, ip: str, name: str) -> list[dict]:
     findings: list[dict] = []
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         return findings
+    ctx = ctx or {}
+    platform_skip = ctx.get("platform_default_paths", set())
 
     auth_endpoints = [
         ("/api/auth/login",          "login"),
@@ -3542,6 +3529,9 @@ def scan_target_login_bruteforce(run_id: str, ip: str, name: str) -> list[dict]:
     dummy_reset = json.dumps({"email": "probe@test.invalid"})
 
     for path, kind in auth_endpoints:
+        # Skip paths known to be platform defaults (e.g., Bolt /api/auth/*)
+        if path in platform_skip:
+            continue
         url = f"https://{ip}{path}"
         payload = dummy_login if kind == "login" else dummy_reset
 
@@ -3616,7 +3606,7 @@ def scan_target_login_bruteforce(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — PII exposure in API list endpoints
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_pii_exposure(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_pii_exposure(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Scan API list/collection endpoints for PII leaked in response bodies.
 
     AI-generated APIs commonly return full user objects (including email,
@@ -3625,6 +3615,7 @@ def scan_target_pii_exposure(run_id: str, ip: str, name: str) -> list[dict]:
     findings: list[dict] = []
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         return findings
+    ctx = ctx or {}
 
     list_endpoints = [
         "/api/users", "/api/customers", "/api/profiles",
@@ -3643,18 +3634,8 @@ def scan_target_pii_exposure(run_id: str, ip: str, name: str) -> list[dict]:
         "credit_card": re.compile(r'"(?:card_number|creditCard|cc_number)"\s*:\s*"\d'),
     }
 
-    # SPA baseline
-    spa_hash = None
-    try:
-        _, _, root_body = _curl(f"https://{ip}/", timeout=5)
-        _, _, rand_body = _curl(f"https://{ip}/__probe_pii_{hashlib.md5(run_id.encode()).hexdigest()[:8]}", timeout=5)
-        if root_body and rand_body:
-            rh = hashlib.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
-            nh = hashlib.sha256(rand_body.encode("utf-8", errors="replace")).hexdigest()
-            if rh == nh:
-                spa_hash = rh
-    except Exception:
-        pass
+    # Use shared SPA hash from ctx
+    spa_hash = ctx.get("spa_fallback_hash")
 
     for path in list_endpoints:
         url = f"https://{ip}{path}"
@@ -3716,7 +3697,7 @@ def scan_target_pii_exposure(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — Trigger verbose error messages
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_error_leak(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_error_leak(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Actively trigger error conditions and check for information leakage
     in error responses (stack traces, file paths, DB errors, internal IPs).
 
@@ -3823,7 +3804,7 @@ def scan_target_error_leak(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — Basic SQL injection detection
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_sqli_basic(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_sqli_basic(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Test for basic SQL injection using boolean-based and error-based techniques.
 
     Only flags when we have differential evidence (different responses for
@@ -3944,7 +3925,7 @@ def scan_target_sqli_basic(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — Server-side template injection (SSTI)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_ssti(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_ssti(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Test for server-side template injection by injecting math expressions
     in various template syntaxes and checking if the result (49) appears.
 
@@ -4071,7 +4052,7 @@ def scan_target_ssti(run_id: str, ip: str, name: str) -> list[dict]:
 # MODULE — API version / internal endpoint enumeration
 # ═════════════════════════════════════════════════════════════════════════════
 
-def scan_target_api_enum(run_id: str, ip: str, name: str) -> list[dict]:
+def scan_target_api_enum(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
     """Enumerate API versions and internal endpoints. Flag when alternate
     versions have weaker auth than the main API, or when internal/debug
     endpoints are exposed.
@@ -4079,19 +4060,8 @@ def scan_target_api_enum(run_id: str, ip: str, name: str) -> list[dict]:
     findings: list[dict] = []
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         return findings
-
-    # SPA baseline
-    spa_hash = None
-    try:
-        _, _, root_body = _curl(f"https://{ip}/", timeout=5)
-        _, _, rand_body = _curl(f"https://{ip}/__probe_enum_{hashlib.md5(run_id.encode()).hexdigest()[:8]}", timeout=5)
-        if root_body and rand_body:
-            rh = hashlib.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
-            nh = hashlib.sha256(rand_body.encode("utf-8", errors="replace")).hexdigest()
-            if rh == nh:
-                spa_hash = rh
-    except Exception:
-        pass
+    ctx = ctx or {}
+    spa_hash = ctx.get("spa_fallback_hash")
 
     version_paths = [
         ("/api/v1/", "version"),

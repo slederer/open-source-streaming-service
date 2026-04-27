@@ -2826,6 +2826,118 @@ def _run_status(run_id: str) -> str:
         return ""
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Shared scan context — computed once per target, passed to every module
+# ═════════════════════════════════════════════════════════════════════════════
+
+_PLATFORM_SUFFIXES = {
+    ".lovable.app": "lovable", ".bolt.host": "bolt", ".bolt.new": "bolt",
+    ".vercel.app": "vercel", ".netlify.app": "netlify",
+    ".replit.app": "replit", ".repl.co": "replit",
+    ".pages.dev": "cloudflare", ".tempo.new": "tempo",
+    ".streamlit.app": "streamlit", ".fly.dev": "fly",
+    ".railway.app": "railway", ".herokuapp.com": "heroku", ".render.com": "render",
+}
+
+_PLATFORM_DEFAULT_PATHS = {
+    "bolt": {"/cms", "/panel", "/debug/", "/api/auth/login", "/api/auth/signin",
+             "/api/auth/signup", "/api/auth/forgot-password", "/api/auth/reset-password"},
+}
+
+_PLATFORM_KNOWN_KEYS = {
+    "bolt": {"sdk-ye5YC6vB6I5SoRX"},
+}
+
+_PLATFORM_APEX_DOMAINS = {
+    "lovable.app", "bolt.host", "bolt.new", "vercel.app", "netlify.app",
+    "replit.app", "repl.co", "pages.dev", "tempo.new", "emergent.sh",
+    "streamlit.app", "railway.app", "fly.dev", "render.com", "herokuapp.com",
+}
+
+_PLACEHOLDER_CREDS = {
+    "posthog:posthog", "postgres:postgres", "admin:admin", "root:root",
+    "test:test", "user:password", "admin:password", "admin:changeme",
+    "<USERNAME>:<PLAIN_TEXT_PASSWORD>", "<USERNAME>:<PASSWORD>",
+}
+
+
+def _build_scan_context(ip: str, run_id: str) -> dict:
+    """Build shared context for a scan target. Called once per target."""
+    import hashlib as _hl
+    ctx = {
+        "platform": None,
+        "spa_fallback_hash": None,
+        "root_body_hash": None,
+        "platform_default_paths": set(),
+        "platform_known_keys": set(),
+        "is_github_repo": False,
+        "is_platform_subdomain": False,
+        "apex_domain": "",
+    }
+
+    # GitHub repo detection
+    if ip.startswith("https://github.com/") or ip.startswith("github.com/"):
+        ctx["is_github_repo"] = True
+        return ctx
+
+    # Platform detection
+    ip_lower = ip.lower()
+    for suffix, platform in _PLATFORM_SUFFIXES.items():
+        if ip_lower.endswith(suffix):
+            ctx["platform"] = platform
+            ctx["is_platform_subdomain"] = True
+            ctx["platform_default_paths"] = _PLATFORM_DEFAULT_PATHS.get(platform, set())
+            ctx["platform_known_keys"] = _PLATFORM_KNOWN_KEYS.get(platform, set())
+            break
+
+    # Apex domain
+    parts = ip.lower().split(".")
+    if len(parts) >= 2:
+        ctx["apex_domain"] = ".".join(parts[-2:])
+
+    # SPA fallback fingerprint — one fetch instead of 6+ per-module fetches
+    try:
+        probe_hash = _hl.md5(run_id.encode()).hexdigest()[:8]
+        root_cmd = ["curl", "-sk", "-m", "5", "--max-filesize", "100000",
+                    "-A", "SecurityScannerBot/1.0", f"https://{ip}/"]
+        rand_cmd = ["curl", "-sk", "-m", "5", "--max-filesize", "100000",
+                    "-A", "SecurityScannerBot/1.0", f"https://{ip}/__probe_ctx_{probe_hash}"]
+        r1 = subprocess.run(root_cmd, capture_output=True, text=True, timeout=8)
+        r2 = subprocess.run(rand_cmd, capture_output=True, text=True, timeout=8)
+        root_body = r1.stdout or ""
+        rand_body = r2.stdout or ""
+        if root_body and rand_body:
+            root_hash = _hl.sha256(root_body.encode("utf-8", errors="replace")).hexdigest()
+            rand_hash = _hl.sha256(rand_body.encode("utf-8", errors="replace")).hexdigest()
+            ctx["root_body_hash"] = root_hash
+            if root_hash == rand_hash:
+                ctx["spa_fallback_hash"] = root_hash
+    except Exception:
+        pass
+
+    return ctx
+
+
+def _post_scan_fp_filter(run_id: str, ctx: dict):
+    """Safety-net: suppress known FP patterns after all modules have run."""
+    suppressions = [
+        # Bolt SDK key appearing in any finding
+        "evidence LIKE '%sdk-ye5YC%'",
+        # Bolt.new platform default page in admin-panel
+        "tool='admin-panel' AND evidence LIKE '%Bolt.new%'",
+        # Login-bruteforce returning 429 means rate limiting IS working
+        "tool='login-bruteforce' AND evidence LIKE '%returned HTTP 429%'",
+        # Login-bruteforce returning 502 = server error, not meaningful
+        "tool='login-bruteforce' AND evidence LIKE '%returned HTTP 502%'",
+    ]
+    try:
+        with get_db() as db:
+            for cond in suppressions:
+                db.execute(f"DELETE FROM findings WHERE run_id=? AND ({cond})", (run_id,))
+    except Exception:
+        pass
+
+
 def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = None):
     """Execute all scan modules against all targets, storing results incrementally.
 
@@ -2869,6 +2981,9 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
                 "tool": "policy",
             }], seen, user_id=user_id)
             continue
+        # Build shared scan context once per target
+        ctx = _build_scan_context(ip, run_id)
+
         for mod_name, mod_func in scan_modules:
             # Cancellation checkpoint — cheap DB read, per-module granularity.
             if _run_status(run_id) != "running":
@@ -2880,7 +2995,12 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
                 if mod_name == "nmap":
                     findings, _ = mod_func(run_id, ip, name)
                 else:
-                    findings = mod_func(run_id, ip, name)
+                    # Pass ctx to modules that accept it (all new ones do via ctx=None default)
+                    try:
+                        findings = mod_func(run_id, ip, name, ctx=ctx)
+                    except TypeError:
+                        # Old module that doesn't accept ctx kwarg
+                        findings = mod_func(run_id, ip, name)
                 _store_findings(run_id, findings, seen, user_id=user_id)
             except Exception as e:
                 _store_findings(run_id, [{
@@ -2892,6 +3012,9 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
             # Mark this module done
             completed.append(mod_name)
             _update_summary(run_id, status="running", current_module=None, completed_modules=completed, total_modules=total)
+
+        # Post-scan FP filter — safety net for patterns that slip through
+        _post_scan_fp_filter(run_id, ctx)
 
     if canceled:
         # Don't overwrite the 'canceled' status set by the cancel endpoint; just

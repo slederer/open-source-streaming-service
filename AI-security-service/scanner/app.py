@@ -2228,31 +2228,29 @@ _INFRA_LEAK_K8S_DOCKER = [
 ]
 
 
-def scan_target_infra_leaks(run_id: str, ip: str, name: str):
+def scan_target_infra_leaks(run_id: str, ip: str, name: str, ctx=None):
     """Enumerate common leaked-configuration paths + unauth K8s/Docker APIs.
 
-    SPA-fallback guard: we first fetch the site's homepage and keep a hash
-    of the first 500 bytes. Any probe whose response matches that hash is
-    treated as a soft 404 (SPA serving index.html for every unknown route)
-    and skipped — this prevents false positives that plagued the 2026-04-15
-    batch where `/_hg/store` and `/WEB-INF/*.properties` matched the
-    Lovable/Bolt default SPA HTML."""
+    SPA-fallback guard: uses shared ctx.spa_fallback_hash when available,
+    otherwise falls back to own homepage fetch."""
     findings = []
+    ctx = ctx or {}
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
         schemes = [(f"http://{ip}", 80), (f"https://{ip}", 443)]
     else:
         schemes = [(f"https://{ip}", 443), (f"http://{ip}", 80)]
 
-    # Fetch homepage once for SPA-fallback fingerprinting
+    # Use shared SPA fingerprint from ctx, or compute our own
     import hashlib as _hashlib
-    spa_fingerprint: Optional[str] = None
+    spa_fingerprint: Optional[str] = ctx.get("spa_fallback_hash")
     spa_size: int = 0
-    for base, _ in schemes:
-        hp = run_cmd(["curl", "-sk", "-m", "5", base + "/"], timeout=8)
-        if hp and "[TIMEOUT" not in hp and "[ERROR" not in hp and len(hp) > 40:
-            spa_fingerprint = _hashlib.sha256(hp[:500].encode("utf-8", errors="replace")).hexdigest()
-            spa_size = len(hp)
-            break
+    if not spa_fingerprint:
+        for base, _ in schemes:
+            hp = run_cmd(["curl", "-sk", "-m", "5", base + "/"], timeout=8)
+            if hp and "[TIMEOUT" not in hp and "[ERROR" not in hp and len(hp) > 40:
+                spa_fingerprint = _hashlib.sha256(hp[:500].encode("utf-8", errors="replace")).hexdigest()
+                spa_size = len(hp)
+                break
 
     # Phase 1 — HTTP path probes on 80/443
     probed = 0
@@ -5888,12 +5886,30 @@ async def github_scan_repo(request: Request):
                             continue
                         files_scanned += 1
                         rel = os.path.relpath(path, tmp)
+                        # Skip test/example/fixture files — these contain
+                        # intentional placeholder credentials, not leaks
+                        _rel_lower = rel.lower()
+                        _skip_paths = ("test", "example", "fixture", "mock",
+                                       "sample", "demo", "template", ".example",
+                                       "docker-compose", "dev-compose")
+                        if any(sp in _rel_lower for sp in _skip_paths):
+                            continue
                         for pattern, label, sev in SECRET_PATTERNS:
                             for m in re.finditer(pattern, content):
                                 key = (rel, label)
                                 if key in secrets_seen_in_file:
                                     break
                                 secrets_seen_in_file.add(key)
+                                # Skip placeholder/example credentials
+                                _matched = m.group(0).lower()
+                                _placeholders = [
+                                    "posthog:posthog", "postgres:postgres",
+                                    "admin:admin", "root:root", "test:test",
+                                    "user:password", "<username>", "<password>",
+                                    "localhost:5432/mydb", "example.com",
+                                ]
+                                if any(ph in _matched for ph in _placeholders):
+                                    continue
                                 findings.append({
                                     "target": repo_url,
                                     "severity": sev, "category": "code",

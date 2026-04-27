@@ -3553,6 +3553,13 @@ def scan_target_login_bruteforce(run_id: str, ip: str, name: str, ctx=None) -> l
         body0 = lines0[0] if len(lines0) > 1 else ""
         if "<html" in body0.lower() and "login" not in body0.lower():
             continue
+        # SPA fallback check — if response body matches the SPA hash, it's
+        # the SPA serving index.html for POST /login, not a real login endpoint
+        if ctx.get("spa_fallback_hash") and body0:
+            import hashlib as _hl_bf
+            body_hash = _hl_bf.sha256(body0.encode("utf-8", errors="replace")).hexdigest()
+            if body_hash == ctx["spa_fallback_hash"]:
+                continue
 
         # Now send 20 rapid requests and check for rate limiting
         got_429 = False

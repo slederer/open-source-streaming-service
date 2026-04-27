@@ -78,7 +78,7 @@ app.add_middleware(
 
 
 _CACHEABLE_PATH_PREFIXES = ("/blog", "/docs/api", "/docs")
-_CACHEABLE_EXACT = {"/contact", "/privacy", "/terms"}
+_CACHEABLE_EXACT = {"/contact", "/privacy", "/terms", "/cookies"}
 # `/` is intentionally NOT cached — it returns the landing page for anon
 # users but the dashboard HTML for signed-in users. If we set Cache-Control
 # on the landing-page response, browsers happily serve it back to the same
@@ -3794,6 +3794,7 @@ async def signup_page(request: Request):
     <div class="field"><label>Name</label><input type="text" name="name" required></div>
     <div class="field"><label>Email</label><input type="email" name="email" required autocomplete="email"></div>
     <div class="field"><label>Password <span style="color:#4b5563;">(min 8 chars)</span></label><input type="password" name="password" required minlength="8" autocomplete="new-password"></div>
+    <div class="field" style="display:flex;align-items:flex-start;gap:8px;"><input type="checkbox" name="consent" id="consent-cb" required style="margin-top:4px;accent-color:#dc2626;"><label for="consent-cb" style="font-size:0.85rem;color:#9ca3af;">I agree to the <a href="/privacy" style="color:#dc2626;">Privacy Policy</a> and <a href="/terms" style="color:#dc2626;">Terms of Service</a></label></div>
     <button type="submit" class="btn">Create account</button>
   </form>
   <div class="divider"><span>or</span></div>
@@ -3808,7 +3809,7 @@ document.getElementById('signup-form').addEventListener('submit', async e => {{
   btn.disabled = true; btn.textContent = 'Creating...';
   const r = await fetch('/api/auth/signup', {{
     method: 'POST', headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{name: form.name.value, email: form.email.value, password: form.password.value}})
+    body: JSON.stringify({{name: form.name.value, email: form.email.value, password: form.password.value, consent: form.querySelector('#consent-cb').checked}})
   }});
   const data = await r.json();
   document.querySelector('.error, .success')?.remove();
@@ -4182,6 +4183,9 @@ async def signup(request: Request):
     password = body.get("password") or ""
     name = (body.get("name") or "").strip() or email.split("@")[0]
 
+    consent = body.get("consent", False)
+    if not consent:
+        return JSONResponse({"error": "You must agree to the Privacy Policy and Terms of Service"}, status_code=400)
     if not email or "@" not in email or len(email) > 254:
         return JSONResponse({"error": "Valid email required"}, status_code=400)
     if len(password) < 8 or len(password) > 256:
@@ -9059,11 +9063,23 @@ async function nlSubmit(e) {
       <a href="/contact">Contact</a>
       <a href="/privacy">Privacy</a>
       <a href="/terms">Terms</a>
+      <a href="/cookies">Cookies</a>
       <a href="/login">Sign in</a>
     </div>
     <div style="margin-top:10px;color:#4b5563;font-size:0.8rem;">Not open source today &middot; Read-only probes &middot; <a href="/.well-known/security.txt" style="color:#6b7280;">security.txt</a></div>
   </div>
 </footer>
+<!-- Cookie consent banner (GDPR) -->
+<div id="cookie-banner" style="display:none;position:fixed;bottom:0;left:0;right:0;background:#1f2937;border-top:1px solid #374151;padding:14px 24px;z-index:9999;font-size:0.9rem;color:#d1d5db;">
+  <div style="max-width:1100px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+    <span>We use cookies for authentication. By continuing, you accept our cookie policy.</span>
+    <div style="display:flex;gap:8px;">
+      <a href="/cookies" style="background:transparent;border:1px solid #6b7280;color:#e5e7eb;padding:6px 14px;border-radius:6px;text-decoration:none;font-size:0.85rem;">Cookie Policy</a>
+      <button onclick="document.getElementById('cookie-banner').style.display='none';localStorage.setItem('cookie_consent','1');" style="background:#dc2626;color:white;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-weight:600;font-size:0.85rem;">Accept</button>
+    </div>
+  </div>
+</div>
+<script>if(!localStorage.getItem('cookie_consent'))document.getElementById('cookie-banner').style.display='block';</script>
 </body></html>"""
 
 
@@ -9274,6 +9290,7 @@ async def sitemap_xml():
         ("https://securityscanner.dev/contact", "0.5", "yearly"),
         ("https://securityscanner.dev/privacy", "0.3", "yearly"),
         ("https://securityscanner.dev/terms", "0.3", "yearly"),
+        ("https://securityscanner.dev/cookies", "0.3", "yearly"),
         ("https://securityscanner.dev/changelog", "0.6", "weekly"),
         ("https://securityscanner.dev/status", "0.4", "weekly"),
         # Platform landing pages
@@ -10325,12 +10342,11 @@ async def newsletter_signup(request: Request):
     source = (data.get("source") or "landing")[:50]
     if "@" not in email or "." not in email.split("@")[-1] or len(email) < 5:
         return JSONResponse({"error": "Please enter a valid email address."}, status_code=400)
-    ip = (request.client.host if request.client else "")[:64]
     try:
         with get_db() as db:
             db.execute(
-                "INSERT OR IGNORE INTO newsletter_subscribers (email, source, ip) VALUES (?, ?, ?)",
-                (email, source, ip),
+                "INSERT OR IGNORE INTO newsletter_subscribers (email, source) VALUES (?, ?)",
+                (email, source),
             )
     except Exception:
         return JSONResponse({"error": "Could not save your email — please email stefan@securityscanner.dev directly."}, status_code=500)
@@ -10628,6 +10644,92 @@ async def unsubscribe_post(request: Request):
     return JSONResponse({"ok": ok})
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# GDPR — Data export, account deletion
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/me/data-export")
+async def data_export(request: Request):
+    user = get_user(request)
+    if not user or not user.get("user_id"):
+        return JSONResponse({"error": "Authentication required"}, status_code=401)
+    uid = user["user_id"]
+    email = user.get("email", "")
+    with get_db() as db:
+        # User profile (exclude password_hash)
+        u = db.execute(
+            "SELECT id, email, name, picture, plan, scan_credits, created_at, last_login_at, auth_provider FROM users WHERE id=?",
+            (uid,),
+        ).fetchone()
+        profile = dict(u) if u else {}
+
+        # Scan runs
+        runs = [dict(r) for r in db.execute(
+            "SELECT id, target, started_at, finished_at, status, summary_json FROM scan_runs WHERE user_id=? ORDER BY started_at DESC",
+            (uid,),
+        ).fetchall()]
+
+        # Findings
+        findings = [dict(r) for r in db.execute(
+            "SELECT severity, tool, title, target, evidence, category, created_at FROM findings WHERE user_id=? ORDER BY created_at DESC",
+            (uid,),
+        ).fetchall()]
+
+        # Targets
+        targets = [dict(r) for r in db.execute(
+            "SELECT host, label, added_at FROM targets WHERE user_id=?", (uid,),
+        ).fetchall()]
+
+        # API keys (exclude key_hash)
+        api_keys = [dict(r) for r in db.execute(
+            "SELECT key_prefix, label, created_at, last_used_at FROM api_keys WHERE user_id=?", (uid,),
+        ).fetchall()]
+
+        # Monitors
+        monitors = [dict(r) for r in db.execute(
+            "SELECT target, frequency, alert_email, is_active, created_at FROM monitors WHERE user_id=?", (uid,),
+        ).fetchall()]
+
+    export = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "profile": profile,
+        "scan_runs": runs,
+        "findings": findings,
+        "targets": targets,
+        "api_keys": api_keys,
+        "monitors": monitors,
+    }
+    return JSONResponse(
+        content=export,
+        headers={"Content-Disposition": 'attachment; filename="data-export.json"'},
+    )
+
+
+@app.post("/api/me/delete-account")
+async def delete_account(request: Request):
+    user = get_user(request)
+    if not user or not user.get("user_id"):
+        return JSONResponse({"error": "Authentication required"}, status_code=401)
+    uid = user["user_id"]
+    email = user.get("email", "")
+    with get_db() as db:
+        db.execute("DELETE FROM findings WHERE user_id=?", (uid,))
+        db.execute("DELETE FROM scan_runs WHERE user_id=?", (uid,))
+        db.execute("DELETE FROM targets WHERE user_id=?", (uid,))
+        db.execute("DELETE FROM api_keys WHERE user_id=?", (uid,))
+        db.execute("DELETE FROM monitors WHERE user_id=?", (uid,))
+        db.execute("DELETE FROM analyses WHERE user_id=?", (uid,))
+        db.execute("DELETE FROM vercel_installs WHERE user_id=?", (uid,))
+        if email:
+            db.execute("DELETE FROM outreach_suppressions WHERE email=?", (email,))
+            db.execute("DELETE FROM newsletter_subscribers WHERE email=?", (email,))
+        db.execute("DELETE FROM users WHERE id=?", (uid,))
+    # Clear session
+    request.session.clear()
+    return {"deleted": True}
+
+
 _LEGAL_CSS = """
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: #0a0e17; color: #e5e7eb; line-height: 1.6; }
@@ -10677,7 +10779,12 @@ async def privacy_policy():
 </ul>
 
 <h2>Data retention</h2>
-<p>Scan results are kept for as long as your account is active. You can delete your account at any time by emailing us; all your data will be deleted within 30 days.</p>
+<ul>
+<li>Scan data is retained for 1 year after the last scan. Older scan runs and findings are automatically purged.</li>
+<li>User accounts can be deleted at any time via the <a href="/settings">dashboard settings</a> or the <code>/api/me/delete-account</code> endpoint. All associated data is removed immediately.</li>
+<li>Outreach email records are retained for 6 months, then automatically deleted.</li>
+<li>Newsletter subscriptions can be cancelled at any time via the unsubscribe link in each email.</li>
+</ul>
 
 <h2>Third parties</h2>
 <ul>
@@ -10689,8 +10796,16 @@ async def privacy_policy():
 <li><strong>Cloudflare</strong> — our DNS provider and TLS termination</li>
 </ul>
 
-<h2>Your rights</h2>
-<p>You can export all your data via the API, delete your account, or revoke API keys at any time. Email <a href="mailto:privacy@securityscanner.dev">privacy@securityscanner.dev</a> with any requests.</p>
+<h2>Your rights (GDPR)</h2>
+<p>Under GDPR and similar privacy regulations, you have the right to:</p>
+<ul>
+<li><strong>Access</strong> — Export all your data via <code>GET /api/me/data-export</code></li>
+<li><strong>Erasure</strong> — Delete your account and all associated data via <code>POST /api/me/delete-account</code></li>
+<li><strong>Portability</strong> — Your data export is provided as standard JSON</li>
+<li><strong>Rectification</strong> — Update your profile in the dashboard settings</li>
+<li><strong>Objection</strong> — Unsubscribe from emails via one-click links, or contact us</li>
+</ul>
+<p>For any privacy request, email <a href="mailto:privacy@securityscanner.dev">privacy@securityscanner.dev</a>.</p>
 
 <h2>Scanning ethics</h2>
 <p>You must only scan targets you own or have explicit permission to test. Unauthorized scanning violates our terms and may be illegal in your jurisdiction. We log all scans against the authenticated user.</p>
@@ -10735,6 +10850,40 @@ async def terms_of_service():
 
 <h2>Contact</h2>
 <p><a href="mailto:support@securityscanner.dev">support@securityscanner.dev</a></p>
+</div>
+</body></html>""")
+
+
+@app.get("/cookies", response_class=HTMLResponse)
+async def cookie_policy():
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Cookie Policy — Security Scanner</title><style>{_LEGAL_CSS}</style></head>
+<body>
+<nav><a href="/" class="logo"><span>&#9632;</span> Security Scanner</a><a href="/">Back</a></nav>
+<div class="container">
+<h1>Cookie Policy</h1>
+<div class="meta">Last updated: 2026-04-25</div>
+
+<h2>What cookies we use</h2>
+<p>We use a single <strong>session cookie</strong> for authentication. When you sign in (via email/password or Google OAuth), a session cookie is set so the server can identify you on subsequent requests.</p>
+
+<h2>What we do NOT use</h2>
+<ul>
+<li>No tracking cookies</li>
+<li>No analytics cookies (no Google Analytics, no Mixpanel, no Plausible)</li>
+<li>No third-party cookies</li>
+<li>No advertising or remarketing cookies</li>
+</ul>
+
+<h2>Cookie duration</h2>
+<p>The session cookie expires when you close your browser or when the server-side session expires (whichever comes first).</p>
+
+<h2>Managing cookies</h2>
+<p>You can delete cookies at any time in your browser settings. Note that deleting the session cookie will sign you out.</p>
+<p>Since we only use essential authentication cookies, there is no option to use the site while logged in without them. You can browse the landing page and public pages without any cookies.</p>
+
+<h2>Contact</h2>
+<p>Questions about cookies? <a href="mailto:privacy@securityscanner.dev">privacy@securityscanner.dev</a></p>
 </div>
 </body></html>""")
 

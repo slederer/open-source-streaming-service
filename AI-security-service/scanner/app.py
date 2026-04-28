@@ -3590,6 +3590,72 @@ PLAN_LIMITS = {
 }
 
 
+def _gate_findings_for_plan(findings: list[dict], plan: str) -> dict:
+    """Apply paywall gating to scan findings based on user plan.
+
+    Free users see: severity count summary, one CRITICAL finding (title only),
+    one HIGH finding (title only). Everything else is locked.
+    Paid users see everything unchanged.
+
+    Returns a dict with keys: findings, gated, severity_counts, upgrade_message.
+    """
+    if plan != "free":
+        return {"findings": findings, "gated": False}
+
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for f in findings:
+        sev = f.get("severity", "INFO")
+        counts[sev] = counts.get(sev, 0) + 1
+
+    # Pick one CRITICAL and one HIGH sample (title only, no details)
+    preview = []
+    crit_sample = next((f for f in findings if f.get("severity") == "CRITICAL"), None)
+    high_sample = next((f for f in findings if f.get("severity") == "HIGH"), None)
+    if crit_sample:
+        preview.append({
+            "id": crit_sample.get("id"),
+            "severity": "CRITICAL",
+            "title": crit_sample.get("title", ""),
+            "tool": crit_sample.get("tool", ""),
+            "target": crit_sample.get("target", ""),
+            "category": crit_sample.get("category", ""),
+            "description": None,
+            "evidence": None,
+            "locked": False,
+        })
+    if high_sample:
+        preview.append({
+            "id": high_sample.get("id"),
+            "severity": "HIGH",
+            "title": high_sample.get("title", ""),
+            "tool": high_sample.get("tool", ""),
+            "target": high_sample.get("target", ""),
+            "category": high_sample.get("category", ""),
+            "description": None,
+            "evidence": None,
+            "locked": False,
+        })
+
+    # Add locked placeholders for remaining findings
+    remaining = len(findings) - len(preview)
+    if remaining > 0:
+        preview.append({
+            "severity": "LOCKED",
+            "title": f"{remaining} more findings hidden. Upgrade to see all findings.",
+            "locked": True,
+        })
+
+    total = sum(counts.values())
+    return {
+        "findings": preview,
+        "gated": True,
+        "severity_counts": counts,
+        "total_findings": total,
+        "upgrade_message": "Upgrade to see all findings with evidence, fix instructions, and AI-powered analysis.",
+        "upgrade_url": "https://securityscanner.dev/billing",
+    }
+
+
 def can_user_scan(user_id: str) -> tuple[bool, str]:
     """Return (allowed, reason_if_denied)."""
     user = get_user_by_id(user_id)
@@ -5193,13 +5259,23 @@ async def get_run(request: Request, run_id: str):
     run = _verify_run_ownership(run_id, user["user_id"])
     if not run:
         return JSONResponse({"error": "Not found"}, status_code=404)
+    full_user = get_user_by_id(user["user_id"])
+    plan = (full_user or {}).get("plan", "free")
     with get_db() as db:
         findings = db.execute(
             "SELECT * FROM findings WHERE run_id=? ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END, target",
             (run_id,),
         ).fetchall()
+    all_findings = [dict(f) for f in findings]
+    gated = _gate_findings_for_plan(all_findings, plan)
     target_diffs = _compute_target_diffs(run_id)
-    return {"run": dict(run), "findings": [dict(f) for f in findings], "target_diffs": target_diffs}
+    result = {"run": dict(run), "findings": gated["findings"], "target_diffs": target_diffs, "gated": gated["gated"]}
+    if gated["gated"]:
+        result["severity_counts"] = gated["severity_counts"]
+        result["total_findings"] = gated["total_findings"]
+        result["upgrade_message"] = gated["upgrade_message"]
+        result["upgrade_url"] = gated["upgrade_url"]
+    return result
 
 
 @app.post("/api/runs/{run_id}/cancel")
@@ -5327,6 +5403,15 @@ async def get_run_pdf(request: Request, run_id: str, target: str = ""):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     if not _verify_run_ownership(run_id, user["user_id"]):
         return JSONResponse({"error": "Not found"}, status_code=404)
+
+    # Block PDF export for free plan
+    full_user = get_user_by_id(user["user_id"])
+    plan = (full_user or {}).get("plan", "free")
+    if plan == "free":
+        return JSONResponse({
+            "error": "PDF export requires a paid plan. Upgrade to download full reports.",
+            "upgrade_url": "https://securityscanner.dev/billing",
+        }, status_code=402)
 
     with get_db() as db:
         run = db.execute("SELECT * FROM scan_runs WHERE id=?", (run_id,)).fetchone()
@@ -5497,6 +5582,15 @@ async def get_compliance_pdf(request: Request, run_id: str):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     if not _verify_run_ownership(run_id, user["user_id"]):
         return JSONResponse({"error": "Not found"}, status_code=404)
+
+    # Block PDF export for free plan
+    full_user = get_user_by_id(user["user_id"])
+    plan = (full_user or {}).get("plan", "free")
+    if plan == "free":
+        return JSONResponse({
+            "error": "PDF export requires a paid plan. Upgrade to download full reports.",
+            "upgrade_url": "https://securityscanner.dev/billing",
+        }, status_code=402)
 
     with get_db() as db:
         run = db.execute("SELECT * FROM scan_runs WHERE id=?", (run_id,)).fetchone()
@@ -6885,20 +6979,31 @@ async def v1_get_scan(request: Request, run_id: str):
     run = _verify_run_ownership(run_id, user["user_id"])
     if not run:
         return JSONResponse({"error": "Not found"}, status_code=404)
+    full_user = get_user_by_id(user["user_id"])
+    plan = (full_user or {}).get("plan", "free")
     with get_db() as db:
         findings = db.execute(
             "SELECT target, severity, category, title, description, evidence, tool FROM findings WHERE run_id=? ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END",
             (run_id,),
         ).fetchall()
-    return {
+    all_findings = [dict(f) for f in findings]
+    gated = _gate_findings_for_plan(all_findings, plan)
+    result = {
         "run_id": run["id"],
         "status": run["status"],
         "started_at": run["started_at"],
         "finished_at": run["finished_at"],
         "summary": json.loads(run["summary_json"]) if run["summary_json"] else None,
-        "findings": [dict(f) for f in findings],
+        "findings": gated["findings"],
         "fix_url": f"https://securityscanner.dev/v1/scan/{run_id}/fix",
+        "gated": gated["gated"],
     }
+    if gated["gated"]:
+        result["severity_counts"] = gated["severity_counts"]
+        result["total_findings"] = gated["total_findings"]
+        result["upgrade_message"] = gated["upgrade_message"]
+        result["upgrade_url"] = gated["upgrade_url"]
+    return result
 
 
 @app.get("/v1/scan/{run_id}/fix")
@@ -6909,6 +7014,15 @@ async def v1_get_fix(request: Request, run_id: str, target: str = "", format: st
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     if not _verify_run_ownership(run_id, user["user_id"]):
         return JSONResponse({"error": "Not found"}, status_code=404)
+
+    # Block fix file download for free plan (contains full findings data)
+    full_user = get_user_by_id(user["user_id"])
+    plan = (full_user or {}).get("plan", "free")
+    if plan == "free":
+        return JSONResponse({
+            "error": "Fix file download requires a paid plan. Upgrade to get fix instructions.",
+            "upgrade_url": "https://securityscanner.dev/billing",
+        }, status_code=402)
 
     # Try AI analysis first if format=auto or format=ai
     if format in ("auto", "ai"):
@@ -7634,10 +7748,10 @@ async function _loadModulesMeta() {
   return _scanModulesMeta;
 }
 
-function _renderTargetCard(runId, target, findings, gradeFor, diff) {
-  const grade = gradeFor(findings);
+function _renderTargetCard(runId, target, findings, gradeFor, diff, isGated) {
+  const grade = gradeFor(findings.filter(f => !f.locked));
   const counts = {CRITICAL:0,HIGH:0,MEDIUM:0,LOW:0,INFO:0};
-  findings.forEach(f => counts[f.severity]++);
+  findings.filter(f => !f.locked).forEach(f => counts[f.severity]++);
   return `
     <div class="target-card">
       <div class="target-card-head">
@@ -7658,27 +7772,34 @@ function _renderTargetCard(runId, target, findings, gradeFor, diff) {
       </div>
       <div class="target-card-body">
         ${['CRITICAL','HIGH','MEDIUM','LOW','INFO'].map(sev =>
-          findings.filter(f => f.severity === sev).map(f => `
+          findings.filter(f => f.severity === sev && !f.locked).map(f => `
             <div class="finding">
               <div class="finding-head" onclick="if(window.getSelection().toString().length===0)this.parentElement.classList.toggle('open')" style="cursor:pointer;user-select:none;">
                 <span class="badge ${f.severity}">${f.severity}</span>
                 <span class="finding-title">${esc(f.title)}</span>
-                <span class="finding-tool">${esc(f.tool)}</span>
+                <span class="finding-tool">${esc(f.tool || '')}</span>
                 <span class="finding-chev">&#9654;</span>
               </div>
               <div class="finding-body" style="user-select:text;">
-                ${f.description ? `<dt>Description</dt><dd>${esc(f.description)}</dd>` : ''}
+                ${f.description ? `<dt>Description</dt><dd>${esc(f.description)}</dd>` : (isGated ? '<dd style="color:var(--text-muted);font-style:italic;">Upgrade to see full details.</dd>' : '')}
                 ${f.evidence ? `<dt>Evidence</dt><dd style="font-family:'SF Mono',Menlo,monospace;font-size:0.82rem;white-space:pre-wrap;word-break:break-all;background:#0a0e17;padding:8px 10px;border-radius:4px;border:1px solid #1f2937;">${esc(f.evidence)}</dd>` : ''}
-                <dt>Category</dt><dd>${esc(f.category)}</dd>
-                <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;">
+                ${f.category ? `<dt>Category</dt><dd>${esc(f.category)}</dd>` : ''}
+                ${!isGated ? `<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;">
                   <button class="btn btn-outline btn-sm" onclick="event.stopPropagation();_copyFix(this,'${esc(target).replace(/'/g,"\\'")}','${f.severity}',\`${esc(f.title).replace(/`/g,"\\`")}\`,\`${esc(f.description||"").replace(/`/g,"\\`")}\`,\`${esc(f.evidence||"").replace(/`/g,"\\`")}\`)">&#128203; Copy fix to Cursor</button>
                   <button class="btn btn-outline btn-sm" onclick="event.stopPropagation();_suppressFinding(this,${f.id})">${f.suppressed ? '&#10003; Suppressed' : '&#128683; Suppress'}</button>
-                </div>
+                </div>` : ''}
               </div>
             </div>`).join('')).join('')}
+        ${findings.filter(f => f.locked).map(f => `
+          <div class="finding" style="border:1px dashed var(--border);border-radius:8px;padding:16px;margin-top:8px;text-align:center;">
+            <span style="color:var(--text-muted);font-size:0.9rem;">&#128274; ${esc(f.title)}</span>
+            <div style="margin-top:8px;">
+              <a class="btn btn-sm" href="/billing" onclick="event.preventDefault();go('billing');">Upgrade to unlock</a>
+            </div>
+          </div>`).join('')}
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
           <a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">&#128196; Fix (.md)</a>
-          <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/pdf?target=${encodeURIComponent(target)}" target="_blank">&#128462; PDF</a>
+          <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/pdf?target=${encodeURIComponent(target)}" target="_blank" ${isGated ? 'onclick="event.preventDefault();alert(\'PDF export requires a paid plan. Upgrade at /billing\');"' : ''}>&#128462; PDF</a>
           <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/compliance/pdf" target="_blank">&#127919; OWASP Report</a>
           <button class="btn btn-outline btn-sm" onclick="_getBadge(this,'${esc(target)}')">&#127942; Get Badge</button>
           <a class="btn btn-outline btn-sm" href="/scan/${encodeURIComponent(target)}" target="_blank">&#127760; Public Page</a>
@@ -7838,7 +7959,35 @@ VIEWS["scan-detail"] = async (runId, isPoll = false) => {
       <div class="stat-card"><div class="label">Low/Info</div><div class="value">${(sumAll.low || 0) + (sumAll.info || 0)}</div></div>
     </div>`;
 
-  const targetsHtml = Object.entries(byTarget).map(([target, findings]) => _renderTargetCard(runId, target, findings, gradeFor, diffs[target])).join('');
+  const isGated = !!d.gated;
+  const targetsHtml = Object.entries(byTarget).map(([target, findings]) => _renderTargetCard(runId, target, findings, gradeFor, diffs[target], isGated)).join('');
+
+  // Upgrade banner for free plan users
+  const userPlan = (user && user.plan) || 'free';
+  const totalForBanner = d.total_findings || (d.findings || []).length;
+  const upgradeBannerHtml = (userPlan === 'free' && totalForBanner > 0) ? `
+    <div class="card" style="margin-bottom:20px;border:1px solid var(--brand);background:rgba(220,38,38,0.06);padding:20px 24px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+        <div>
+          <div style="font-size:1rem;font-weight:600;margin-bottom:4px;">Your scan found ${totalForBanner} issues. You are seeing a preview.</div>
+          <div style="color:var(--text-muted);font-size:0.85rem;">Upgrade to unlock all findings with evidence, AI-powered analysis, fix instructions, and continuous monitoring.</div>
+        </div>
+        <a class="btn btn-sm" href="/billing" onclick="event.preventDefault();go('billing');">Upgrade now</a>
+      </div>
+    </div>` : '';
+
+  // Monitoring prompt for scans with CRIT/HIGH findings
+  const hasCritHigh = (sumAll.critical || 0) + (sumAll.high || 0) > 0;
+  const monitorPromptHtml = (!isRunning && hasCritHigh) ? `
+    <div class="card" style="margin-bottom:20px;border:1px solid #f97316;background:rgba(249,115,22,0.06);padding:20px 24px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+        <div>
+          <div style="font-size:1rem;font-weight:600;margin-bottom:4px;">This app has critical issues. Want to know when they are fixed?</div>
+          <div style="color:var(--text-muted);font-size:0.85rem;">Enable weekly monitoring to get notified when vulnerabilities are resolved or new ones appear.</div>
+        </div>
+        <a class="btn btn-sm" href="${userPlan === 'free' ? '/billing' : '/monitors'}" onclick="event.preventDefault();go('${userPlan === 'free' ? 'billing' : 'monitors'}');">${userPlan === 'free' ? 'Upgrade for monitoring' : 'Set up monitoring'}</a>
+      </div>
+    </div>` : '';
 
   // SURGICAL UPDATE — only on poll, only replace sections whose content actually changed
   if (isPoll && root.querySelector('#sd-status')) {
@@ -7871,7 +8020,11 @@ VIEWS["scan-detail"] = async (runId, isPoll = false) => {
         <div id="ai-result" style="margin-top:14px;"></div>
       </div>
 
-      <div id="sd-targets">${targetsHtml}</div>`;
+      ${upgradeBannerHtml}
+
+      <div id="sd-targets">${targetsHtml}</div>
+
+      ${monitorPromptHtml}`;
   }
 
   // Auto-refresh while running (no flicker — render keeps showing until new one is ready)
@@ -10263,12 +10416,44 @@ async def public_scan_page(host: str):
     grade = summary.get("risk_grade", "?")
     grade_color = {"A": "#22c55e", "B": "#3b82f6", "C": "#eab308", "D": "#f97316", "F": "#dc2626"}.get(grade, "#6b7280")
 
+    # Fetch one CRITICAL and one HIGH sample finding (title only) for the public page
+    sample_findings_html = ""
+    with get_db() as db:
+        crit_sample = db.execute(
+            "SELECT title FROM findings WHERE run_id=? AND severity='CRITICAL' LIMIT 1",
+            (run["id"],),
+        ).fetchone()
+        high_sample = db.execute(
+            "SELECT title FROM findings WHERE run_id=? AND severity='HIGH' LIMIT 1",
+            (run["id"],),
+        ).fetchone()
+    samples = []
+    if crit_sample:
+        _t = (crit_sample["title"] or "")[:100].replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
+        samples.append(f'<div style="padding:10px 14px;background:#1a0505;border:1px solid #dc2626;border-radius:8px;margin-bottom:8px;">'
+                       f'<span style="color:#dc2626;font-weight:700;font-size:0.8rem;">CRITICAL</span> '
+                       f'<span style="color:#e5e7eb;font-size:0.9rem;">{_t}</span></div>')
+    if high_sample:
+        _t = (high_sample["title"] or "")[:100].replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
+        samples.append(f'<div style="padding:10px 14px;background:#1a0f05;border:1px solid #f97316;border-radius:8px;margin-bottom:8px;">'
+                       f'<span style="color:#f97316;font-weight:700;font-size:0.8rem;">HIGH</span> '
+                       f'<span style="color:#e5e7eb;font-size:0.9rem;">{_t}</span></div>')
+    total_findings = summary.get("critical", 0) + summary.get("high", 0) + summary.get("medium", 0) + summary.get("low", 0)
+    remaining = total_findings - len(samples)
+    if samples:
+        sample_findings_html = '<h2 style="font-size:1.1rem;margin-bottom:12px;">Sample findings (preview)</h2>' + "".join(samples)
+        if remaining > 0:
+            sample_findings_html += (
+                f'<div style="padding:12px 14px;background:#111827;border:1px dashed #374151;border-radius:8px;text-align:center;color:#9ca3af;">'
+                f'+ {remaining} more findings hidden. <a href="/signup" style="color:#dc2626;">Sign up</a> to see all findings with evidence and fix instructions.</div>'
+            )
+
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Security Scan: {host} — Grade {grade} | Security Scanner</title>
+<title>Security Scan: {host} - Grade {grade} | Security Scanner</title>
 <meta name="description" content="Security scan results for {host}. Grade: {grade}. {summary.get('critical',0)} critical, {summary.get('high',0)} high findings.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<meta property="og:title" content="Security Scan: {host} — Grade {grade}">
+<meta property="og:title" content="Security Scan: {host} - Grade {grade}">
 <meta property="og:description" content="{summary.get('critical',0)} critical, {summary.get('high',0)} high, {summary.get('medium',0)} medium findings">
 <style>{_SEO_CSS}</style></head><body>
 {_seo_nav()}
@@ -10277,7 +10462,7 @@ async def public_scan_page(host: str):
   <div style="width:56px;height:56px;border-radius:12px;background:{grade_color};display:flex;align-items:center;justify-content:center;font-size:1.5rem;font-weight:800;color:white;">{grade}</div>
   <div>
     <h1 style="margin-bottom:2px;">Security Scan: {host}</h1>
-    <p style="margin:0;color:#9ca3af;font-size:0.85rem;">Scanned {run.get('started_at','')[:10]} · Scan #{run['id']}</p>
+    <p style="margin:0;color:#9ca3af;font-size:0.85rem;">Scanned {run.get('started_at','')[:10]} - Scan #{run['id']}</p>
   </div>
 </div>
 <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px;">
@@ -10286,8 +10471,9 @@ async def public_scan_page(host: str):
   <span class="hero-stat"><span class="num" style="color:#eab308;">{summary.get('medium',0)}</span><span class="label">Medium</span></span>
   <span class="hero-stat"><span class="num" style="color:#3b82f6;">{summary.get('low',0)}</span><span class="label">Low</span></span>
 </div>
-<p>This is a summary of the latest automated security scan. For full findings with evidence and fix instructions, <a href="/signup">sign up free</a>.</p>
-<a href="/" class="cta">Run your own scan →</a>
+{sample_findings_html}
+<p style="margin-top:20px;">This is a preview of the latest automated security scan. For full findings with evidence and fix instructions, <a href="/signup">sign up free</a>.</p>
+<a href="/" class="cta">Run your own scan</a>
 </div></body></html>""")
 
 

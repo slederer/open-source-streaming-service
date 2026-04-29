@@ -4999,7 +4999,7 @@ async def list_targets(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     with get_db() as db:
         rows = db.execute(
-            "SELECT * FROM targets WHERE user_id=? ORDER BY id", (user["user_id"],)
+            "SELECT * FROM targets WHERE user_id=? ORDER BY id DESC LIMIT 100", (user["user_id"],)
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -7799,7 +7799,7 @@ function _renderTargetCard(runId, target, findings, gradeFor, diff, isGated) {
           </div>`).join('')}
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
           <a class="btn btn-outline btn-sm" href="/v1/scan/${runId}/fix?target=${encodeURIComponent(target)}" download="SECURITY-FIX-${target}.md">&#128196; Fix (.md)</a>
-          <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/pdf?target=${encodeURIComponent(target)}" target="_blank" ${isGated ? 'onclick="event.preventDefault();alert(\'PDF export requires a paid plan. Upgrade at /billing\');"' : ''}>&#128462; PDF</a>
+          <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/pdf?target=${encodeURIComponent(target)}" target="_blank" ${isGated ? 'onclick="event.preventDefault();alert(&quot;PDF export requires a paid plan. Upgrade at /billing&quot;);"' : ''}>&#128462; PDF</a>
           <a class="btn btn-outline btn-sm" href="/api/runs/${runId}/compliance/pdf" target="_blank">&#127919; OWASP Report</a>
           <button class="btn btn-outline btn-sm" onclick="_getBadge(this,'${esc(target)}')">&#127942; Get Badge</button>
           <a class="btn btn-outline btn-sm" href="/scan/${encodeURIComponent(target)}" target="_blank">&#127760; Public Page</a>
@@ -12147,4 +12147,5 @@ async def contact_submit(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "80")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "80")),
+                proxy_headers=True, forwarded_allow_ips="*")

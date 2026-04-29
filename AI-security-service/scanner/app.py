@@ -8682,7 +8682,7 @@ go(initView || "overview", initParam);
 _LANDING_HTML = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Security Scanner — AI-native vulnerability scanning</title>
-<meta name="description" content="Scan any deployed web app for vulnerabilities. AI-powered fix instructions for Claude Code, ChatGPT, Cursor, and Copilot. Built for the vibe-coding era.">
+<meta name="description" content="Scan any deployed web app for vulnerabilities. 80+ modules. AI-powered fix instructions for Claude Code, Cursor, and Copilot.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="alternate" type="application/rss+xml" title="Security Scanner Blog" href="/blog/rss.xml">
 <meta property="og:type" content="website">
@@ -8883,7 +8883,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape')closeNav();});
 
 <section class="hero">
   <div class="container">
-    <h1>Security scans for the<br><span>vibe-coding</span> era.</h1>
+    <h1>Scan any web app for<br><span>security vulnerabilities.</span></h1>
     <p>Scan any deployed app. 80+ modules: Supabase RLS probe, AI-key detection, XSS testing, GraphQL audit, Firebase deep probe, subdomain takeover, IDOR detection, AI code fingerprinting, OWASP compliance reports, and more. PDF reports, CI/CD webhooks, Slack/Discord alerts.</p>
     <div id="quick-scan" style="margin:28px auto 0;max-width:560px;">
       <form id="qs-form" onsubmit="return runQuickScan(event)" style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;">
@@ -9577,7 +9577,7 @@ def _generate_og_image() -> bytes:
             tag_font = ImageFont.load_default()
     draw.text((130, 70), "Security Scanner", fill=(229, 231, 235), font=tag_font)
     draw.text((60, 200), "Security scans for the", fill=(156, 163, 175), font=sub_font)
-    draw.text((60, 240), "vibe-coding era.", fill=(220, 38, 38), font=title_font)
+    draw.text((60, 240), "deployed web apps.", fill=(220, 38, 38), font=title_font)
     draw.text((60, 360), (
         "Scan any deployed app. Supabase RLS, AI-key leak"
     ), fill=(209, 213, 219), font=sub_font)

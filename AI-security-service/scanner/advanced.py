@@ -2775,7 +2775,18 @@ def scan_target_zone_transfer(run_id: str, ip: str, name: str, ctx=None) -> list
                     ["dig", f"@{ns}", apex, "AXFR", "+short"],
                     capture_output=True, text=True, timeout=10,
                 )
-                if axfr.stdout.strip() and "Transfer failed" not in axfr.stdout and len(axfr.stdout) > 50:
+                out = axfr.stdout or ""
+                err = axfr.stderr or ""
+                combined = out + err
+                # AXFR is denied if dig reports communications error, refused, timed out,
+                # or returns no actual records. Real successful AXFRs return SOA + records.
+                failed_markers = (
+                    "Transfer failed", "communications error", "connection refused",
+                    "timed out", "REFUSED", "NOTAUTH", "FORMERR", "no servers could be reached",
+                )
+                if (out.strip() and len(out) > 50
+                        and not any(m in combined for m in failed_markers)
+                        and "SOA" in out):
                     findings.append({
                         "target": ip, "severity": "HIGH", "category": "network",
                         "title": f"DNS zone transfer allowed on {ns}",
@@ -3546,8 +3557,11 @@ def scan_target_login_bruteforce(run_id: str, ip: str, name: str, ctx=None) -> l
 
         lines0 = (r0.stdout or "").strip().rsplit("\n", 1)
         status0 = lines0[-1].strip() if lines0 else ""
-        # Skip non-existent endpoints
-        if status0 in ("404", "405", "000", "301", "302", ""):
+        # Skip non-existent or already-blocked endpoints. 401 = expected auth challenge
+        # without entering creds; 403 = WAF/firewall already blocking (rate limiting is
+        # implicit). 5xx = unhealthy. We can only meaningfully test 200/400/422 responses.
+        if status0 in ("401", "403", "404", "405", "000", "301", "302",
+                       "500", "502", "503", "504", ""):
             continue
         # Skip SPA fallback (HTML response to API POST)
         body0 = lines0[0] if len(lines0) > 1 else ""

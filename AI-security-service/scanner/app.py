@@ -4593,6 +4593,58 @@ async def stripe_webhook(request: Request):
     return {"received": True}
 
 
+@app.post("/webhooks/resend")
+async def resend_webhook(request: Request):
+    """Receive email engagement events from Resend (delivered, opened, clicked, bounced).
+
+    Configure in Resend dashboard: Webhooks → Add → URL https://securityscanner.dev/webhooks/resend
+    Subscribe to email.* events. Verifies via RESEND_WEBHOOK_SECRET (svix-style HMAC).
+    """
+    body = await request.body()
+    secret = os.getenv("RESEND_WEBHOOK_SECRET", "").strip()
+    if secret:
+        # Resend uses Svix; signature header is "svix-signature: v1,<base64>"
+        sig = request.headers.get("svix-signature", "")
+        msg_id = request.headers.get("svix-id", "")
+        ts = request.headers.get("svix-timestamp", "")
+        try:
+            import hmac, hashlib, base64
+            signed = f"{msg_id}.{ts}.{body.decode()}".encode()
+            key = base64.b64decode(secret.split("_", 1)[-1])
+            expected = "v1," + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+            if not any(hmac.compare_digest(expected, s.strip()) for s in sig.split(" ")):
+                return JSONResponse({"error": "bad signature"}, status_code=401)
+        except Exception:
+            return JSONResponse({"error": "verify failed"}, status_code=401)
+
+    try:
+        event = json.loads(body)
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    ev_type = event.get("type", "")
+    data = event.get("data", {}) or {}
+    resend_id = data.get("email_id") or data.get("id") or ""
+    if not resend_id:
+        return {"received": True}
+
+    with get_db() as db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS outreach_events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "resend_id TEXT, event_type TEXT, payload TEXT,"
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outreach_events_rid ON outreach_events(resend_id)"
+        )
+        db.execute(
+            "INSERT INTO outreach_events (resend_id, event_type, payload) VALUES (?, ?, ?)",
+            (resend_id, ev_type, json.dumps(data)[:8000]),
+        )
+    return {"received": True}
+
+
 @app.get("/api/billing/status")
 async def billing_status(request: Request):
     """Return user's billing info for the dashboard."""

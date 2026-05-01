@@ -57,7 +57,8 @@ def _send(to: str, subject: str, html: str) -> bool:
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {api_key}",
                      "Content-Type": "application/json"},
-            json={"from": _FROM, "to": [to], "subject": subject, "html": html},
+            json={"from": _FROM, "to": [to], "subject": subject, "html": html,
+                  "tags": [{"name": "category", "value": "outreach"}]},
             timeout=15,
         )
         if r.status_code >= 400:

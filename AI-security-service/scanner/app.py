@@ -4777,6 +4777,175 @@ async def resend_inbound_webhook(request: Request):
     return {"received": True, "id": msg_pk}
 
 
+def _require_admin(request: Request) -> Optional[dict]:
+    """Return user dict if authenticated AND in ADMIN_EMAILS, else None."""
+    user = get_user(request)
+    if not user:
+        return None
+    full = get_user_by_id(user["user_id"]) or {}
+    admins = set(
+        e.strip().lower()
+        for e in os.getenv("ADMIN_EMAILS", "stefan.a.lederer@gmail.com").split(",")
+        if e.strip()
+    )
+    if (full.get("email") or "").lower() not in admins:
+        return None
+    return full
+
+
+@app.get("/api/inbox")
+async def api_inbox_list(request: Request):
+    """List inbound messages for the admin inbox UI. Newest first."""
+    if not _require_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    with get_db() as db:
+        rows = db.execute("""
+            SELECT id, from_addr, from_name, to_addr, subject,
+                   substr(text_body, 1, 200) as snippet,
+                   message_id, in_reply_to, replied_at, forwarded_at, created_at,
+                   length(text_body) as body_len
+            FROM inbox_messages ORDER BY id DESC LIMIT 200
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/inbox/{msg_id}")
+async def api_inbox_get(request: Request, msg_id: int):
+    """Full message detail."""
+    if not _require_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    with get_db() as db:
+        row = db.execute(
+            "SELECT id, from_addr, from_name, to_addr, subject, text_body, html_body, "
+            "message_id, in_reply_to, refs, replied_at, forwarded_at, created_at "
+            "FROM inbox_messages WHERE id=?",
+            (msg_id,),
+        ).fetchone()
+    if not row:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return dict(row)
+
+
+@app.get("/inbox", response_class=HTMLResponse)
+async def inbox_page(request: Request):
+    if not _require_admin(request):
+        return RedirectResponse("/login")
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inbox &mdash; Security Scanner</title>
+<style>
+{_AUTH_CSS}
+  body {{ align-items: stretch; padding: 0; }}
+  .layout {{ display: grid; grid-template-columns: 320px 1fr; gap: 0; height: 100vh; width: 100%; }}
+  .sidebar {{ background: #0a0e17; border-right: 1px solid #1f2937; overflow-y: auto; }}
+  .sidebar-header {{ padding: 16px 20px; border-bottom: 1px solid #1f2937; display: flex; justify-content: space-between; align-items: center; }}
+  .sidebar-header h2 {{ margin: 0; font-size: 1rem; color: #e5e7eb; }}
+  .sidebar-nav {{ font-size: 0.75rem; }}
+  .sidebar-nav a {{ color: #6b7280; text-decoration: none; margin-left: 12px; }}
+  .sidebar-nav a:hover {{ color: #dc2626; }}
+  .msg-row {{ padding: 12px 20px; border-bottom: 1px solid #111827; cursor: pointer; }}
+  .msg-row:hover {{ background: #111827; }}
+  .msg-row.active {{ background: #1f2937; border-left: 3px solid #dc2626; }}
+  .msg-from {{ color: #e5e7eb; font-size: 0.85rem; font-weight: 600; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .msg-subj {{ color: #9ca3af; font-size: 0.78rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .msg-meta {{ color: #4b5563; font-size: 0.7rem; margin-top: 4px; }}
+  .badge {{ display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.65rem; margin-right: 4px; }}
+  .badge-fwd {{ background: #064e3b; color: #6ee7b7; }}
+  .badge-rep {{ background: #1e3a8a; color: #93c5fd; }}
+  .detail {{ overflow-y: auto; padding: 32px 40px; background: #050810; }}
+  .detail .empty {{ color: #4b5563; text-align: center; padding: 80px 0; font-size: 0.9rem; }}
+  .detail h3 {{ color: #e5e7eb; margin: 0 0 8px; font-size: 1.1rem; }}
+  .detail .from-line {{ color: #9ca3af; font-size: 0.85rem; margin-bottom: 4px; }}
+  .detail .meta-line {{ color: #6b7280; font-size: 0.75rem; margin-bottom: 24px; }}
+  .detail .body {{ color: #d1d5db; font-size: 0.92rem; line-height: 1.6; white-space: pre-wrap; word-break: break-word; padding-top: 16px; border-top: 1px solid #1f2937; }}
+  .detail .body iframe {{ width: 100%; border: 0; min-height: 400px; background: #fff; border-radius: 6px; }}
+  .tab-row {{ display: flex; gap: 4px; margin: 16px 0 0; }}
+  .tab-row button {{ background: transparent; border: 1px solid #1f2937; color: #9ca3af; padding: 4px 10px; border-radius: 4px; font-size: 0.75rem; cursor: pointer; font-family: inherit; }}
+  .tab-row button.active {{ background: #1f2937; color: #e5e7eb; border-color: #374151; }}
+</style></head>
+<body>
+<div class="layout">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h2>Inbox</h2>
+      <span class="sidebar-nav"><a href="/">Dashboard</a> <a href="/logout">Sign out</a></span>
+    </div>
+    <div id="msg-list">Loading...</div>
+  </div>
+  <div class="detail" id="detail">
+    <div class="empty">Select a message</div>
+  </div>
+</div>
+<script>
+let _msgs = [];
+let _active = null;
+
+function fmtDate(s) {{
+  if (!s) return '';
+  return s.replace('T',' ').slice(0, 16);
+}}
+
+async function loadList() {{
+  const r = await fetch('/api/inbox');
+  if (!r.ok) {{ document.getElementById('msg-list').innerHTML = '<div style="padding:20px;color:#dc2626;">Failed to load</div>'; return; }}
+  _msgs = await r.json();
+  const el = document.getElementById('msg-list');
+  if (!_msgs.length) {{ el.innerHTML = '<div style="padding:20px;color:#6b7280;font-size:0.85rem;">No messages yet</div>'; return; }}
+  el.innerHTML = _msgs.map(m => {{
+    const fromLabel = m.from_name ? `${{escapeHtml(m.from_name)}} <span style="color:#6b7280;font-weight:400;">${{escapeHtml(m.from_addr)}}</span>` : escapeHtml(m.from_addr);
+    const badges = (m.forwarded_at ? '<span class="badge badge-fwd">fwd</span>' : '') + (m.replied_at ? '<span class="badge badge-rep">replied</span>' : '');
+    return `<div class="msg-row" data-id="${{m.id}}" onclick="selectMsg(${{m.id}})">
+      <div class="msg-from">${{fromLabel}}</div>
+      <div class="msg-subj">${{escapeHtml(m.subject || '(no subject)')}}</div>
+      <div class="msg-meta">${{badges}}${{fmtDate(m.created_at)}}</div>
+    </div>`;
+  }}).join('');
+}}
+
+async function selectMsg(id) {{
+  document.querySelectorAll('.msg-row').forEach(r => r.classList.toggle('active', +r.dataset.id === id));
+  _active = id;
+  const r = await fetch('/api/inbox/' + id);
+  if (!r.ok) {{ document.getElementById('detail').innerHTML = '<div class="empty">Failed to load</div>'; return; }}
+  const m = await r.json();
+  const fromLabel = m.from_name ? `${{escapeHtml(m.from_name)}} &lt;${{escapeHtml(m.from_addr)}}&gt;` : escapeHtml(m.from_addr);
+  const badges = (m.forwarded_at ? '<span class="badge badge-fwd">forwarded to gmail</span>' : '') + (m.replied_at ? '<span class="badge badge-rep">replied</span>' : '');
+  const hasHtml = m.html_body && m.html_body.length > 10;
+  const hasText = m.text_body && m.text_body.length > 0;
+  document.getElementById('detail').innerHTML = `
+    <h3>${{escapeHtml(m.subject || '(no subject)')}}</h3>
+    <div class="from-line">From: ${{fromLabel}}</div>
+    <div class="from-line">To: ${{escapeHtml(m.to_addr || '')}}</div>
+    <div class="meta-line">${{badges}}${{fmtDate(m.created_at)}}</div>
+    ${{(hasHtml && hasText) ? `<div class="tab-row">
+      <button class="active" onclick="showTab(this,'html')">HTML</button>
+      <button onclick="showTab(this,'text')">Plain</button>
+    </div>` : ''}}
+    <div class="body" id="body-text" style="display:${{(hasHtml && hasText) ? 'none' : (hasText ? 'block' : 'none')}};">${{escapeHtml(m.text_body || '')}}</div>
+    <div class="body" id="body-html" style="display:${{hasHtml ? 'block' : 'none'}};padding:16px 0;">
+      ${{hasHtml ? `<iframe sandbox="" srcdoc="${{escapeAttr(m.html_body)}}"></iframe>` : ''}}
+    </div>`;
+}}
+
+function showTab(btn, which) {{
+  document.querySelectorAll('.tab-row button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('body-html').style.display = which === 'html' ? 'block' : 'none';
+  document.getElementById('body-text').style.display = which === 'text' ? 'block' : 'none';
+}}
+
+function escapeHtml(s) {{
+  return (s || '').replace(/[&<>"']/g, c => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }})[c]);
+}}
+function escapeAttr(s) {{
+  return (s || '').replace(/[&<>"']/g, c => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }})[c]);
+}}
+
+loadList();
+setInterval(loadList, 30000);
+</script></body></html>""")
+
+
 @app.get("/api/billing/status")
 async def billing_status(request: Request):
     """Return user's billing info for the dashboard."""

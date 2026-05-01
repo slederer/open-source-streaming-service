@@ -4645,6 +4645,130 @@ async def resend_webhook(request: Request):
     return {"received": True}
 
 
+def _verify_svix(secret: str, headers, body: bytes) -> bool:
+    """Verify Svix-style webhook signature shared by Resend send + inbound."""
+    if not secret:
+        return True
+    try:
+        import hmac, hashlib, base64
+        sig = headers.get("svix-signature", "")
+        msg_id = headers.get("svix-id", "")
+        ts = headers.get("svix-timestamp", "")
+        signed = f"{msg_id}.{ts}.{body.decode()}".encode()
+        key = base64.b64decode(secret.split("_", 1)[-1])
+        expected = "v1," + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+        return any(hmac.compare_digest(expected, s.strip()) for s in sig.split(" "))
+    except Exception:
+        return False
+
+
+@app.post("/webhooks/resend-inbound")
+async def resend_inbound_webhook(request: Request):
+    """Receive inbound email replies from Resend Inbound. Stores message and
+    re-sends a copy to FORWARD_INBOUND_TO so the user keeps inbox flow in gmail.
+
+    Resend Inbound posts JSON like:
+      { "type": "email.received", "data": { "from": "...", "to": ["..."],
+        "subject": "...", "text": "...", "html": "...", "headers": {...},
+        "message_id": "...", "in_reply_to": "...", "references": [...] } }
+
+    The exact shape may vary; we store the full data blob so we can adjust later.
+    """
+    body = await request.body()
+    secret = os.getenv("RESEND_INBOUND_SECRET", os.getenv("RESEND_WEBHOOK_SECRET", "")).strip()
+    if secret and not _verify_svix(secret, request.headers, body):
+        return JSONResponse({"error": "bad signature"}, status_code=401)
+
+    try:
+        event = json.loads(body)
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    data = event.get("data", {}) or {}
+    # Try both flat and nested shapes — Resend Inbound is new, schema may shift
+    fr = data.get("from")
+    if isinstance(fr, dict):
+        from_addr = fr.get("email") or fr.get("address") or ""
+        from_name = fr.get("name", "")
+    else:
+        from_addr = fr or ""
+        from_name = ""
+    to_field = data.get("to") or []
+    if isinstance(to_field, list) and to_field:
+        first = to_field[0]
+        to_addr = first.get("email") if isinstance(first, dict) else first
+    else:
+        to_addr = to_field if isinstance(to_field, str) else ""
+
+    subject = data.get("subject") or ""
+    text_body = data.get("text") or ""
+    html_body = data.get("html") or ""
+    message_id = data.get("message_id") or data.get("messageId") or ""
+    in_reply_to = data.get("in_reply_to") or data.get("inReplyTo") or ""
+    refs = data.get("references") or []
+    if isinstance(refs, list):
+        refs = " ".join(refs)
+
+    with get_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS inbox_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_addr TEXT,
+                from_name TEXT,
+                to_addr TEXT,
+                subject TEXT,
+                text_body TEXT,
+                html_body TEXT,
+                message_id TEXT,
+                in_reply_to TEXT,
+                refs TEXT,
+                raw_payload TEXT,
+                replied_at TIMESTAMP,
+                forwarded_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_inbox_from ON inbox_messages(from_addr)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_inbox_msgid ON inbox_messages(message_id)")
+        cur = db.execute(
+            "INSERT INTO inbox_messages (from_addr, from_name, to_addr, subject, "
+            "text_body, html_body, message_id, in_reply_to, refs, raw_payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (from_addr, from_name, to_addr, subject,
+             text_body[:60000], html_body[:200000], message_id,
+             in_reply_to, refs, json.dumps(data)[:200000]),
+        )
+        msg_pk = cur.lastrowid
+
+    # Forward a copy to gmail so the user still sees replies in their inbox
+    forward_to = os.getenv("FORWARD_INBOUND_TO", "stefan.a.lederer@gmail.com").strip()
+    if forward_to and from_addr:
+        try:
+            from scanner.notifications import _send as _resend_send  # type: ignore
+        except ImportError:
+            from scanner_notifications import _send as _resend_send  # type: ignore
+        fwd_subject = f"[fwd: {to_addr}] {subject}"
+        sender_label = f"{from_name} <{from_addr}>" if from_name else from_addr
+        fwd_html = (
+            f"<p style='color:#6b7280;font-size:12px;'>Forwarded from <b>{from_addr}</b> "
+            f"to <b>{to_addr}</b></p>"
+            f"<hr style='border:none;border-top:1px solid #e5e7eb;'>"
+            + (html_body or f"<pre>{text_body}</pre>")
+        )
+        try:
+            ok = _resend_send(forward_to, fwd_subject, fwd_html)
+            if ok:
+                with get_db() as db:
+                    db.execute(
+                        "UPDATE inbox_messages SET forwarded_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (msg_pk,),
+                    )
+        except Exception as e:
+            print(f"[inbound] forward failed for msg {msg_pk}: {e}", flush=True)
+
+    return {"received": True, "id": msg_pk}
+
+
 @app.get("/api/billing/status")
 async def billing_status(request: Request):
     """Return user's billing info for the dashboard."""

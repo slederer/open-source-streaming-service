@@ -4777,6 +4777,116 @@ async def resend_inbound_webhook(request: Request):
     return {"received": True, "id": msg_pk}
 
 
+@app.post("/webhooks/cf-inbound")
+async def cf_inbound_webhook(request: Request):
+    """Receive raw MIME from the Cloudflare Email Worker. Parses to from/to/
+    subject/text/html and stores in inbox_messages.
+
+    Worker sends: Content-Type: message/rfc822, X-Inbound-Secret header,
+    optional X-Inbound-From / X-Inbound-To envelope hints.
+    """
+    raw = await request.body()
+    secret_required = os.getenv("CF_EMAIL_WEBHOOK_SECRET", "").strip()
+    if secret_required:
+        provided = request.headers.get("x-inbound-secret", "").strip()
+        if not hmac_safe_eq(provided, secret_required):
+            return JSONResponse({"error": "bad secret"}, status_code=401)
+
+    envelope_from = request.headers.get("x-inbound-from", "")
+    envelope_to = request.headers.get("x-inbound-to", "")
+
+    try:
+        import email
+        from email import policy
+        msg = email.message_from_bytes(raw, policy=policy.default)
+    except Exception as e:
+        return JSONResponse({"error": f"mime parse failed: {e}"}, status_code=400)
+
+    # Header-derived fields. Use the parsed From if present, else the envelope.
+    from_header = str(msg.get("From", "") or envelope_from)
+    # Split "Name <addr@x>" into parts
+    from_name = ""
+    from_addr = from_header.strip()
+    if "<" in from_header and ">" in from_header:
+        from_name = from_header.split("<")[0].strip().strip('"')
+        from_addr = from_header.split("<")[1].split(">")[0].strip()
+    elif "@" in from_header:
+        from_addr = from_header.strip()
+
+    to_addr = (str(msg.get("To", "") or envelope_to) or "").strip()
+    if "<" in to_addr and ">" in to_addr:
+        to_addr = to_addr.split("<")[1].split(">")[0].strip()
+
+    subject = str(msg.get("Subject", "") or "")
+    message_id = str(msg.get("Message-ID", "") or "")
+    in_reply_to = str(msg.get("In-Reply-To", "") or "")
+    refs = str(msg.get("References", "") or "")
+
+    # Extract bodies. multipart/alternative → walk parts.
+    text_body = ""
+    html_body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = (part.get("Content-Disposition") or "").lower()
+            if "attachment" in disp:
+                continue
+            try:
+                payload = part.get_content()
+            except Exception:
+                payload = part.get_payload(decode=True) or b""
+                if isinstance(payload, bytes):
+                    try:
+                        payload = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    except Exception:
+                        payload = payload.decode("utf-8", errors="replace")
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8", errors="replace")
+            if ctype == "text/plain" and not text_body:
+                text_body = payload
+            elif ctype == "text/html" and not html_body:
+                html_body = payload
+    else:
+        try:
+            payload = msg.get_content()
+        except Exception:
+            payload = msg.get_payload(decode=True) or b""
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8", errors="replace")
+        ctype = msg.get_content_type()
+        if ctype == "text/html":
+            html_body = payload
+        else:
+            text_body = payload or ""
+
+    with get_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS inbox_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_addr TEXT, from_name TEXT, to_addr TEXT, subject TEXT,
+                text_body TEXT, html_body TEXT, message_id TEXT,
+                in_reply_to TEXT, refs TEXT, raw_payload TEXT,
+                replied_at TIMESTAMP, forwarded_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur = db.execute(
+            "INSERT INTO inbox_messages (from_addr, from_name, to_addr, subject, "
+            "text_body, html_body, message_id, in_reply_to, refs, raw_payload, forwarded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (from_addr, from_name, to_addr, subject,
+             text_body[:60000], html_body[:200000], message_id,
+             in_reply_to, refs, raw[:500000].decode("utf-8", errors="replace")),
+        )
+        msg_pk = cur.lastrowid
+    return {"received": True, "id": msg_pk}
+
+
+def hmac_safe_eq(a: str, b: str) -> bool:
+    import hmac as _hmac
+    return _hmac.compare_digest(a.encode(), b.encode())
+
+
 def _require_admin(request: Request) -> Optional[dict]:
     """Return user dict if authenticated AND in ADMIN_EMAILS, else None."""
     user = get_user(request)

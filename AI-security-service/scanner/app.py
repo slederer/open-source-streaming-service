@@ -4162,6 +4162,15 @@ async def auth_callback(request: Request):
                 "INSERT INTO users (id, email, name, picture, email_verified, auth_provider, plan, last_login_at) VALUES (?,?,?,?,1,'google','free',?)",
                 (user_id, email, name, picture, datetime.now(timezone.utc).isoformat()),
             )
+        # Send welcome email (best-effort, never blocks login)
+        try:
+            from scanner.notifications import send_welcome_email
+        except ImportError:
+            from scanner_notifications import send_welcome_email  # type: ignore
+        try:
+            send_welcome_email(email, name)
+        except Exception:
+            pass
     else:
         user_id = user["id"]
         with get_db() as db:
@@ -4278,6 +4287,15 @@ async def signup(request: Request):
     host_hdr = request.headers.get("host", "")
     base_url = f"{scheme}://{host_hdr}" if host_hdr else None
     send_verification_email(email, token, base_url=base_url)
+    # Send welcome email (best-effort)
+    try:
+        from scanner.notifications import send_welcome_email
+    except ImportError:
+        from scanner_notifications import send_welcome_email  # type: ignore
+    try:
+        send_welcome_email(email, name)
+    except Exception:
+        pass
     return {"ok": True, "message": "Account created. Check your email to verify."}
 
 

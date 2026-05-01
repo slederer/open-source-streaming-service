@@ -310,6 +310,135 @@ def notify_scan_complete(run_id: str, user_id: Optional[str]) -> None:
         print(f"[notify] notify_scan_complete failed for run={run_id}: {e}", flush=True)
 
 
+# ── 4. Welcome email on signup ────────────────────────────────────────────
+
+def send_welcome_email(email: str, name: str) -> bool:
+    """Sent immediately after account creation."""
+    display = name or "there"
+    body = f"""{_BRAND_HEADER}
+      <h2 style="margin:0 0 16px;color:#111;font-size:20px;">Welcome to Security Scanner</h2>
+      <p>Hi {display},</p>
+      <p>Your account is ready. Here's how to get started:</p>
+      <ol style="color:#4b5563;padding-left:20px;line-height:1.8;">
+        <li><strong>Run your first scan.</strong> Paste any URL and we'll check it against 80+ security modules.</li>
+        <li><strong>Review your findings.</strong> Each finding includes severity, evidence, and a fix prompt you can paste into Cursor or Claude Code.</li>
+        <li><strong>Set up monitoring.</strong> Get notified when new vulnerabilities appear or existing ones get fixed.</li>
+      </ol>
+      <p>
+        <a href="{_BASE_URL}" style="display:inline-block;background:#dc2626;color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:600;">Run your first scan</a>
+      </p>
+      <p style="margin-top:24px;color:#6b7280;font-size:13px;">
+        Questions? Reply to this email. I read every one.<br>
+        Stefan, Security Scanner
+      </p>
+    {_BRAND_FOOTER}"""
+    return _send(email, "Welcome to Security Scanner", body)
+
+
+# ── 5. Upgrade nudge (3 days after signup) ────────────────────────────────
+
+def send_upgrade_nudge(user_id: str) -> bool:
+    """Sent 3 days after signup if user is still on free plan."""
+    try:
+        with _get_db() as db:
+            user = db.execute(
+                "SELECT id, email, name, plan, email_notifications FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+            if not user:
+                return False
+            if not user["email_notifications"]:
+                return False
+            if user["plan"] != "free":
+                return False
+
+            # Count their scans
+            scan_count = db.execute(
+                "SELECT COUNT(*) FROM scan_runs WHERE user_id=?", (user_id,)
+            ).fetchone()[0]
+
+            # Count their findings
+            finding_counts = {}
+            for r in db.execute("""
+                SELECT f.severity, COUNT(*) FROM findings f
+                JOIN scan_runs r ON f.run_id = r.id
+                WHERE r.user_id=? AND f.severity IN ('CRITICAL','HIGH','MEDIUM')
+                GROUP BY f.severity
+            """, (user_id,)).fetchall():
+                finding_counts[r[0]] = r[1]
+
+        total_findings = sum(finding_counts.values())
+        display = user["name"] or "there"
+
+        if scan_count == 0:
+            # Never scanned. Nudge to scan.
+            body = f"""{_BRAND_HEADER}
+              <h2 style="margin:0 0 16px;color:#111;font-size:20px;">You haven't run a scan yet</h2>
+              <p>Hi {display},</p>
+              <p>You signed up 3 days ago but haven't scanned anything yet. It takes 3 minutes and you'll get a full security report with fix instructions.</p>
+              <p>
+                <a href="{_BASE_URL}" style="display:inline-block;background:#dc2626;color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:600;">Run your first scan</a>
+              </p>
+              <p style="color:#6b7280;font-size:13px;">Stefan, Security Scanner</p>
+            {_BRAND_FOOTER}"""
+            return _send(user["email"], "You haven't scanned yet. Try it now.", body)
+        else:
+            # Has scanned. Nudge to upgrade.
+            crits = finding_counts.get("CRITICAL", 0)
+            highs = finding_counts.get("HIGH", 0)
+
+            if total_findings > 0:
+                findings_text = f"Your scan found <strong>{total_findings} issues</strong>"
+                if crits:
+                    findings_text += f" including <strong style='color:#dc2626;'>{crits} critical</strong>"
+                findings_text += ". You're seeing a preview on the free plan."
+            else:
+                findings_text = "Your scan came back clean. Nice work."
+
+            body = f"""{_BRAND_HEADER}
+              <h2 style="margin:0 0 16px;color:#111;font-size:20px;">Get the full picture</h2>
+              <p>Hi {display},</p>
+              <p>{findings_text}</p>
+              <p>Upgrade to unlock:</p>
+              <ul style="color:#4b5563;padding-left:20px;line-height:1.8;">
+                <li>Full findings with evidence and reproducible proof</li>
+                <li>AI-powered fix instructions for Cursor and Claude Code</li>
+                <li>Continuous monitoring with weekly re-scans</li>
+                <li>PDF reports for compliance and stakeholders</li>
+                <li>Unlimited scans across multiple targets</li>
+              </ul>
+              <p>
+                <a href="{_BASE_URL}/#billing" style="display:inline-block;background:#dc2626;color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:600;">See plans</a>
+              </p>
+              <p style="color:#6b7280;font-size:13px;">Stefan, Security Scanner</p>
+            {_BRAND_FOOTER}"""
+            subject = f"Your scan found {total_findings} issues. See the full details." if total_findings else "Upgrade for continuous monitoring and PDF reports."
+            return _send(user["email"], subject, body)
+    except Exception as e:
+        print(f"[notify] upgrade nudge failed for {user_id}: {e}", flush=True)
+        return False
+
+
+# ── Drip sequence cron helper ─────────────────────────────────────────────
+
+def run_drip_sequence():
+    """Called daily by cron. Sends upgrade nudges to users 3 days after signup."""
+    try:
+        with _get_db() as db:
+            # Users who signed up 3 days ago, still on free plan
+            users = db.execute("""
+                SELECT id FROM users
+                WHERE plan = 'free'
+                AND created_at BETWEEN datetime('now', '-4 days') AND datetime('now', '-2 days')
+                AND email_notifications = 1
+            """).fetchall()
+        for u in users:
+            send_upgrade_nudge(u[0])
+            print(f"[drip] Sent upgrade nudge to {u[0]}", flush=True)
+    except Exception as e:
+        print(f"[drip] run_drip_sequence failed: {e}", flush=True)
+
+
 # ── Schema migration: ensure users.email_notifications column exists ───────
 
 def ensure_email_notifications_column():

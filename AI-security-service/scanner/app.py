@@ -4740,9 +4740,17 @@ async def resend_inbound_webhook(request: Request):
         )
         msg_pk = cur.lastrowid
 
-    # Forward a copy to gmail so the user still sees replies in their inbox
+    # Forward a copy to gmail so the user still sees replies in their inbox.
+    # Skip loopback: messages from gmail itself, from our own domain, or already
+    # forwarded (subject prefix). Prevents auto-responders from causing infinite forwards.
     forward_to = os.getenv("FORWARD_INBOUND_TO", "stefan.a.lederer@gmail.com").strip()
-    if forward_to and from_addr:
+    is_loop = (
+        from_addr.lower() == forward_to.lower()
+        or from_addr.lower().endswith("@securityscanner.dev")
+        or subject.startswith("[fwd:")
+        or subject.startswith("Re: [fwd:")
+    )
+    if forward_to and from_addr and not is_loop:
         try:
             from scanner.notifications import _send as _resend_send  # type: ignore
         except ImportError:

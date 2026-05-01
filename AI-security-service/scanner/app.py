@@ -4826,6 +4826,116 @@ async def api_inbox_get(request: Request, msg_id: int):
     return dict(row)
 
 
+@app.post("/api/inbox/{msg_id}/reply")
+async def api_inbox_reply(request: Request, msg_id: int):
+    """Reply to an inbound message via Resend. Reply-from = the address the original
+    was sent to (so a reply to mail received at security@... goes out as security@...).
+    Sets In-Reply-To and References for proper threading.
+    """
+    user = _require_admin(request)
+    if not user:
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    body_text = (payload.get("text") or "").strip()
+    if not body_text:
+        return JSONResponse({"error": "empty body"}, status_code=400)
+
+    with get_db() as db:
+        row = db.execute(
+            "SELECT id, from_addr, from_name, to_addr, subject, message_id, refs, in_reply_to "
+            "FROM inbox_messages WHERE id=?",
+            (msg_id,),
+        ).fetchone()
+    if not row:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    msg = dict(row)
+
+    # Reply From = the original "to" address. Falls back to noreply@ if it's
+    # an external-looking address.
+    our_domain = "@securityscanner.dev"
+    reply_from_addr = (msg["to_addr"] or "").strip()
+    if not reply_from_addr.lower().endswith(our_domain):
+        reply_from_addr = "stefan@securityscanner.dev"
+    sender_name = (user.get("name") or "Stefan Lederer").split("<")[0].strip()
+    from_header = f"{sender_name} <{reply_from_addr}>"
+
+    subject = msg["subject"] or ""
+    if not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+
+    # References: original references + original message_id, joined with space
+    refs_chain = []
+    if msg.get("refs"):
+        refs_chain.extend([r for r in (msg["refs"] or "").split() if r])
+    if msg.get("message_id"):
+        refs_chain.append(msg["message_id"])
+    refs_chain = list(dict.fromkeys(refs_chain))  # de-dupe preserving order
+
+    headers = {}
+    if msg.get("message_id"):
+        headers["In-Reply-To"] = msg["message_id"]
+    if refs_chain:
+        headers["References"] = " ".join(refs_chain)
+
+    # Build HTML body: user's plain text, with a quoted block of the original
+    import html as _html_mod
+    quoted_lines = (msg.get("text_body") or "")[:4000].splitlines() if False else []
+    # Pull text_body from DB for the quote
+    with get_db() as db:
+        body_row = db.execute("SELECT text_body FROM inbox_messages WHERE id=?", (msg_id,)).fetchone()
+    original_text = (body_row["text_body"] or "") if body_row else ""
+    quoted = "\n".join("> " + line for line in original_text.splitlines()[:120])
+    body_html = (
+        f"<div style='font-family:-apple-system,BlinkMacSystemFont,sans-serif;color:#111;line-height:1.5;'>"
+        f"<div style='white-space:pre-wrap;'>{_html_mod.escape(body_text)}</div>"
+        f"<br><br>"
+        f"<div style='color:#6b7280;font-size:0.85em;border-left:3px solid #e5e7eb;padding-left:12px;'>"
+        f"On {msg.get('created_at','')}, {_html_mod.escape(msg.get('from_addr',''))} wrote:<br>"
+        f"<pre style='white-space:pre-wrap;font-family:inherit;color:#6b7280;'>{_html_mod.escape(quoted)}</pre>"
+        f"</div></div>"
+    )
+
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not api_key:
+        return JSONResponse({"error": "RESEND_API_KEY not set"}, status_code=500)
+
+    payload_to_resend = {
+        "from": from_header,
+        "to": [msg["from_addr"]],
+        "subject": subject,
+        "html": body_html,
+        "text": body_text,
+        "headers": headers,
+    }
+    try:
+        import httpx
+        r = httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json=payload_to_resend,
+            timeout=20,
+        )
+        if r.status_code >= 400:
+            return JSONResponse(
+                {"error": f"Resend HTTP {r.status_code}", "body": r.text[:300]},
+                status_code=502,
+            )
+        sent = r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"send failed: {e}"}, status_code=500)
+
+    with get_db() as db:
+        db.execute(
+            "UPDATE inbox_messages SET replied_at=CURRENT_TIMESTAMP WHERE id=?",
+            (msg_id,),
+        )
+    return {"sent": True, "id": sent.get("id"), "from": reply_from_addr}
+
+
 @app.get("/inbox", response_class=HTMLResponse)
 async def inbox_page(request: Request):
     if not _require_admin(request):
@@ -4862,6 +4972,16 @@ async def inbox_page(request: Request):
   .tab-row {{ display: flex; gap: 4px; margin: 16px 0 0; }}
   .tab-row button {{ background: transparent; border: 1px solid #1f2937; color: #9ca3af; padding: 4px 10px; border-radius: 4px; font-size: 0.75rem; cursor: pointer; font-family: inherit; }}
   .tab-row button.active {{ background: #1f2937; color: #e5e7eb; border-color: #374151; }}
+  .reply-box {{ margin-top: 32px; padding-top: 24px; border-top: 1px solid #1f2937; }}
+  .reply-box .reply-meta {{ color: #6b7280; font-size: 0.78rem; margin-bottom: 8px; }}
+  .reply-box textarea {{ width: 100%; box-sizing: border-box; min-height: 180px; background: #0a0e17; border: 1px solid #1f2937; border-radius: 6px; color: #e5e7eb; padding: 12px; font-family: inherit; font-size: 0.9rem; line-height: 1.5; resize: vertical; }}
+  .reply-box textarea:focus {{ outline: none; border-color: #dc2626; }}
+  .reply-box .reply-actions {{ display: flex; gap: 8px; align-items: center; margin-top: 8px; }}
+  .reply-box button {{ background: #dc2626; border: 0; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 0.85rem; cursor: pointer; font-family: inherit; }}
+  .reply-box button:disabled {{ background: #6b7280; cursor: not-allowed; }}
+  .reply-status {{ color: #6b7280; font-size: 0.8rem; }}
+  .reply-status.ok {{ color: #22c55e; }}
+  .reply-status.err {{ color: #dc2626; }}
 </style></head>
 <body>
 <div class="layout">
@@ -4924,7 +5044,45 @@ async function selectMsg(id) {{
     <div class="body" id="body-text" style="display:${{(hasHtml && hasText) ? 'none' : (hasText ? 'block' : 'none')}};">${{escapeHtml(m.text_body || '')}}</div>
     <div class="body" id="body-html" style="display:${{hasHtml ? 'block' : 'none'}};padding:16px 0;">
       ${{hasHtml ? `<iframe sandbox="" srcdoc="${{escapeAttr(m.html_body)}}"></iframe>` : ''}}
+    </div>
+    <div class="reply-box">
+      <div class="reply-meta">Replying to <b>${{escapeHtml(m.from_addr)}}</b> &mdash; from ${{escapeHtml((m.to_addr || '').toLowerCase().endsWith('@securityscanner.dev') ? m.to_addr : 'stefan@securityscanner.dev')}}</div>
+      <textarea id="reply-text" placeholder="Write your reply..."></textarea>
+      <div class="reply-actions">
+        <button id="reply-send" onclick="sendReply()">Send reply</button>
+        <span class="reply-status" id="reply-status"></span>
+      </div>
     </div>`;
+}}
+
+async function sendReply() {{
+  if (!_active) return;
+  const text = document.getElementById('reply-text').value.trim();
+  if (!text) {{ document.getElementById('reply-status').textContent = 'Empty.'; return; }}
+  const btn = document.getElementById('reply-send');
+  const status = document.getElementById('reply-status');
+  btn.disabled = true; status.className = 'reply-status'; status.textContent = 'Sending...';
+  try {{
+    const r = await fetch(`/api/inbox/${{_active}}/reply`, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ text }}),
+    }});
+    const data = await r.json();
+    if (r.ok && data.sent) {{
+      status.className = 'reply-status ok';
+      status.textContent = `Sent from ${{data.from}} (${{data.id}})`;
+      document.getElementById('reply-text').value = '';
+      loadList();
+    }} else {{
+      status.className = 'reply-status err';
+      status.textContent = data.error || `HTTP ${{r.status}}`;
+    }}
+  }} catch (e) {{
+    status.className = 'reply-status err';
+    status.textContent = String(e);
+  }}
+  btn.disabled = false;
 }}
 
 function showTab(btn, which) {{
@@ -5335,7 +5493,10 @@ def startup():
         if ENVIRONMENT == "production":
             raise RuntimeError(msg)
     try:
-        from scanner.admin import init_admin_db
+        try:
+            from scanner.admin import init_admin_db
+        except ImportError:
+            from scanner_admin import init_admin_db  # type: ignore
         init_admin_db()
     except Exception as e:
         print(f"[startup] admin init failed: {e}")
@@ -5354,7 +5515,10 @@ def startup():
 
 # Mount admin module
 try:
-    from scanner.admin import router as _admin_router, api as _admin_api
+    try:
+        from scanner.admin import router as _admin_router, api as _admin_api
+    except ImportError:
+        from scanner_admin import router as _admin_router, api as _admin_api  # type: ignore
     app.include_router(_admin_router)
     app.include_router(_admin_api)
 except Exception as _e:

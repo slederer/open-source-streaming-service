@@ -2,9 +2,21 @@
 
 import os
 import sqlite3
+import tempfile
 import uuid
 from pathlib import Path
 from unittest.mock import patch
+
+# Set test env BEFORE importing scanner.app — that module reads SCANNER_DB
+# and SESSION_SECRET at module load. Without this, test collection on a
+# machine without /home/ec2-user/scanner.db fails with sqlite errors.
+os.environ.setdefault("SCANNER_DB", os.path.join(tempfile.gettempdir(), "test_scanner_collect.db"))
+os.environ.setdefault("SESSION_SECRET", "test-session-secret-0123456789abcdef")
+os.environ.setdefault("GOOGLE_CLIENT_ID", "test-client-id")
+os.environ.setdefault("GOOGLE_CLIENT_SECRET", "test-secret")
+os.environ.setdefault("ALLOWED_EMAILS", "test@example.com")
+os.environ.setdefault("SCANNER_ALLOW_PRIVATE_TARGETS", "1")
+os.environ.setdefault("ENVIRONMENT", "test")
 
 import pytest
 from fastapi.testclient import TestClient

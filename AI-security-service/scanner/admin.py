@@ -32,12 +32,18 @@ api = APIRouter(prefix="/api/admin", tags=["admin"])
 # ── DB helpers (late-bound to avoid circular import) ─────────────────────────
 
 def _get_db():
-    from scanner.app import get_db  # noqa: WPS433
+    try:
+        from scanner.app import get_db  # noqa: WPS433
+    except ImportError:
+        from scanner_app import get_db  # type: ignore
     return get_db()
 
 
 def _db_path() -> Path:
-    from scanner.app import DB_PATH  # noqa: WPS433
+    try:
+        from scanner.app import DB_PATH  # noqa: WPS433
+    except ImportError:
+        from scanner_app import DB_PATH  # type: ignore
     return DB_PATH
 
 
@@ -46,7 +52,10 @@ def _db_path() -> Path:
 def _current_user(request: Request) -> Optional[dict]:
     """Read current user via scanner.app.get_user so tests can patch it."""
     try:
-        from scanner.app import get_user  # noqa: WPS433
+        try:
+            from scanner.app import get_user  # noqa: WPS433
+        except ImportError:
+            from scanner_app import get_user  # type: ignore
         return get_user(request)
     except Exception:
         try:

@@ -881,10 +881,19 @@ const $$ = (q,e=document)=>Array.from(e.querySelectorAll(q));
 const esc = s => (s==null?'':String(s)).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = n => (n==null?'—':Number(n).toLocaleString());
 const fmtUsd = c => '$' + (Number(c)/100).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
-const fmtDate = s => { if(!s) return '—'; const d=new Date(s); return isNaN(d)?s:d.toISOString().slice(0,19).replace('T',' ')+'Z'; };
+// SQLite CURRENT_TIMESTAMP returns "YYYY-MM-DD HH:MM:SS" without timezone.
+// JS new Date() parses this as local time, breaking relative-ago math for
+// any browser not on UTC. Force UTC interpretation.
+const _parseUtc = s => {
+  if (!s) return null;
+  if (typeof s !== 'string') return new Date(s);
+  if (s.endsWith('Z') || /[+\-]\d\d:?\d\d$/.test(s)) return new Date(s);
+  return new Date(s.replace(' ', 'T') + 'Z');
+};
+const fmtDate = s => { if(!s) return '—'; const d=_parseUtc(s); return isNaN(d)?s:d.toISOString().slice(0,19).replace('T',' ')+'Z'; };
 const fmtAgo = s => {
   if(!s) return '—';
-  const d = new Date(s); if (isNaN(d)) return s;
+  const d = _parseUtc(s); if (!d || isNaN(d)) return s;
   const sec = Math.round((Date.now()-d.getTime())/1000);
   if (sec<60) return sec+'s ago';
   if (sec<3600) return Math.round(sec/60)+'m ago';

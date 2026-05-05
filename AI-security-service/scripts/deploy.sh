@@ -83,9 +83,11 @@ PYEOF
 "
 
 # 5. Restart scanner ───────────────────────────────────────────────────────
+# Use a narrow pgrep so we don't match the SSH command itself (which contains
+# "scanner_app.py" as a literal string and would otherwise kill its own bash).
 echo "[deploy] restarting scanner…"
 ssh -i "$EC2_KEY" -o ConnectTimeout=15 "ec2-user@$EC2_HOST" "
-for PID in \$(pgrep -f scanner_app.py); do sudo kill -9 \$PID; done
+for PID in \$(pgrep -fx 'python3 /home/ec2-user/scanner_app.py'); do sudo kill -9 \$PID; done
 sleep 4
 sudo bash -c 'source /home/ec2-user/scanner.env && export PORT=80 && export \$(grep -v ^# /home/ec2-user/scanner.env | xargs) && nohup python3 /home/ec2-user/scanner_app.py > /home/ec2-user/scanner.log 2>&1 &'
 "

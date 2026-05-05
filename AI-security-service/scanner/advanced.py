@@ -3435,7 +3435,7 @@ def scan_target_admin_panel(run_id: str, ip: str, name: str, ctx=None) -> list[d
         if status != "200" or not body.strip():
             continue
 
-        # SPA fallback check
+        # SPA fallback check (exact body match)
         if spa_hash:
             bh = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
             if bh == spa_hash:
@@ -3447,10 +3447,39 @@ def scan_target_admin_panel(run_id: str, ip: str, name: str, ctx=None) -> list[d
         if expected_ct == "text/html" and "html" not in (ctype or ""):
             continue
 
-        # At least one marker must be present
         body_lower = body[:8000].lower()
+
+        # SPA-shell heuristic: SPAs serve a tiny shell with the same /assets/index-*.js
+        # for every unknown route, even when the body hash differs slightly (per-route
+        # preload tags, injected nonce). Detect the shell pattern and skip — it's the
+        # SPA, not a real admin route.
+        shell_markers = ('<div id="root"></div>', '<div id="app"></div>',
+                          '<div id="__next"></div>', '/assets/index-', 'data-vite-')
+        is_spa_shell = any(m in body_lower for m in shell_markers) or (
+            'data-reactroot' in body_lower and len(body) < 5000
+        )
+        if expected_ct == "text/html" and is_spa_shell:
+            # SPA shell detected. Only flag if the body has clear admin-form markers
+            # (real login form) or actual admin data (table of users, order list).
+            has_form = "<form" in body_lower and "password" in body_lower
+            has_admin_data = any(
+                k in body_lower for k in (
+                    "total revenue", "manage users", "pending approvals",
+                    "user list", "admin dashboard", "all orders", "<table",
+                )
+            )
+            if not (has_form or has_admin_data):
+                continue
+
+        # Require 2+ markers OR strong single marker. Single-marker matches against
+        # generic words ("dashboard", "users") in a footer/header are too weak.
         matched_markers = [m for m in markers if m.lower() in body_lower]
+        strong_single_markers = ("admin panel", "phpmyadmin", "wp-admin", "backstage",
+                                  '"email"', '"setting"')
+        has_strong_single = any(m.lower() in body_lower for m in strong_single_markers)
         if not matched_markers:
+            continue
+        if len(matched_markers) < 2 and not has_strong_single:
             continue
 
         # Skip known platform default pages (not real admin panels)

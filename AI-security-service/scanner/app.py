@@ -2075,9 +2075,26 @@ def scan_target_s3_cloud(run_id: str, ip: str, name: str):
         [b for b in sorted(dict_buckets) if b not in discovered_gcs]
     )[:25]
 
+    # Shared/CDN buckets that show up across many customer scans because customers
+    # link to the vendor's own assets domain. Not the customer's data — flagging
+    # them per-host produces hundreds of duplicate findings for a single bucket
+    # owned by a vendor (Webflow, GitHub Pages, etc.).
+    _SHARED_CDN_BUCKETS = {
+        "cdn-webflow",          # Webflow's customer asset CDN
+        "assets-pages",          # GitHub Pages CDN
+        "github-actions-cache",  # GitHub Actions
+        "artifact-action-output",
+        "lobste.rs",
+        "vercel-edge-functions",
+        "netlify-cdn",
+        "fastly-customer-data",
+    }
+
     # ── Phase 3: probe each candidate (S3) ─────────────────────────────────
     probed = 0
     for bucket in s3_probe_list:
+        if bucket in _SHARED_CDN_BUCKETS:
+            continue  # skip vendor-owned shared infrastructure
         url = f"https://{bucket}.s3.amazonaws.com/"
         code = run_cmd(
             ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
@@ -2110,6 +2127,8 @@ def scan_target_s3_cloud(run_id: str, ip: str, name: str):
     #   https://storage.googleapis.com/storage/v1/b/<bucket>/o?maxResults=5
     # An open bucket returns a JSON object with an "items" array.
     for bucket in gcs_probe_list:
+        if bucket in _SHARED_CDN_BUCKETS:
+            continue  # skip vendor-owned shared infrastructure
         url = (
             f"https://storage.googleapis.com/storage/v1/b/{bucket}/o?maxResults=5"
         )

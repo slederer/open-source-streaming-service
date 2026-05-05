@@ -5214,6 +5214,250 @@ setInterval(loadList, 30000);
 </script></body></html>""")
 
 
+@app.get("/admin/newsletter", response_class=HTMLResponse)
+async def admin_newsletter_page(request: Request):
+    if not _require_admin(request):
+        return RedirectResponse("/login")
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Newsletter &mdash; Security Scanner Admin</title>
+<style>
+{_AUTH_CSS}
+  body {{ align-items: flex-start; padding-top: 32px; }}
+  .container {{ max-width: 880px; width: 100%; }}
+  .nav {{ display: flex; gap: 16px; margin-bottom: 24px; font-size: 0.85rem; }}
+  .nav a {{ color: #9ca3af; text-decoration: none; padding: 4px 8px; }}
+  .nav a:hover, .nav a.active {{ color: #dc2626; }}
+  .stat {{ display: flex; gap: 24px; padding: 12px 16px; background: #111827; border: 1px solid #1f2937; border-radius: 8px; margin-bottom: 24px; }}
+  .stat span {{ font-size: 0.85rem; color: #9ca3af; }}
+  .stat b {{ color: #e5e7eb; font-size: 1rem; }}
+  label {{ display: block; color: #9ca3af; font-size: 0.78rem; margin: 16px 0 6px; }}
+  input[type="text"], textarea {{ width: 100%; box-sizing: border-box; background: #0a0e17;
+    border: 1px solid #1f2937; border-radius: 6px; color: #e5e7eb; padding: 10px 12px;
+    font-family: inherit; font-size: 0.92rem; }}
+  textarea {{ min-height: 360px; line-height: 1.55; resize: vertical; }}
+  .actions {{ display: flex; gap: 8px; align-items: center; margin-top: 16px; }}
+  .actions button {{ background: #dc2626; border: 0; color: #fff; padding: 10px 20px;
+    border-radius: 6px; font-size: 0.85rem; cursor: pointer; font-family: inherit; }}
+  .actions button.secondary {{ background: #374151; }}
+  .actions button:disabled {{ background: #6b7280; cursor: not-allowed; }}
+  .hint {{ color: #6b7280; font-size: 0.78rem; margin-top: 6px; }}
+  .status {{ font-size: 0.85rem; }}
+  .status.ok {{ color: #22c55e; }}
+  .status.err {{ color: #dc2626; }}
+  .draft-list {{ background: #111827; border: 1px solid #1f2937; border-radius: 8px;
+    padding: 12px 16px; margin-top: 32px; }}
+  .draft-row {{ display: flex; justify-content: space-between; padding: 8px 0;
+    border-bottom: 1px solid #1f2937; font-size: 0.85rem; }}
+  .draft-row:last-child {{ border: 0; }}
+</style></head>
+<body><div class="container">
+  <div class="nav">
+    <a href="/admin">Admin</a>
+    <a href="/inbox">Inbox</a>
+    <a href="/admin/newsletter" class="active">Newsletter</a>
+    <a href="/logout">Sign out</a>
+  </div>
+
+  <h1>Compose newsletter</h1>
+  <div class="stat" id="stat-row">Loading…</div>
+
+  <label>Subject</label>
+  <input type="text" id="subject" placeholder="Weekly digest — May 04, 2026">
+
+  <label>Body (HTML allowed)</label>
+  <textarea id="body" placeholder="&lt;p&gt;Hey,&lt;/p&gt;&lt;p&gt;This week's findings…&lt;/p&gt;"></textarea>
+  <div class="hint">Plain HTML. Resend auto-injects an unsubscribe link in the footer. Do not paste content from cold-outreach campaigns — newsletter is opt-in only.</div>
+
+  <div class="actions">
+    <button id="send-btn" onclick="send()">Send to all subscribers</button>
+    <button class="secondary" onclick="saveDraft()">Save draft</button>
+    <span class="status" id="status"></span>
+  </div>
+
+  <div class="draft-list">
+    <h3 style="margin:0 0 12px;font-size:0.95rem;">Recent broadcasts</h3>
+    <div id="recent">Loading…</div>
+  </div>
+</div>
+<script>
+async function loadStats() {{
+  const r = await fetch('/api/admin/newsletter/stats');
+  if (!r.ok) {{ document.getElementById('stat-row').textContent = 'Failed to load.'; return; }}
+  const s = await r.json();
+  document.getElementById('stat-row').innerHTML =
+    `<span>Confirmed subscribers: <b>${{s.confirmed}}</b></span>` +
+    `<span>Pending (sent confirm, not clicked): <b>${{s.pending}}</b></span>` +
+    `<span>In Resend audience: <b>${{s.resend_count}}</b></span>`;
+}}
+async function loadRecent() {{
+  const r = await fetch('/api/admin/newsletter/broadcasts');
+  const el = document.getElementById('recent');
+  if (!r.ok) {{ el.textContent = 'Failed to load.'; return; }}
+  const d = await r.json();
+  if (!d.broadcasts || !d.broadcasts.length) {{
+    el.innerHTML = '<div style="color:#6b7280;font-size:0.85rem;">No broadcasts sent yet.</div>'; return;
+  }}
+  el.innerHTML = d.broadcasts.map(b =>
+    `<div class="draft-row"><span>${{escapeHtml(b.name || b.subject || '(untitled)')}}</span>` +
+    `<span style="color:#6b7280;">${{b.status || ''}} ${{b.created_at ? '· '+b.created_at.slice(0,16) : ''}}</span></div>`
+  ).join('');
+}}
+async function send() {{
+  const subject = document.getElementById('subject').value.trim();
+  const body = document.getElementById('body').value.trim();
+  if (!subject || !body) {{ setStatus('Subject and body are required.', false); return; }}
+  if (!confirm(`Send "${{subject}}" to all confirmed subscribers? This is irreversible.`)) return;
+  setStatus('Sending…', true);
+  document.getElementById('send-btn').disabled = true;
+  const r = await fetch('/api/admin/newsletter/send', {{
+    method: 'POST', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{subject, body}}),
+  }});
+  const d = await r.json();
+  document.getElementById('send-btn').disabled = false;
+  if (r.ok && d.broadcast_id) {{
+    setStatus(`Sent. Broadcast ID: ${{d.broadcast_id}}`, true);
+    document.getElementById('subject').value = ''; document.getElementById('body').value = '';
+    loadRecent();
+  }} else {{
+    setStatus(d.error || `HTTP ${{r.status}}`, false);
+  }}
+}}
+function saveDraft() {{
+  const subject = document.getElementById('subject').value;
+  const body = document.getElementById('body').value;
+  localStorage.setItem('newsletter_draft', JSON.stringify({{subject, body, ts: Date.now()}}));
+  setStatus('Draft saved locally.', true);
+}}
+function loadDraft() {{
+  try {{
+    const d = JSON.parse(localStorage.getItem('newsletter_draft') || 'null');
+    if (d) {{ document.getElementById('subject').value = d.subject || ''; document.getElementById('body').value = d.body || ''; }}
+  }} catch (e) {{}}
+}}
+function setStatus(msg, ok) {{
+  const el = document.getElementById('status');
+  el.textContent = msg; el.className = 'status ' + (ok ? 'ok' : 'err');
+}}
+function escapeHtml(s) {{
+  return (s || '').replace(/[&<>"']/g, c => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }})[c]);
+}}
+loadStats(); loadRecent(); loadDraft();
+</script></body></html>""")
+
+
+@app.get("/api/admin/newsletter/stats")
+async def admin_newsletter_stats(request: Request):
+    if not _require_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    with get_db() as db:
+        confirmed = db.execute(
+            "SELECT COUNT(*) FROM newsletter_subscribers WHERE confirmed_at IS NOT NULL"
+        ).fetchone()[0]
+        pending = db.execute(
+            "SELECT COUNT(*) FROM newsletter_subscribers WHERE confirmed_at IS NULL"
+        ).fetchone()[0]
+    # Resend audience contact count
+    resend_count = 0
+    try:
+        api_key = os.getenv("RESEND_API_KEY", "").strip()
+        aud = _resend_audience_id()
+        if api_key and aud:
+            import httpx
+            r = httpx.get(
+                f"https://api.resend.com/audiences/{aud}/contacts",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                resend_count = len((r.json() or {}).get("data", []))
+    except Exception:
+        pass
+    return {"confirmed": confirmed, "pending": pending, "resend_count": resend_count}
+
+
+@app.get("/api/admin/newsletter/broadcasts")
+async def admin_newsletter_broadcasts(request: Request):
+    if not _require_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not api_key:
+        return {"broadcasts": []}
+    try:
+        import httpx
+        r = httpx.get(
+            "https://api.resend.com/broadcasts",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        data = r.json() if r.status_code == 200 else {}
+        return {"broadcasts": (data.get("data") or [])[:20]}
+    except Exception as e:
+        return {"broadcasts": [], "error": str(e)}
+
+
+@app.post("/api/admin/newsletter/send")
+async def admin_newsletter_send(request: Request):
+    """Create a Resend broadcast and immediately send it to the audience.
+
+    Body: { subject: str, body: str (HTML) }
+    """
+    if not _require_admin(request):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    subject = (payload.get("subject") or "").strip()[:300]
+    body = (payload.get("body") or "").strip()
+    if not subject or not body:
+        return JSONResponse({"error": "subject and body required"}, status_code=400)
+
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    aud = _resend_audience_id()
+    if not api_key or not aud:
+        return JSONResponse({"error": "Resend not configured"}, status_code=500)
+
+    sender = "Stefan <stefan@securityscanner.dev>"
+    try:
+        import httpx
+        # Step 1: create the broadcast
+        r = httpx.post(
+            "https://api.resend.com/broadcasts",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json={"audience_id": aud,
+                  "from": sender,
+                  "subject": subject,
+                  "html": body,
+                  "name": subject},
+            timeout=20,
+        )
+        if r.status_code >= 400:
+            return JSONResponse({"error": f"create failed: HTTP {r.status_code}",
+                                 "body": r.text[:300]}, status_code=502)
+        bid = (r.json() or {}).get("id")
+        if not bid:
+            return JSONResponse({"error": "no broadcast id returned"}, status_code=502)
+
+        # Step 2: send immediately
+        r2 = httpx.post(
+            f"https://api.resend.com/broadcasts/{bid}/send",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json={},  # no scheduled_at = send now
+            timeout=20,
+        )
+        if r2.status_code >= 400:
+            return JSONResponse({"error": f"send failed: HTTP {r2.status_code}",
+                                 "body": r2.text[:300],
+                                 "broadcast_id": bid}, status_code=502)
+        return {"ok": True, "broadcast_id": bid}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/api/billing/status")
 async def billing_status(request: Request):
     """Return user's billing info for the dashboard."""
@@ -10649,12 +10893,61 @@ def _ensure_newsletter_table():
             "  email TEXT NOT NULL UNIQUE,"
             "  source TEXT,"
             "  ip TEXT,"
+            "  confirmed_at TEXT,"           # double-opt-in confirmation timestamp
+            "  resend_contact_id TEXT,"      # populated after push to Resend audience
             "  created_at TEXT DEFAULT CURRENT_TIMESTAMP"
             ")"
         )
+        # Migrate older schemas
+        for col, ddl in [("confirmed_at", "TEXT"),
+                          ("resend_contact_id", "TEXT")]:
+            try:
+                db.execute(f"ALTER TABLE newsletter_subscribers ADD COLUMN {col} {ddl}")
+            except Exception:
+                pass
 
 
 _ensure_newsletter_table()
+
+
+def _newsletter_confirm_token(email: str) -> str:
+    """HMAC(SESSION_SECRET, 'newsletter:'+email)[:16] — same pattern as outreach unsub."""
+    import hmac as _hmac, hashlib as _hashlib
+    secret = os.getenv("SESSION_SECRET", "").encode()
+    if not secret:
+        raise RuntimeError("SESSION_SECRET missing")
+    return _hmac.new(secret, ("newsletter:" + email.lower()).encode(),
+                     _hashlib.sha256).hexdigest()[:16]
+
+
+def _resend_audience_id() -> str:
+    return os.getenv("RESEND_AUDIENCE_ID", "").strip()
+
+
+def _resend_add_contact(email: str, first_name: str = "") -> Optional[str]:
+    """Push a contact to the Resend audience. Returns the contact id or None on failure."""
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    aud = _resend_audience_id()
+    if not api_key or not aud:
+        return None
+    try:
+        import httpx
+        r = httpx.post(
+            f"https://api.resend.com/audiences/{aud}/contacts",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json={"email": email.lower(),
+                  "first_name": first_name or "",
+                  "unsubscribed": False},
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            print(f"[newsletter] resend add contact HTTP {r.status_code}: {r.text[:200]}", flush=True)
+            return None
+        return (r.json() or {}).get("id")
+    except Exception as e:
+        print(f"[newsletter] resend add contact error: {e}", flush=True)
+        return None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -11165,6 +11458,9 @@ async def unsuppress_finding(request: Request, finding_id: int):
 
 @app.post("/api/newsletter")
 async def newsletter_signup(request: Request):
+    """Double-opt-in newsletter signup. Stores email locally as pending,
+    sends a confirmation email via Resend. Recipient must click the link
+    to confirm — only then do we add them to the Resend audience."""
     try:
         data = await request.json()
     except Exception:
@@ -11181,7 +11477,85 @@ async def newsletter_signup(request: Request):
             )
     except Exception:
         return JSONResponse({"error": "Could not save your email — please email stefan@securityscanner.dev directly."}, status_code=500)
-    return {"ok": True, "message": "Thanks — we'll let you know when we publish."}
+
+    # Send confirmation email (double opt-in)
+    base = (os.getenv("PUBLIC_BASE_URL") or "https://securityscanner.dev").rstrip("/")
+    token = _newsletter_confirm_token(email)
+    confirm_url = f"{base}/newsletter/confirm?email={email}&t={token}"
+    try:
+        try:
+            from scanner.notifications import _send as _send_email
+        except ImportError:
+            from scanner_notifications import _send as _send_email  # type: ignore
+        html = (
+            f"<div style='font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:560px;color:#111;'>"
+            f"<h2 style='font-size:18px;margin:0 0 12px;'>Confirm your subscription</h2>"
+            f"<p>You asked to subscribe to the Security Scanner weekly newsletter. "
+            f"Click the button below to confirm — we won't add you to the list otherwise.</p>"
+            f"<p style='margin:24px 0;'><a href='{confirm_url}' "
+            f"style='display:inline-block;background:#dc2626;color:#fff;padding:11px 22px;"
+            f"border-radius:8px;text-decoration:none;font-weight:600;'>Confirm subscription</a></p>"
+            f"<p style='color:#6b7280;font-size:13px;'>If you didn't request this, just ignore the email — "
+            f"we won't email you again unless you confirm.</p></div>"
+        )
+        _send_email(email, "Confirm your subscription to Security Scanner",
+                    html)
+    except Exception as e:
+        print(f"[newsletter] confirm email send failed: {e}", flush=True)
+    return {"ok": True, "message": "Check your email — we sent you a confirmation link."}
+
+
+@app.get("/newsletter/confirm", response_class=HTMLResponse)
+async def newsletter_confirm(request: Request):
+    """Double-opt-in confirmation. Verifies HMAC token, marks subscriber
+    as confirmed locally, pushes to Resend audience."""
+    email = (request.query_params.get("email") or "").strip().lower()[:240]
+    token = (request.query_params.get("t") or "").strip()
+    if not email or not token:
+        return HTMLResponse("<h2>Invalid confirmation link.</h2>", status_code=400)
+
+    import hmac as _hmac
+    expected = _newsletter_confirm_token(email)
+    if not _hmac.compare_digest(expected, token):
+        return HTMLResponse("<h2>Invalid or expired confirmation link.</h2>", status_code=400)
+
+    with get_db() as db:
+        row = db.execute(
+            "SELECT id, confirmed_at, resend_contact_id FROM newsletter_subscribers WHERE email=?",
+            (email,),
+        ).fetchone()
+        if not row:
+            # Re-create the row (someone may have hit confirm without going through signup)
+            db.execute(
+                "INSERT INTO newsletter_subscribers (email, source, confirmed_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (email, "confirm-direct"),
+            )
+        elif not row["confirmed_at"]:
+            db.execute(
+                "UPDATE newsletter_subscribers SET confirmed_at=CURRENT_TIMESTAMP WHERE email=?",
+                (email,),
+            )
+
+    # Push to Resend audience (idempotent — Resend dedupes by email)
+    contact_id = _resend_add_contact(email)
+    if contact_id:
+        with get_db() as db:
+            db.execute(
+                "UPDATE newsletter_subscribers SET resend_contact_id=? WHERE email=?",
+                (contact_id, email),
+            )
+
+    return HTMLResponse(f"""
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Subscribed — Security Scanner</title>
+<style>body{{font-family:-apple-system,sans-serif;background:#0a0e17;color:#e5e7eb;display:flex;
+align-items:center;justify-content:center;min-height:100vh;margin:0;}}
+.box{{max-width:480px;background:#111827;border:1px solid #1f2937;border-radius:12px;padding:32px;text-align:center;}}
+h2{{margin:0 0 12px;color:#22c55e;font-size:22px;}}
+a{{color:#dc2626;}}</style></head>
+<body><div class="box"><h2>&#10003; Subscribed</h2>
+<p>Thanks — you'll get the next newsletter when we publish.</p>
+<p style="color:#6b7280;font-size:13px;">Want out? Click unsubscribe in any newsletter we send.</p>
+<p><a href="/">Back to Security Scanner</a></p></div></body></html>""")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

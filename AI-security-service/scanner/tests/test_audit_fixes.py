@@ -24,32 +24,43 @@ class TestStripeIdempotencyAtomic:
         import inspect
         from scanner import app
         src = inspect.getsource(app.stripe_webhook)
-        # The only `with get_db()` block in stripe_webhook should contain both
-        # the dedup INSERT and the credit UPDATE. Check by counting.
+        # Exactly one `with get_db()` block — and dedup + credit UPDATE must
+        # both live AFTER its opening line, with no second `with get_db()`
+        # appearing between them. This catches refactors that split the
+        # transaction (e.g. _dedupe_event(...) helper outside the block).
         with_blocks = src.count("with get_db()")
         assert with_blocks == 1, (
             f"stripe_webhook should use exactly 1 `with get_db()` block to "
             f"keep dedup + side effects atomic; found {with_blocks}. "
             f"Splitting into multiple blocks breaks idempotency on crash."
         )
-        # And both should be present inside that block
-        assert "INSERT INTO processed_stripe_events" in src
-        assert "UPDATE users SET scan_credits" in src
+        with_idx = src.index("with get_db()")
+        dedup_idx = src.index("INSERT INTO processed_stripe_events")
+        credit_idx = src.index("UPDATE users SET scan_credits")
+        assert with_idx < dedup_idx < credit_idx or with_idx < credit_idx < dedup_idx, (
+            "dedup INSERT and credit UPDATE must both come after the "
+            "`with get_db()` opening — atomicity broken if either escaped "
+            "the block."
+        )
 
 
 # ── OAuth ?next=// open-redirect ───────────────────────────────────────────
 
 class TestOAuthNextProtocolRelative:
-    def test_login_page_rejects_protocol_relative_next(self, anon_client):
+    def test_login_page_rejects_protocol_relative_next(self, client):
         """?next=//evil.com previously passed startswith('/') and redirected
-        externally after login. Now must be rejected (treated as missing)."""
+        externally after login. Hits the live redirect path with an
+        authenticated client and asserts the Location header is `/`, not
+        `//evil.com`. Anything but the safe fallback is an open-redirect."""
         from urllib.parse import quote
-        # Visit /login?next=//evil.com — server should NOT store this in the
-        # session, so subsequent post-login flow will redirect to / instead.
-        # We confirm by checking the rendered page has no //evil.com link.
-        r = anon_client.get(f"/login?next={quote('//evil.com')}")
-        assert r.status_code == 200
-        assert "//evil.com" not in r.text
+        # `client` fixture is already logged in. /login with a protocol-
+        # relative next must redirect to "/" (the safe fallback), never to
+        # the attacker-controlled URL.
+        r = client.get(f"/login?next={quote('//evil.com')}", follow_redirects=False)
+        assert r.status_code in (302, 307), f"expected redirect, got {r.status_code}"
+        loc = r.headers.get("location", "")
+        assert loc == "/", f"expected redirect to '/', got {loc!r}"
+        assert "evil.com" not in loc
 
 
 # ── Resend Svix replay timestamp tolerance ─────────────────────────────────
@@ -173,6 +184,73 @@ class TestPaymentBypassJsonRejection:
 
 
 # ── Cookie-audit infra cookie prefix matching ──────────────────────────────
+
+class TestFreePlanScanLimit:
+    """Paywall: free tier = 1 lifetime scan. The 2nd scan attempt for a free
+    user must be rejected (otherwise our entire pricing model breaks)."""
+
+    def test_free_user_blocked_after_first_scan(self, db):
+        from scanner.app import can_user_scan
+        uid = "free-user-paywall-test"
+        # Replace the seeded test user with a free-plan user
+        db.execute("DELETE FROM users WHERE id=?", (uid,))
+        db.execute(
+            "INSERT INTO users (id, email, name, email_verified, auth_provider, plan) "
+            "VALUES (?,?,?,1,'email','free')",
+            (uid, "free@example.com", "Free User"),
+        )
+        db.commit()
+        # First scan: allowed (no scan_runs rows yet)
+        ok, msg = can_user_scan(uid)
+        assert ok is True, f"first free scan should be allowed: {msg}"
+        # Simulate completed first scan
+        db.execute(
+            "INSERT INTO scan_runs (id, user_id, started_at, status, targets) "
+            "VALUES (?,?, datetime('now'), 'complete', ?)",
+            ("free-run-1", uid, "10.0.0.1"),
+        )
+        db.commit()
+        # Second scan: must be blocked. Either the daily=1 limit or the
+        # lifetime=1 limit fires; both are valid paywall enforcement.
+        ok, msg = can_user_scan(uid)
+        assert ok is False, "second free scan should be blocked"
+        msg_low = msg.lower()
+        assert any(kw in msg_low for kw in ("free", "upgrade", "limit", "reached")), (
+            f"rejection should mention paywall/limit, got: {msg!r}"
+        )
+
+    def test_payg_zero_credits_blocked(self, db):
+        from scanner.app import can_user_scan
+        uid = "payg-no-credits"
+        db.execute("DELETE FROM users WHERE id=?", (uid,))
+        db.execute(
+            "INSERT INTO users (id, email, name, email_verified, auth_provider, plan, scan_credits) "
+            "VALUES (?,?,?,1,'email','payg', 0)",
+            (uid, "payg@example.com", "PAYG User"),
+        )
+        db.commit()
+        ok, msg = can_user_scan(uid)
+        assert ok is False
+        assert "credit" in msg.lower()
+
+
+class TestSqlInjectionPathParams:
+    """Path parameters fed directly into queries must not 500. Future code
+    that builds SQL via f-string into a path param would be caught here."""
+
+    def test_run_status_endpoint_safe_against_sqli_payload(self, client):
+        # SQLi-style path segment must 404 or 400, not 500 or DB-corrupting 200
+        r = client.get("/api/scan/'%20OR%201=1--/status")
+        assert r.status_code in (400, 404, 422), (
+            f"SQLi-style path param should 4xx, got {r.status_code}"
+        )
+
+    def test_target_endpoint_safe_against_sqli_payload(self, client):
+        r = client.delete("/api/targets/x%27%3B%20DROP%20TABLE%20users%3B--")
+        assert r.status_code in (400, 404, 405, 422), (
+            f"SQLi DELETE path param should 4xx, got {r.status_code}"
+        )
+
 
 class TestCookieAuditInfraPrefix:
     def test_incapsula_dynamic_suffix_skipped(self):

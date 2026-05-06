@@ -39,6 +39,7 @@ jobs:
             itsdangerous \
             python-multipart \
             'stripe>=8' \
+            'passlib[bcrypt]' \
             requests \
             pyyaml \
             cryptography \

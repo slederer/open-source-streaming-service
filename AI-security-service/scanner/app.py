@@ -3967,7 +3967,7 @@ async def signup_page(request: Request):
     <div class="field"><label>Name</label><input type="text" name="name" required></div>
     <div class="field"><label>Email</label><input type="email" name="email" required autocomplete="email"></div>
     <div class="field"><label>Password <span style="color:#4b5563;">(min 8 chars)</span></label><input type="password" name="password" required minlength="8" autocomplete="new-password"></div>
-    <div class="field" style="display:flex;align-items:flex-start;gap:8px;"><input type="checkbox" name="consent" id="consent-cb" required style="margin-top:4px;accent-color:#dc2626;"><label for="consent-cb" style="font-size:0.85rem;color:#9ca3af;">I agree to the <a href="/privacy" style="color:#dc2626;">Privacy Policy</a> and <a href="/terms" style="color:#dc2626;">Terms of Service</a></label></div>
+    <label class="field" style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:0.85rem;color:#9ca3af;font-weight:normal;line-height:1.4;"><input type="checkbox" name="consent" id="consent-cb" required style="width:16px;height:16px;flex-shrink:0;accent-color:#dc2626;margin:0;"><span>I agree to the <a href="/privacy" style="color:#dc2626;">Privacy Policy</a> and <a href="/terms" style="color:#dc2626;">Terms of Service</a></span></label>
     <button type="submit" class="btn">Create account</button>
   </form>
   <div class="divider"><span>or</span></div>
@@ -5772,7 +5772,12 @@ async def overview(request: Request):
         ).fetchall()
 
     return {
-        "user": {"email": full.get("email"), "name": full.get("name"), "plan": plan, "credits": full.get("scan_credits", 0)},
+        "user": {
+            "email": full.get("email"), "name": full.get("name"), "plan": plan,
+            "credits": full.get("scan_credits", 0),
+            "scans_total": total_runs,
+            "monthly_scans": monthly_scans,
+        },
         "limits": limits,
         "targets_count": targets,
         "total_runs": total_runs,
@@ -8574,7 +8579,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </button>
         <h1 id="page-title">Overview</h1>
       </div>
-      <div>
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+        <a href="/blog" style="font-size:0.85rem;color:var(--text-muted);text-decoration:none;">Blog</a>
+        <a href="/contact" style="font-size:0.85rem;color:var(--text-muted);text-decoration:none;">Contact</a>
+        <span id="topbar-plan" style="display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;background:#111827;border:1px solid #1f2937;font-size:0.78rem;color:#e5e7eb;"></span>
         <button class="btn" onclick="openScanModal()">+ New Scan</button>
       </div>
     </div>
@@ -9791,9 +9799,73 @@ function renderUser() {
       <div class="name">${esc(user.name || user.email)}</div>
       <div style="color:var(--text-muted);font-size:0.7rem;">${esc(user.plan)}</div>
     </div>`;
+  renderTopbarPlan();
+}
+
+// ─── Topbar plan + scans-remaining widget ───────────────────────────────────
+function renderTopbarPlan() {
+  const el = document.getElementById("topbar-plan");
+  if (!el || !user) return;
+  const plan = (user.plan || "free").toLowerCase();
+  const credits = (typeof user.credits === "number") ? user.credits : 0;
+  const scansTotal = (typeof user.scans_total === "number") ? user.scans_total : 0;
+  let label, sub, color;
+  if (plan === "free") {
+    // Free tier = 1 lifetime scan total
+    const remaining = Math.max(0, 1 - scansTotal);
+    label = "Free";
+    sub = remaining + " scan" + (remaining === 1 ? "" : "s") + " left";
+    color = "#9ca3af";
+  } else if (plan === "payg") {
+    label = "PAYG";
+    sub = credits + " credit" + (credits === 1 ? "" : "s");
+    color = "#3b82f6";
+  } else if (plan === "pro" || plan === "monthly") {
+    label = "Monthly";
+    sub = "Unlimited scans";
+    color = "#22c55e";
+  } else if (plan === "team") {
+    label = "Team";
+    sub = "Unlimited scans";
+    color = "#dc2626";
+  } else {
+    label = plan.charAt(0).toUpperCase() + plan.slice(1);
+    sub = "";
+    color = "#9ca3af";
+  }
+  el.innerHTML =
+    '<span style="font-weight:600;color:' + color + ';">' + esc(label) + '</span>' +
+    (sub ? ' <span style="color:var(--text-muted);">· ' + esc(sub) + '</span>' : '') +
+    (plan === "free" || plan === "payg"
+      ? ' <a href="#billing" onclick="event.preventDefault();go(\\'billing\\')" style="margin-left:8px;color:#dc2626;font-weight:600;text-decoration:none;">Upgrade</a>'
+      : '');
 }
 
 // ─── Bootstrap ───────────────────────────────────────────────────────────────
+// Populate the topbar plan widget immediately, regardless of which view loads
+// first — otherwise it's blank until the user clicks Overview.
+(async () => {
+  try {
+    const me = await api("/api/me");
+    if (me && me.email) {
+      // /api/me returns scan_credits (DB column); the dashboard JS uses .credits
+      if (typeof me.credits !== "number" && typeof me.scan_credits === "number") {
+        me.credits = me.scan_credits;
+      }
+      // /api/me doesn't include scan totals — fetch separately for free-tier counter
+      if (typeof me.scans_total !== "number") {
+        try {
+          const ov = await fetch("/api/overview", {credentials:"include"}).then(r => r.ok ? r.json() : null);
+          if (ov && ov.user && typeof ov.user.scans_total === "number") {
+            me.scans_total = ov.user.scans_total;
+          }
+        } catch (e) {}
+      }
+      user = me;
+      renderTopbarPlan();
+    }
+  } catch (e) {}
+})();
 const [initView, initParam] = (location.hash || "#overview").slice(1).split("/");
 go(initView || "overview", initParam);
 </script>
@@ -13086,16 +13158,42 @@ _BLOG_CSS = """
 """
 
 
-def _render_blog_nav():
+def _render_blog_nav(user: Optional[dict] = None):
+    """Marketing nav. Renders 'Start free' for anonymous users; the inline
+    JS at the bottom upgrades it to a Dashboard link + plan label after a
+    quick /api/me probe (so the same nav works on every marketing page
+    without threading user/request through 10 route handlers)."""
     return """<nav>
   <a href="/" class="logo"><span>&#9632;</span> Security Scanner</a>
   <div class="links">
     <a href="/blog">Blog</a>
     <a href="/docs/api">API</a>
     <a href="/contact">Contact</a>
-    <a href="/signup" class="cta">Start free</a>
+    <span id="nav-auth-slot"><a href="/signup" class="cta">Start free</a></span>
   </div>
-</nav>"""
+</nav>
+<script>
+(function(){
+  fetch('/api/me', {credentials:'include'})
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(u){
+      if (!u || !u.email) return;
+      var slot = document.getElementById('nav-auth-slot');
+      if (!slot) return;
+      var plan = (u.plan || 'free');
+      var planLabel = plan === 'payg' ? 'PAYG' : (plan.charAt(0).toUpperCase() + plan.slice(1));
+      var credits = (typeof u.scan_credits === 'number') ? u.scan_credits : null;
+      var creditTxt = '';
+      if (plan === 'free') creditTxt = ' · Free tier';
+      else if (plan === 'payg') creditTxt = ' · ' + (credits || 0) + ' credit' + (credits === 1 ? '' : 's');
+      slot.innerHTML =
+        '<a href="/" class="cta">Dashboard</a>' +
+        '<span style="font-size:0.78rem;color:#9ca3af;margin-left:10px;">' + planLabel + creditTxt + '</span>' +
+        '<a href="/logout" style="font-size:0.78rem;color:#9ca3af;margin-left:10px;">Sign out</a>';
+    })
+    .catch(function(){});
+})();
+</script>"""
 
 
 def _fmt_date(iso_date: str) -> str:

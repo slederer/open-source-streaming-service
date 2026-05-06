@@ -1410,6 +1410,16 @@ def scan_target_nuclei_cve(run_id: str, ip: str, name: str) -> list[dict]:
     module adds the CVE-focused set — real version-based CVE detection that
     actually finds known-vulnerable software versions."""
     findings = []
+    # Templates that are noisy — they match URL-encoded path-traversal patterns
+    # or generic endpoint shapes on apps that aren't actually the targeted CVE.
+    # E.g. CVE-2018-14064 is for the VelotiSmart wifi router; nuclei will fire
+    # it whenever /../../etc/passwd returns 200, which on a SaaS app on Fly.dev
+    # or Railway is a catch-all SPA route, not a router LFI.
+    NUCLEI_BLOCKLIST = {
+        "CVE-2018-14064",        # VelotiSmart wifi router — matches path traversal pattern
+        "CVE-2017-9841",          # PHPUnit RCE — too many FPs on non-PHP apps
+        "exposed-svn",            # /.svn/ on SPA returns 200 catch-all
+    }
     for tag_group in ("cve,exposures,misconfiguration", "takeover"):
         try:
             r = subprocess.run(
@@ -1424,16 +1434,19 @@ def scan_target_nuclei_cve(run_id: str, ip: str, name: str) -> list[dict]:
                     data = json.loads(line)
                 except Exception:
                     continue
+                template_id = data.get("template-id") or ""
+                if template_id in NUCLEI_BLOCKLIST:
+                    continue
                 info = data.get("info", {}) or {}
                 sev = (info.get("severity") or "medium").upper()
                 sev = {"CRIT": "CRITICAL"}.get(sev, sev)
-                title = info.get("name") or data.get("template-id") or "Nuclei finding"
+                title = info.get("name") or template_id or "Nuclei finding"
                 findings.append({
                     "target": ip, "severity": sev, "category": "infra",
                     "title": f"Nuclei CVE match: {title}",
                     "description": (info.get("description") or "")[:600],
                     "evidence": (
-                        f"template: {data.get('template-id')} "
+                        f"template: {template_id} "
                         f"matched-at: {data.get('matched-at')}"
                     ),
                     "tool": "nuclei-cve",
@@ -2231,7 +2244,17 @@ def scan_target_firebase_deep(run_id: str, ip: str, name: str) -> list[dict]:
             capture_output=True, text=True, timeout=8,
         )
         body = r.stdout.strip()
-        if body and body != "null" and "Permission denied" not in body and len(body) > 5:
+        body_low = body.lower()
+        # Reject all error/empty/deactivated responses
+        is_error = (
+            not body
+            or body == "null"
+            or len(body) < 6
+            or "permission denied" in body_low
+            or "deactivated" in body_low
+            or '"error"' in body_low
+        )
+        if not is_error:
             findings.append({
                 "target": ip, "severity": "CRITICAL", "category": "baas",
                 "title": f"Firebase Realtime DB readable without auth (project: {project})",
@@ -3360,9 +3383,16 @@ def scan_target_payment_bypass(run_id: str, ip: str, name: str, ctx=None) -> lis
             # Extra check: response shouldn't look like a generic SPA/404 page
             if "<html" in body_lower and "checkout" not in body_lower:
                 continue
-            if len(body) < 5 and body.strip() in ("", "ok", "OK", "{}"):
-                # Many webhook handlers just return 200 with empty body
-                pass
+            # Strict: completely empty bodies on a "/api/webhook/..." 200 are
+            # almost always SPA catch-all routes returning the empty document
+            # for every unknown path. A real webhook handler echoes something
+            # (status, event id, "received: true", or at least an error JSON).
+            stripped = body.strip()
+            if not stripped:
+                continue
+            # If it's HTML at all, skip — real webhook handlers don't return HTML
+            if stripped.lower().startswith(("<!doctype", "<html")):
+                continue
 
             findings.append({
                 "target": ip, "severity": "CRITICAL", "category": "auth",
@@ -4066,14 +4096,25 @@ def scan_target_ssti(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
                 continue
 
             # Extra verification: "49" must appear as a standalone token, not buried
-            # in a hash, URL, ID, or random number. Look for it near the injection point
-            # or as a clear value (e.g., ">49<" or "49\n" or " 49 ")
+            # in a hash, URL, ID, timestamp, or GUID segment. Audit found that
+            # GUID 4-char segments like "49f8" inside "68634305-2015-49f8-9970-..."
+            # were getting through the prior 8-char hex strip.
             import re as _re
-            # Reject if "49" only appears inside long hex strings, URLs, or IDs
-            body_stripped = _re.sub(r'[0-9a-f]{8,}', '', body)  # remove hex
-            body_stripped = _re.sub(r'https?://\S+', '', body_stripped)  # remove URLs
-            body_stripped = _re.sub(r'\d{3,}', '', body_stripped)  # remove 3+ digit numbers
-            if "49" not in body_stripped:
+            stripped = body
+            # Strip all hex segments of any length 3+ (covers UUID quartets like 49f8)
+            stripped = _re.sub(r'\b[0-9a-f]{3,}\b', '', stripped, flags=_re.I)
+            # Strip URLs and asset paths
+            stripped = _re.sub(r'https?://\S+', '', stripped)
+            stripped = _re.sub(r'/[\w./-]*\.(js|css|svg|png|jpg|webp)\b', '', stripped, flags=_re.I)
+            # Strip ISO 8601 timestamps and time-of-day markers
+            stripped = _re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*', '', stripped)
+            stripped = _re.sub(r'\d{2}:\d{2}:\d{2}', '', stripped)
+            # Strip 3+ digit numbers
+            stripped = _re.sub(r'\d{3,}', '', stripped)
+            # Strip nonce-style attribute values: nonce="xxx", id="xxx"
+            stripped = _re.sub(r'(?:nonce|id|data-[a-z-]+)="[^"]*"', '', stripped, flags=_re.I)
+            # Now "49" must still appear AND not be bordered by alphanumeric chars
+            if not _re.search(r'(?<![0-9a-zA-Z])49(?![0-9a-zA-Z])', stripped):
                 continue
 
             if "49" in body:

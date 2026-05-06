@@ -939,6 +939,10 @@ def scan_target_secrets(run_id: str, ip: str, name: str):
     ]
     schemes_ports = [("https", 443), ("http", 80), ("http", 3000), ("http", 8080)]
     bodies_fetched = 0
+    # Dedupe: track (label, exact_secret_value) pairs we've already reported on
+    # this host so the same AWS key found at /env.js, /config.js, and /index.js
+    # only generates one finding instead of three.
+    seen_secrets: set = set()
     for scheme, port in schemes_ports:
         base = f"{scheme}://{ip}" if port in (80, 443) else f"{scheme}://{ip}:{port}"
         test = run_cmd(["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "-m", "3", base + "/"], timeout=5).strip()
@@ -957,7 +961,12 @@ def scan_target_secrets(run_id: str, ip: str, name: str):
             for pattern, label, sev in SECRET_PATTERNS:
                 match = re.search(pattern, body)
                 if match:
-                    snippet = match.group(0)[:60] + "..." if len(match.group(0)) > 60 else match.group(0)
+                    secret_value = match.group(0)
+                    dedupe_key = (label, secret_value)
+                    if dedupe_key in seen_secrets:
+                        continue  # already reported this exact secret on this host
+                    seen_secrets.add(dedupe_key)
+                    snippet = secret_value[:60] + "..." if len(secret_value) > 60 else secret_value
                     findings.append({
                         "target": ip, "severity": sev, "category": "secrets",
                         "title": f"{label} exposed at {path}",
@@ -1541,7 +1550,19 @@ def scan_target_baas(run_id: str, ip: str, name: str):
             if firebase_db:
                 db_url = firebase_db.group(1).rstrip("/")
                 resp = run_cmd(["curl", "-sk", "-m", "5", f"{db_url}/.json"], timeout=8)
-                if resp and not resp.startswith('{"error"') and resp != "null" and len(resp) > 5:
+                # Reject error responses (the prior startswith check missed
+                # responses with leading whitespace/newlines like
+                # "{\n  \"error\" : \"Permission denied\"\n}")
+                resp_low = (resp or "").lower().strip()
+                is_error = (
+                    not resp
+                    or resp_low == "null"
+                    or len(resp) < 6
+                    or '"error"' in resp_low
+                    or "permission denied" in resp_low
+                    or "deactivated" in resp_low
+                )
+                if not is_error:
                     findings.append({
                         "target": ip, "severity": "CRITICAL", "category": "baas",
                         "title": "Firebase Realtime Database world-readable",
@@ -1860,14 +1881,31 @@ def scan_target_llm(run_id: str, ip: str, name: str):
                 "--data", probe_body, "-m", "8", base + path,
             ], timeout=12).strip()
             if code_resp in ("200", "201"):
-                # Check if response looks like LLM output
-                full = run_cmd([
-                    "curl", "-sk", "-X", "POST", "-H", "Content-Type: application/json",
+                # Check if response looks like LLM output. Stricter than before:
+                # the response must be JSON (not HTML) and contain LLM-specific
+                # field shapes — not just generic words like "content" or
+                # "message" which appear in any HTML landing page.
+                full_with_headers = run_cmd([
+                    "curl", "-sk", "-i", "-X", "POST", "-H", "Content-Type: application/json",
                     "--data", probe_body, "-m", "10", base + path,
                 ], timeout=15)
-                if full and len(full) > 30 and any(k in full.lower() for k in ["hello", "hi", "assist", "help", "content", "message", "response"]):
-                    llm_endpoint = path
-                    break
+                if not full_with_headers or len(full_with_headers) < 30:
+                    continue
+                # Skip HTML responses outright
+                low = full_with_headers.lower()
+                if "<!doctype" in low[:1000] or "<html" in low[:1000]:
+                    continue
+                # Require an LLM-shaped JSON response: needs to look like an
+                # actual chat-completion response, not a random JSON blob.
+                llm_shapes = (
+                    '"choices"', '"completion"', '"role":"assistant"',
+                    '"finish_reason"', '"output_text"', '"reply":', '"answer":',
+                    '"content":"',  # quoted content key (chat API shape)
+                )
+                if not any(shape in full_with_headers for shape in llm_shapes):
+                    continue
+                llm_endpoint = path
+                break
 
         if not llm_endpoint:
             continue
@@ -2165,8 +2203,11 @@ _INFRA_LEAK_PROBES = [
      "CRITICAL", "Spring Boot Actuator /heapdump downloadable (memory dump with secrets)"),
     ("/actuator/loggers", r'"loggers"\s*:',
      "MEDIUM", "Spring Boot Actuator /loggers exposed"),
-    # Laravel
-    ("/_ignition/execute-solution", r'ignition|Laravel',
+    # Laravel — strict markers: previous regex matched on any "Laravel" mention
+    # (vendor pages, blog posts, third-party CSS comments). Real Ignition page
+    # has a unique title or error-shell signature.
+    ("/_ignition/execute-solution",
+     r'<title>[^<]*Ignition|Whoops,\s*looks\s*like|executeSolution|class="ignition-|ignition-style',
      "CRITICAL", "Laravel Ignition RCE endpoint exposed (CVE-2021-3129)"),
     ("/_debugbar", r'phpdebugbar|Debug\s*Bar',
      "HIGH", "Laravel Debugbar exposed in production"),

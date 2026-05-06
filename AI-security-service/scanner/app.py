@@ -4595,27 +4595,48 @@ async def stripe_webhook(request: Request):
         except Exception:
             return JSONResponse({"error": "Invalid webhook signature"}, status_code=400)
 
-    # Normalize to plain dict. Stripe's StripeObject overrides __getattr__
-    # and __getitem__ in ways that raise AttributeError on missing keys,
-    # which broke the previous `.get()`-chaining approach on live webhook
-    # events (observed 2026-04-15 with sk_live — webhook returned 500 on
-    # every checkout.session.completed).
+    # Normalize to plain dict. The PRIOR approach used .to_dict_recursive()
+    # which doesn't exist in stripe-python >=8 — that silently returned an
+    # empty dict, causing every paid checkout to land but never upgrade the
+    # user. Switched to json.loads(json.dumps(...)) which is plan-version-
+    # independent and handles both dict and StripeObject inputs.
     if isinstance(event, dict):
         event_type = event.get("type", "")
         data = event.get("data", {}).get("object", {}) or {}
     else:
         event_type = getattr(event, "type", "") or ""
-        _obj = getattr(getattr(event, "data", None), "object", None)
         try:
-            data = _obj.to_dict_recursive() if _obj is not None and hasattr(_obj, "to_dict_recursive") else (dict(_obj) if _obj is not None else {})
-        except Exception:
+            # stripe-python: every StripeObject has a .to_dict() that returns a
+            # plain dict for the immediate level. For deep normalisation we
+            # round-trip via JSON.
+            raw = event.to_dict() if hasattr(event, "to_dict") else event
+            data = (raw.get("data", {}) if isinstance(raw, dict) else {}).get("object", {}) or {}
+            # If `data` is still a StripeObject, force-normalise via JSON.
+            if not isinstance(data, dict):
+                data = json.loads(json.dumps(data, default=lambda o: dict(o) if hasattr(o, "items") else str(o)))
+        except Exception as e:
+            print(f"[stripe-webhook] event normalize failed: {e}", flush=True)
             data = {}
+
+    print(f"[stripe-webhook] event={event_type} customer={data.get('customer')} "
+          f"metadata={data.get('metadata')}", flush=True)
 
     if event_type == "checkout.session.completed":
         metadata = data.get("metadata") or {}
         user_id = metadata.get("user_id")
         plan = metadata.get("plan", "payg")
         customer_id = data.get("customer")
+        if not user_id:
+            # Fallback: look up the user by stripe_customer_id we stored at
+            # session creation. Catches events where metadata didn't propagate.
+            if customer_id:
+                with get_db() as db:
+                    row = db.execute(
+                        "SELECT id FROM users WHERE stripe_customer_id=?", (customer_id,)
+                    ).fetchone()
+                    if row:
+                        user_id = row["id"]
+                        print(f"[stripe-webhook] resolved user_id={user_id} via customer_id", flush=True)
         if user_id:
             with get_db() as db:
                 if plan == "payg":
@@ -4624,12 +4645,14 @@ async def stripe_webhook(request: Request):
                         (customer_id, user_id),
                     )
                 else:
-                    # Subscription — set plan + expires_at ~ 31 days out (invoice.paid will renew)
                     expires = (datetime.now(timezone.utc) + timedelta(days=31)).isoformat()
                     db.execute(
                         "UPDATE users SET plan=?, plan_expires_at=?, stripe_customer_id=COALESCE(stripe_customer_id, ?) WHERE id=?",
                         (plan, expires, customer_id, user_id),
                     )
+                print(f"[stripe-webhook] upgraded user_id={user_id} plan={plan}", flush=True)
+        else:
+            print(f"[stripe-webhook] WARN no user_id resolved for customer={customer_id}", flush=True)
 
     elif event_type == "invoice.paid":
         # Renewal — extend plan

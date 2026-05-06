@@ -42,9 +42,17 @@ fi
 echo "[deploy] pre-deploy gates ok."
 
 # 3. SCP changed files (with package→flat path rename) ─────────────────────
-FILES=( "${@:-scanner/app.py scanner/admin.py scanner/advanced.py scanner/notifications.py scanner/ai_triage.py}" )
+# Bug fix: prior version used `FILES=( "${@:-defaults}" )` then iterated
+# `for f in $FILES`. That iterated only FILES[0] when args were passed —
+# silently skipping every file after the first. Switched to explicit
+# branching + `"${FILES[@]}"` iteration.
+if [ $# -eq 0 ]; then
+  FILES=(scanner/app.py scanner/admin.py scanner/advanced.py scanner/notifications.py scanner/ai_triage.py)
+else
+  FILES=( "$@" )
+fi
 
-for f in $FILES; do
+for f in "${FILES[@]}"; do
   if [ ! -f "$f" ]; then
     echo "[deploy] skip missing: $f"; continue
   fi

@@ -2184,11 +2184,23 @@ def scan_target_cookies(run_id: str, ip: str, name: str) -> list[dict]:
             )
         except Exception:
             continue
+        # Cookies set by upstream infrastructure (Cloudflare, AWS ALB, Azure
+        # App Service, GAE, etc.) are outside the customer's control. Flagging
+        # them as missing security flags produces noise — every Cloudflare-
+        # fronted site would get the same finding. Skip them.
+        INFRA_COOKIES = {
+            "__cf_bm", "_cfuvid",   # Cloudflare bot management / visitor ID
+            "ARRAffinity", "ARRAffinitySameSite",  # Azure App Service load balancer
+            "AWSALB", "AWSALBCORS",  # AWS Application Load Balancer
+            "GAESA", "GCLB",          # Google App Engine / Cloud Load Balancer
+        }
         for line in r.stdout.splitlines():
             if not line.lower().startswith("set-cookie:"):
                 continue
             cookie_str = line[len("set-cookie:"):].strip()
             cookie_name = cookie_str.split("=")[0].strip() if "=" in cookie_str else "unknown"
+            if cookie_name in INFRA_COOKIES:
+                continue
             cookie_lower = cookie_str.lower()
             issues = []
             if "secure" not in cookie_lower and scheme == "https":

@@ -514,6 +514,12 @@ def scan_target_headers(run_id: str, ip: str, name: str, ctx=None):
                 "content-security-policy": "Content-Security-Policy",
                 "referrer-policy": "Referrer-Policy",
             }
+            # Skip plain-HTTP (port 80) missing-header findings. Sites
+            # generally redirect HTTP to HTTPS, and the headers that matter
+            # (HSTS, CSP) are only meaningful on the secure response. Flagging
+            # them on port 80 produces 5x duplicate noise per scan.
+            if port == 80:
+                continue
             for hdr_lower, hdr_name in required_headers.items():
                 if hdr_lower not in headers_lower and status in ("200", "301", "302", "307"):
                     # Deduplicate: only report each missing header once (not per-port)

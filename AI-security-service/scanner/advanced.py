@@ -2185,21 +2185,41 @@ def scan_target_cookies(run_id: str, ip: str, name: str) -> list[dict]:
         except Exception:
             continue
         # Cookies set by upstream infrastructure (Cloudflare, AWS ALB, Azure
-        # App Service, GAE, etc.) are outside the customer's control. Flagging
-        # them as missing security flags produces noise — every Cloudflare-
-        # fronted site would get the same finding. Skip them.
-        INFRA_COOKIES = {
-            "__cf_bm", "_cfuvid",   # Cloudflare bot management / visitor ID
-            "ARRAffinity", "ARRAffinitySameSite",  # Azure App Service load balancer
-            "AWSALB", "AWSALBCORS",  # AWS Application Load Balancer
-            "GAESA", "GCLB",          # Google App Engine / Cloud Load Balancer
+        # App Service, GAE, Akamai, Incapsula, etc.) are outside the customer's
+        # control. Flagging them as missing security flags is noise — every
+        # Cloudflare-fronted site would get the same finding. Skip them.
+        # Use BOTH exact-match and prefix-match — Incapsula and Akamai use
+        # dynamic suffixes (`incap_ses_123_45678`, `bm_sz`/`bm_sv`).
+        INFRA_COOKIES_EXACT = {
+            "__cf_bm", "_cfuvid", "cf_clearance",  # Cloudflare
+            "__cflb", "__cf_logged_in",
+            "ARRAffinity", "ARRAffinitySameSite",  # Azure App Service
+            "AWSALB", "AWSALBCORS", "AWSALBTG", "AWSALBTGCORS",  # AWS ALB
+            "GAESA", "GCLB",                        # Google App Engine / Cloud LB
+            "_abck", "bm_sz", "bm_sv", "bm_mi", "ak_bmsc", "akacd_*",  # Akamai
+            "TS01*", "TSPD_101", "f5_cspm",         # F5
         }
+        INFRA_COOKIES_PREFIXES = (
+            "AWSALBAPP-",      # AWS ALB session affinity
+            "incap_ses_",      # Incapsula session
+            "visid_incap_",    # Incapsula visitor
+            "nlbi_",           # Incapsula load balancing
+            "__Secure-1PSID",  # Google
+            "__Host-",         # Generic infra
+            "__Secure-",
+        )
+
+        def _is_infra_cookie(name):
+            if name in INFRA_COOKIES_EXACT:
+                return True
+            return any(name.startswith(p) for p in INFRA_COOKIES_PREFIXES)
+
         for line in r.stdout.splitlines():
             if not line.lower().startswith("set-cookie:"):
                 continue
             cookie_str = line[len("set-cookie:"):].strip()
             cookie_name = cookie_str.split("=")[0].strip() if "=" in cookie_str else "unknown"
-            if cookie_name in INFRA_COOKIES:
+            if _is_infra_cookie(cookie_name):
                 continue
             cookie_lower = cookie_str.lower()
             issues = []
@@ -2252,7 +2272,8 @@ def scan_target_firebase_deep(run_id: str, ip: str, name: str) -> list[dict]:
     # 1. Realtime Database — unauthenticated read at root
     try:
         r = subprocess.run(
-            ["curl", "-sk", "-m", "5", f"https://{project}.firebaseio.com/.json"],
+            ["curl", "-sk", "-m", "5", "--max-filesize", "1000000",
+             f"https://{project}.firebaseio.com/.json"],
             capture_output=True, text=True, timeout=8,
         )
         body = r.stdout.strip()
@@ -2288,7 +2309,7 @@ def scan_target_firebase_deep(run_id: str, ip: str, name: str) -> list[dict]:
                 f"/databases/(default)/documents/{collection}?pageSize=1"
             )
             r = subprocess.run(
-                ["curl", "-sk", "-m", "5", url],
+                ["curl", "-sk", "-m", "5", "--max-filesize", "1000000", url],
                 capture_output=True, text=True, timeout=8,
             )
             if '"documents"' in r.stdout and '"fields"' in r.stdout:
@@ -3184,8 +3205,21 @@ def scan_target_auth_bypass(run_id: str, ip: str, name: str, ctx=None) -> list[d
         # Skip trivial responses (health checks, empty objects)
         if len(body_stripped) < 50:
             continue
-        # Skip if it looks like an error/status response
-        if any(k in body_stripped[:200].lower() for k in ['"error"', '"message":"not', '"status":"error']):
+        # Skip if it looks like an error/status response. Cover both common
+        # FastAPI/Starlette shape ({"detail":"..."}) and various framework
+        # error envelopes — these mean the endpoint IS rejecting access,
+        # just returning 200 instead of 401.
+        bs_low = body_stripped[:300].lower()
+        if any(k in bs_low for k in (
+            '"error"', '"message":"not', '"status":"error',
+            '"detail":"auth', '"detail":"unauth', '"detail":"forbidden',
+            '"detail":"missing', '"detail":"permission', '"detail":"not auth',
+            '"detail":"invalid', '"detail":"expired', '"detail":"required',
+            '"code":"auth_', '"code":"unauth', '"code":"forbidden',
+            '"ok":false', '"success":false',
+            'unauthenticated', 'unauthorized', 'forbidden',
+            'authentication required', 'auth_required',
+        )):
             continue
 
         # Check for PII in response
@@ -3265,8 +3299,14 @@ def scan_target_mass_assign(run_id: str, ip: str, name: str, ctx=None) -> list[d
         url = f"https://{ip}{path}"
         for method in ["PATCH", "PUT"]:
             try:
+                # `-D /dev/stderr` writes response headers to stderr so we
+                # can parse status + content-type. Without this, the prior
+                # version checked stderr for "json" and never matched —
+                # the module produced zero findings.
                 r = subprocess.run(
                     ["curl", "-sk", "-m", "6", "-A", _UA,
+                     "-D", "/dev/stderr",
+                     "--max-filesize", "200000",
                      "-X", method, "-H", "Content-Type: application/json",
                      "-d", escalation_json, url],
                     capture_output=True, text=True, timeout=10,
@@ -3361,6 +3401,7 @@ def scan_target_payment_bypass(run_id: str, ip: str, name: str, ctx=None) -> lis
             # Send WITHOUT Stripe-Signature header — if accepted, it's vulnerable
             r = subprocess.run(
                 ["curl", "-sk", "-m", "8", "-A", _UA,
+                 "--max-filesize", "200000",
                  "-X", "POST", "-H", "Content-Type: application/json",
                  "-w", "\n%{http_code}", "-d", fake_event, url],
                 capture_output=True, text=True, timeout=12,
@@ -3404,13 +3445,23 @@ def scan_target_payment_bypass(run_id: str, ip: str, name: str, ctx=None) -> lis
             if stripped_low.startswith(("<!doctype", "<html", "<svg", "<?xml")):
                 continue
             # Auth-rejection messages mean the endpoint IS securing requests,
-            # just not via Stripe-Signature. Not exploitable.
+            # just not via Stripe-Signature. Not exploitable. Cover prose,
+            # JSON shapes ({"error":"..."}, {"ok":false,...}), and common
+            # framework error keys.
             rejection_phrases = (
                 "not logged in", "authentication failed", "unauthorized",
                 "not allowed", "invalid object", "forbidden",
                 "page not found", "please log in", "missing signature",
                 "signature_verification", "invalid signature",
                 "permission denied", "access denied",
+                # JSON-shaped rejections common in modern APIs
+                '"ok":false', '"success":false', '"error"',
+                '"detail":"auth', '"detail":"forbidden',
+                '"detail":"unauth', '"detail":"permission',
+                '"detail":"missing', '"code":"auth_',
+                '"code":"unauth', '"code":"forbidden',
+                "auth_required", "requires_authentication",
+                "unauthenticated", "authentication required",
             )
             if any(p in stripped_low for p in rejection_phrases):
                 continue
@@ -4123,25 +4174,33 @@ def scan_target_ssti(run_id: str, ip: str, name: str, ctx=None) -> list[dict]:
             if "49" not in body:
                 continue
 
-            # Extra verification: "49" must appear as a standalone token, not buried
-            # in a hash, URL, ID, timestamp, or GUID segment. Audit found that
-            # GUID 4-char segments like "49f8" inside "68634305-2015-49f8-9970-..."
-            # were getting through the prior 8-char hex strip.
+            # Strong rejection: if the literal payload string survives in the
+            # body, the engine *didn't* evaluate it — it just echoed user input.
+            # A real SSTI hit replaces ${7*7} with 49 and the literal disappears.
+            if payload in body:
+                continue
+
             import re as _re
             stripped = body
-            # Strip all hex segments of any length 3+ (covers UUID quartets like 49f8)
+            # Strip noise that contains coincidental "49": hex segments, URLs,
+            # timestamps, multi-digit numbers, attribute values, currency,
+            # percentages, JSON status fields, version strings.
             stripped = _re.sub(r'\b[0-9a-f]{3,}\b', '', stripped, flags=_re.I)
-            # Strip URLs and asset paths
             stripped = _re.sub(r'https?://\S+', '', stripped)
             stripped = _re.sub(r'/[\w./-]*\.(js|css|svg|png|jpg|webp)\b', '', stripped, flags=_re.I)
-            # Strip ISO 8601 timestamps and time-of-day markers
             stripped = _re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*', '', stripped)
             stripped = _re.sub(r'\d{2}:\d{2}:\d{2}', '', stripped)
-            # Strip 3+ digit numbers
             stripped = _re.sub(r'\d{3,}', '', stripped)
-            # Strip nonce-style attribute values: nonce="xxx", id="xxx"
-            stripped = _re.sub(r'(?:nonce|id|data-[a-z-]+)="[^"]*"', '', stripped, flags=_re.I)
-            # Now "49" must still appear AND not be bordered by alphanumeric chars
+            # Any HTML attribute value (covers nonce, id, data-*, aria-*, title,
+            # alt, value, class — whatever the page emits).
+            stripped = _re.sub(r'\w[\w-]*="[^"]*"', '', stripped)
+            stripped = _re.sub(r"\w[\w-]*='[^']*'", '', stripped)
+            # Currency, percentages, JSON status fields, version strings.
+            stripped = _re.sub(r'[\$€£¥]\s*\d{1,4}(?:[.,]\d+)?', '', stripped)
+            stripped = _re.sub(r'\b\d{1,3}\s*%', '', stripped)
+            stripped = _re.sub(r'"(?:code|status|http_code|statusCode|errno)"\s*:\s*\d+', '', stripped)
+            stripped = _re.sub(r'\bv\.?\s*\d+(?:\.\d+)*\b', '', stripped, flags=_re.I)
+            # Final boundary check: "49" must appear with non-alnum on both sides.
             if not _re.search(r'(?<![0-9a-zA-Z])49(?![0-9a-zA-Z])', stripped):
                 continue
 

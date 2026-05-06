@@ -411,6 +411,18 @@ async def admin_impersonate(request: Request, user_id: str):
         ).fetchone()
         if not u:
             raise HTTPException(status_code=404, detail="User not found")
+    # Refuse admin-impersonate-admin. With the audit attribution flaw — every
+    # action during impersonation is logged as the impersonated user's email —
+    # one admin could perform privileged actions while leaving the trail
+    # pointing at a different admin.
+    target_email_low = (u["email"] or "").lower()
+    admins = set(
+        e.strip().lower()
+        for e in os.getenv("ADMIN_EMAILS", "stefan.a.lederer@gmail.com").split(",")
+        if e.strip()
+    )
+    if target_email_low in admins:
+        raise HTTPException(status_code=403, detail="Cannot impersonate another admin")
     # Store only the admin's user_id + a flag. On unimpersonate we re-fetch the
     # admin row fresh from the DB — never trust session-serialized fields.
     # Refuse to nest impersonations: if we're already impersonating, require

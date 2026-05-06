@@ -1,0 +1,62 @@
+name: smoke-prod
+
+on:
+  schedule:
+    # Every 30 minutes
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hit critical endpoints
+        run: |
+          set +e  # don't exit on first failure — we want to check all paths
+          fail=0
+
+          check () {
+            local path="$1"
+            local expected="$2"
+            local method="${3:-GET}"
+            if [ "$method" = "GET" ]; then
+              code=$(curl -sk -o /dev/null -w '%{http_code}' -m 10 "https://securityscanner.dev$path")
+            else
+              code=$(curl -sk -o /dev/null -w '%{http_code}' -X "$method" -m 10 "https://securityscanner.dev$path" -H 'Content-Type: application/json' -d '{}')
+            fi
+            if [[ ! "$code" =~ ^($expected)$ ]]; then
+              echo "::error::$path returned $code, expected $expected"
+              fail=1
+            else
+              echo "::notice::$path -> $code"
+            fi
+          }
+
+          # Public marketing
+          check "/"            "200"
+          check "/blog"        "200"
+          check "/contact"     "200"
+          check "/privacy"     "200"
+
+          # Admin / auth-gated routes redirect anonymously
+          check "/admin"            "307|200"
+          check "/inbox"            "307|200"
+          check "/admin/newsletter" "307|200"
+
+          # API endpoints with no auth
+          check "/api/admin/overview" "401|403"
+          check "/api/runs"           "401"
+
+          # Webhooks: the inbound ones must reject anonymous POSTs
+          check "/webhooks/cf-inbound"     "401|503" "POST"
+          check "/webhooks/resend-inbound" "401|503" "POST"
+
+          # Stripe webhook should reject unsigned requests with 400
+          check "/api/stripe/webhook" "400|500" "POST"
+
+          if [ $fail -ne 0 ]; then
+            echo "Smoke test failures detected"
+            exit 1
+          fi
+          echo "All smoke checks passed"

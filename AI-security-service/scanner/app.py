@@ -4677,13 +4677,21 @@ async def stripe_webhook(request: Request):
     # Stripe retries failed webhooks for up to 3 days. Without this, a 5xx
     # blip downstream (or our own normaliser bug as we just hit) replays
     # scan_credit grants and plan_expires_at extensions every retry.
-    if event_id:
-        with get_db() as db:
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS processed_stripe_events ("
-                "event_id TEXT PRIMARY KEY, event_type TEXT, "
-                "processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
-            )
+    print(f"[stripe-webhook] event={event_type} id={event_id} "
+          f"customer={data.get('customer')}", flush=True)
+
+    # Idempotency + side effects must be atomic — otherwise a crash between
+    # dedup INSERT and the credit/plan UPDATE leaves the user paid-but-
+    # uncredited and Stripe retries see "duplicate" and skip the fix.
+    # Solution: do dedup INSERT and the side-effect UPDATEs in a single
+    # connection that commits atomically at __exit__.
+    with get_db() as db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS processed_stripe_events ("
+            "event_id TEXT PRIMARY KEY, event_type TEXT, "
+            "processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        if event_id:
             try:
                 db.execute(
                     "INSERT INTO processed_stripe_events (event_id, event_type) VALUES (?, ?)",
@@ -4694,27 +4702,20 @@ async def stripe_webhook(request: Request):
                 print(f"[stripe-webhook] duplicate event {event_id} ignored", flush=True)
                 return {"received": True, "duplicate": True}
 
-    print(f"[stripe-webhook] event={event_type} id={event_id} "
-          f"customer={data.get('customer')}", flush=True)
-
-    if event_type == "checkout.session.completed":
-        metadata = data.get("metadata") or {}
-        user_id = metadata.get("user_id")
-        plan = metadata.get("plan", "payg")
-        customer_id = data.get("customer")
-        if not user_id:
-            # Fallback: look up the user by stripe_customer_id we stored at
-            # session creation. Catches events where metadata didn't propagate.
-            if customer_id:
-                with get_db() as db:
-                    row = db.execute(
-                        "SELECT id FROM users WHERE stripe_customer_id=?", (customer_id,)
-                    ).fetchone()
-                    if row:
-                        user_id = row["id"]
-                        print(f"[stripe-webhook] resolved user_id={user_id} via customer_id", flush=True)
-        if user_id:
-            with get_db() as db:
+        if event_type == "checkout.session.completed":
+            metadata = data.get("metadata") or {}
+            user_id = metadata.get("user_id")
+            plan = metadata.get("plan", "payg")
+            customer_id = data.get("customer")
+            if not user_id and customer_id:
+                # Fallback: look up the user by stripe_customer_id stored at session creation.
+                row = db.execute(
+                    "SELECT id FROM users WHERE stripe_customer_id=?", (customer_id,)
+                ).fetchone()
+                if row:
+                    user_id = row["id"]
+                    print(f"[stripe-webhook] resolved user_id={user_id} via customer_id", flush=True)
+            if user_id:
                 if plan == "payg":
                     db.execute(
                         "UPDATE users SET scan_credits = COALESCE(scan_credits, 0) + 1, plan='payg', stripe_customer_id=COALESCE(stripe_customer_id, ?) WHERE id=?",
@@ -4727,28 +4728,24 @@ async def stripe_webhook(request: Request):
                         (plan, expires, customer_id, user_id),
                     )
                 print(f"[stripe-webhook] upgraded user_id={user_id} plan={plan}", flush=True)
-        else:
-            print(f"[stripe-webhook] WARN no user_id resolved for customer={customer_id}", flush=True)
+            else:
+                print(f"[stripe-webhook] WARN no user_id for customer={customer_id}", flush=True)
 
-    elif event_type == "invoice.paid":
-        # Renewal — extend plan
-        customer_id = data.get("customer")
-        if customer_id:
-            expires = (datetime.now(timezone.utc) + timedelta(days=31)).isoformat()
-            with get_db() as db:
-                db.execute("UPDATE users SET plan_expires_at=? WHERE stripe_customer_id=?", (expires, customer_id))
+        elif event_type == "invoice.paid":
+            customer_id = data.get("customer")
+            if customer_id:
+                expires = (datetime.now(timezone.utc) + timedelta(days=31)).isoformat()
+                db.execute("UPDATE users SET plan_expires_at=? WHERE stripe_customer_id=?",
+                           (expires, customer_id))
 
-    elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
-        customer_id = data.get("customer")
-        status = data.get("status")
-        if customer_id:
-            with get_db() as db:
-                if event_type == "customer.subscription.deleted" or status == "canceled":
-                    db.execute(
-                        "UPDATE users SET plan='free', plan_expires_at=NULL WHERE stripe_customer_id=?",
-                        (customer_id,),
-                    )
-
+        elif event_type in ("customer.subscription.deleted", "customer.subscription.updated"):
+            customer_id = data.get("customer")
+            status = data.get("status")
+            if customer_id and (event_type == "customer.subscription.deleted" or status == "canceled"):
+                db.execute(
+                    "UPDATE users SET plan='free', plan_expires_at=NULL WHERE stripe_customer_id=?",
+                    (customer_id,),
+                )
     return {"received": True}
 
 
@@ -5610,8 +5607,17 @@ async def admin_newsletter_send(request: Request):
 
     Body: { subject: str, body: str (HTML) }
     """
-    if not _require_admin(request):
+    admin = _require_admin(request)
+    if not admin:
         return JSONResponse({"error": "Forbidden"}, status_code=403)
+    # Rate limit: 3 broadcasts per 24h per admin. A compromised admin
+    # session would otherwise be unlimited mass-mail via our domain.
+    admin_email = (admin.get("email") or "").lower()
+    ok, retry = rate_limit(f"newsletter_send:{admin_email}",
+                            max_events=3, window_seconds=86400)
+    if not ok:
+        return JSONResponse({"error": "Daily broadcast limit reached.",
+                             "retry_after": retry}, status_code=429)
     try:
         payload = await request.json()
     except Exception:
@@ -5620,6 +5626,10 @@ async def admin_newsletter_send(request: Request):
     body = (payload.get("body") or "").strip()
     if not subject or not body:
         return JSONResponse({"error": "subject and body required"}, status_code=400)
+    # Audit log: record the send attempt with subject + body hash + actor
+    # so a compromised-admin scenario leaves a clear forensic trail.
+    import hashlib as _hl
+    body_hash = _hl.sha256(body.encode("utf-8", errors="replace")).hexdigest()[:16]
 
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     aud = _resend_audience_id()
@@ -5660,6 +5670,23 @@ async def admin_newsletter_send(request: Request):
             return JSONResponse({"error": f"send failed: HTTP {r2.status_code}",
                                  "body": r2.text[:300],
                                  "broadcast_id": bid}, status_code=502)
+        # Write audit row
+        try:
+            with get_db() as db:
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS admin_audit ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, actor_email TEXT, "
+                    "action TEXT, target TEXT, detail TEXT, "
+                    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+                )
+                db.execute(
+                    "INSERT INTO admin_audit (actor_email, action, target, detail) "
+                    "VALUES (?, ?, ?, ?)",
+                    (admin_email, "newsletter.send", bid,
+                     f"subject={subject!r} body_sha={body_hash} bytes={len(body)}"),
+                )
+        except Exception as e:
+            print(f"[audit] failed to log newsletter send: {e}", flush=True)
         return {"ok": True, "broadcast_id": bid}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

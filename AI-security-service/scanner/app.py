@@ -977,6 +977,13 @@ def scan_target_secrets(run_id: str, ip: str, name: str):
                 match = re.search(pattern, body)
                 if match:
                     secret_value = match.group(0)
+                    # AIzaSy* are Google web API keys — Firebase + Maps + Places.
+                    # By design they ship in the client; the security risk lives
+                    # in the Firebase rules / API restrictions, not the key
+                    # itself. Demote to LOW so it surfaces but doesn't dominate
+                    # the dashboard.
+                    if secret_value.startswith("AIzaSy"):
+                        sev = "LOW"
                     dedupe_key = (label, secret_value)
                     if dedupe_key in seen_secrets:
                         continue  # already reported this exact secret on this host

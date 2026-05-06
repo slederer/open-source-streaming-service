@@ -3628,8 +3628,8 @@ def scan_target_login_bruteforce(run_id: str, ip: str, name: str, ctx=None) -> l
         # Skip non-existent or already-blocked endpoints. 401 = expected auth challenge
         # without entering creds; 403 = WAF/firewall already blocking (rate limiting is
         # implicit). 5xx = unhealthy. We can only meaningfully test 200/400/422 responses.
-        if status0 in ("401", "403", "404", "405", "000", "301", "302",
-                       "500", "502", "503", "504", ""):
+        if status0 in ("400", "401", "403", "404", "405", "000", "301", "302",
+                       "307", "308", "500", "502", "503", "504", ""):
             continue
         # Skip SPA fallback (HTML response to API POST)
         body0 = lines0[0] if len(lines0) > 1 else ""

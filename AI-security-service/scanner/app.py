@@ -958,6 +958,15 @@ def scan_target_secrets(run_id: str, ip: str, name: str):
             if not body or len(body) < 50 or "[TIMEOUT" in body or "[ERROR" in body:
                 continue
             bodies_fetched += 1
+            # Skip vendor-owned third-party CDN scripts that ship a public
+            # API key by design (AMP project, intentionally embedded).
+            VENDOR_PUBLIC_KEY_HOSTS = (
+                "cdn.ampproject.org", "ampproject.org",
+                "cdn.jsdelivr.net/npm/@amplitude",
+                "cdn.segment.com", "browser.sentry-cdn.com",
+            )
+            if any(host in url for host in VENDOR_PUBLIC_KEY_HOSTS):
+                continue
             for pattern, label, sev in SECRET_PATTERNS:
                 match = re.search(pattern, body)
                 if match:
@@ -2126,6 +2135,9 @@ def scan_target_s3_cloud(run_id: str, ip: str, name: str):
         "vercel-edge-functions",
         "netlify-cdn",
         "fastly-customer-data",
+        "base44-prod",          # base44 customer-asset CDN — referenced by
+                                  # every base44.app site, not their data
+        "base44-dev",
     }
 
     # ── Phase 3: probe each candidate (S3) ─────────────────────────────────

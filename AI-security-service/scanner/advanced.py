@@ -3383,15 +3383,24 @@ def scan_target_payment_bypass(run_id: str, ip: str, name: str, ctx=None) -> lis
             # Extra check: response shouldn't look like a generic SPA/404 page
             if "<html" in body_lower and "checkout" not in body_lower:
                 continue
-            # Strict: completely empty bodies on a "/api/webhook/..." 200 are
-            # almost always SPA catch-all routes returning the empty document
-            # for every unknown path. A real webhook handler echoes something
-            # (status, event id, "received: true", or at least an error JSON).
             stripped = body.strip()
+            stripped_low = stripped.lower()
+            # Empty body — SPA catch-all returning empty document for unknown path
             if not stripped:
                 continue
-            # If it's HTML at all, skip — real webhook handlers don't return HTML
-            if stripped.lower().startswith(("<!doctype", "<html")):
+            # HTML or SVG body — real webhook handlers don't return markup
+            if stripped_low.startswith(("<!doctype", "<html", "<svg", "<?xml")):
+                continue
+            # Auth-rejection messages mean the endpoint IS securing requests,
+            # just not via Stripe-Signature. Not exploitable.
+            rejection_phrases = (
+                "not logged in", "authentication failed", "unauthorized",
+                "not allowed", "invalid object", "forbidden",
+                "page not found", "please log in", "missing signature",
+                "signature_verification", "invalid signature",
+                "permission denied", "access denied",
+            )
+            if any(p in stripped_low for p in rejection_phrases):
                 continue
 
             findings.append({

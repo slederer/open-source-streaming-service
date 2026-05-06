@@ -39,8 +39,12 @@ class TestTargets:
         assert r.status_code == 200
         targets = r.json()
         assert len(targets) == 2
+        # Targets aren't ordering-stable across the API surface — sort by host
+        # so the test isn't coupled to insertion order.
+        targets.sort(key=lambda t: t["host"])
         assert targets[0]["host"] == "10.0.0.1"
         assert targets[0]["label"] == "test-server-1"
+        assert targets[1]["host"] == "10.0.0.2"
 
     def test_add_target(self, client):
         r = client.post("/api/targets", json={"host": "10.0.0.3", "label": "new-server"})

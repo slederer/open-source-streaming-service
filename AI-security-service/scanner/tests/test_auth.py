@@ -7,7 +7,8 @@ from unittest.mock import patch
 class TestSignup:
     def test_signup_creates_user(self, anon_client, db):
         r = anon_client.post("/api/auth/signup", json={
-            "email": "new@example.com", "password": "strongpass123", "name": "New User"
+            "email": "new@example.com", "password": "strongpass123",
+            "name": "New User", "consent": True,
         })
         assert r.status_code == 200
         row = db.execute("SELECT email, email_verified, verification_token FROM users WHERE email='new@example.com'").fetchone()
@@ -16,17 +17,30 @@ class TestSignup:
         assert row["verification_token"] is not None
 
     def test_signup_requires_valid_email(self, anon_client):
-        r = anon_client.post("/api/auth/signup", json={"email": "notanemail", "password": "strongpass123"})
+        r = anon_client.post("/api/auth/signup", json={
+            "email": "notanemail", "password": "strongpass123", "consent": True,
+        })
         assert r.status_code == 400
 
     def test_signup_requires_strong_password(self, anon_client):
-        r = anon_client.post("/api/auth/signup", json={"email": "a@b.com", "password": "short"})
+        r = anon_client.post("/api/auth/signup", json={
+            "email": "a@b.com", "password": "short", "consent": True,
+        })
         assert r.status_code == 400
+
+    def test_signup_requires_consent(self, anon_client):
+        r = anon_client.post("/api/auth/signup", json={
+            "email": "noconsent@example.com", "password": "strongpass123",
+        })
+        assert r.status_code == 400
+        assert "privacy" in (r.json().get("error", "") + r.text).lower()
 
     def test_signup_rejects_duplicate_email(self, anon_client, db):
         db.execute("INSERT INTO users (id, email, password_hash, auth_provider) VALUES ('dupe', 'dup@example.com', 'hash', 'email')")
         db.commit()
-        r = anon_client.post("/api/auth/signup", json={"email": "dup@example.com", "password": "strongpass123"})
+        r = anon_client.post("/api/auth/signup", json={
+            "email": "dup@example.com", "password": "strongpass123", "consent": True,
+        })
         assert r.status_code == 409
 
 

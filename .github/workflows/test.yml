@@ -69,10 +69,8 @@ jobs:
             scanner/tests/test_ai_triage.py \
             -q --tb=short
 
-      - name: Run full suite (informational, does not block)
-        # Pre-existing failures in test_api/test_auth/test_scanners are
-        # documented; this job runs them but does not fail the build.
-        # Once the green-baseline is restored, change `continue-on-error`
-        # to false to enforce.
-        continue-on-error: true
+      - name: Run full suite (must pass)
+        # Green baseline restored — any test failure now blocks the build.
+        # If a network-dependent test starts failing, mark it skip rather
+        # than reintroducing continue-on-error.
         run: python -m pytest scanner/tests/ -q --tb=line

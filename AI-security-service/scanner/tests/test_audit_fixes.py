@@ -252,6 +252,110 @@ class TestSqlInjectionPathParams:
         )
 
 
+class TestScanContext:
+    """Shared scan context: platform detection + SPA fingerprint + post-scan
+    FP filter. This is the central FP-prevention infra after we removed
+    10K+ false positives from the cleanup batches."""
+
+    def test_bolt_subdomain_detected(self):
+        """*.bolt.host targets get platform=bolt + the platform default
+        paths populated, so admin-panel/login-bruteforce/api-enum can skip
+        Bolt's always-401 routes (/cms, /panel, /debug/, /api/auth/*)."""
+        from scanner.app import _build_scan_context
+        ctx = _build_scan_context("myapp.bolt.host", "test-run-1")
+        assert ctx["platform"] == "bolt"
+        assert ctx["is_platform_subdomain"] is True
+        # Default paths populated so login-bruteforce can skip them
+        assert "/cms" in ctx["platform_default_paths"]
+        assert "/api/auth/login" in ctx["platform_default_paths"]
+        # Known keys populated so secret-scan can ignore Bolt's SDK key
+        assert "sdk-ye5YC6vB6I5SoRX" in ctx["platform_known_keys"]
+
+    def test_lovable_subdomain_detected(self):
+        from scanner.app import _build_scan_context
+        ctx = _build_scan_context("foo.lovable.app", "test-run-2")
+        assert ctx["platform"] == "lovable"
+        assert ctx["is_platform_subdomain"] is True
+
+    def test_custom_domain_no_platform(self):
+        """Real customer domain — no platform marker, modules treat
+        normally."""
+        from scanner.app import _build_scan_context
+        # Use a non-resolvable host so the SPA-probe curl bails fast
+        ctx = _build_scan_context("nonexistent-test-domain-xyz.example", "test-run-3")
+        assert ctx["platform"] is None
+        assert ctx["is_platform_subdomain"] is False
+        assert ctx["platform_default_paths"] == set()
+
+    def test_github_repo_detected(self):
+        from scanner.app import _build_scan_context
+        ctx = _build_scan_context("https://github.com/posthog/posthog", "test-run-4")
+        assert ctx["is_github_repo"] is True
+
+
+class TestPostScanFpFilter:
+    """Safety-net: even if a module misses the platform check, the post-scan
+    filter deletes the well-known FP rows before they reach the user."""
+
+    def test_bolt_sdk_key_deleted(self, db):
+        from scanner.app import _post_scan_fp_filter, _build_scan_context
+        run_id = "fp-filter-test-1"
+        # Insert a fake "secret-scan" finding containing the Bolt SDK key
+        db.execute(
+            "INSERT INTO scan_runs (id, user_id, started_at, status, targets) "
+            "VALUES (?,?, datetime('now'), 'running', ?)",
+            (run_id, "test-user-id-12345", "myapp.bolt.host"),
+        )
+        db.execute(
+            "INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (run_id, "myapp.bolt.host", "HIGH", "secrets",
+             "Hardcoded API key", "Found in JS bundle",
+             "key=sdk-ye5YC6vB6I5SoRX", "secret-scan"),
+        )
+        # And a real finding — must NOT be deleted
+        db.execute(
+            "INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (run_id, "myapp.bolt.host", "HIGH", "secrets",
+             "Real secret found", "Stripe key",
+             "key=sk_live_real_customer_key_12345", "secret-scan"),
+        )
+        db.commit()
+        ctx = {"platform": "bolt", "is_platform_subdomain": True}
+        _post_scan_fp_filter(run_id, ctx)
+        rows = db.execute(
+            "SELECT title FROM findings WHERE run_id=?", (run_id,)
+        ).fetchall()
+        titles = [r[0] for r in rows]
+        assert "Hardcoded API key" not in titles, "Bolt SDK key FP not removed"
+        assert "Real secret found" in titles, "Real finding wrongly deleted"
+
+    def test_login_bruteforce_429_deleted(self, db):
+        """A login-bruteforce module hit returning 429 confirms rate
+        limiting works — it's not a vulnerability, so suppress."""
+        from scanner.app import _post_scan_fp_filter
+        run_id = "fp-filter-test-2"
+        db.execute(
+            "INSERT INTO scan_runs (id, user_id, started_at, status, targets) "
+            "VALUES (?,?, datetime('now'), 'running', ?)",
+            (run_id, "test-user-id-12345", "example.com"),
+        )
+        db.execute(
+            "INSERT INTO findings (run_id, target, severity, category, title, description, evidence, tool) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (run_id, "example.com", "MEDIUM", "auth",
+             "Possible weak rate limit", "5 attempts allowed",
+             "Endpoint /login returned HTTP 429 after 5 attempts", "login-bruteforce"),
+        )
+        db.commit()
+        _post_scan_fp_filter(run_id, {})
+        rows = db.execute(
+            "SELECT COUNT(*) FROM findings WHERE run_id=?", (run_id,)
+        ).fetchone()
+        assert rows[0] == 0, "429 rate-limit FP not removed"
+
+
 class TestCookieAuditInfraPrefix:
     def test_incapsula_dynamic_suffix_skipped(self):
         """Incapsula sets cookies with dynamic numeric suffixes

@@ -117,9 +117,15 @@ class TestGithubOrg:
 
         def fake_search(q, num=10):
             if "password" in q:
+                # The post-filter requires the target domain to actually
+                # appear in the link/title/snippet — otherwise the result
+                # is treated as a substring-match FP. Include "acme.com"
+                # in each result so the production code keeps them.
                 return [
-                    {"link": "https://github.com/unrelated-dev/api/blob/main/.env"},
-                    {"link": "https://github.com/community/deploy/blob/main/config.yml"},
+                    {"link": "https://github.com/unrelated-dev/api/blob/main/.env",
+                     "snippet": "DATABASE_URL=postgres://acme.com:5432/db"},
+                    {"link": "https://github.com/community/deploy/blob/main/config.yml",
+                     "snippet": "host: acme.com\npassword: hunter2"},
                 ]
             return []
 
@@ -373,9 +379,14 @@ class TestGithubDorkOwnOrgFilter:
         def fake_search(q, num=10):
             if "password" in q:
                 return [
-                    {"link": "https://github.com/bitmovin/bitmovin-sdk-examples/x.py"},  # own, filtered
-                    {"link": "https://github.com/random-dev/myconfig/blob/main/.env"},   # 3rd party, kept
-                    {"link": "https://github.com/other-dev/deploy/blob/main/conf.yml"},  # 3rd party, kept
+                    # Own-org, filtered out
+                    {"link": "https://github.com/bitmovin/bitmovin-sdk-examples/x.py",
+                     "snippet": "bitmovin.com SDK example"},
+                    # 3rd party, kept (target domain in snippet)
+                    {"link": "https://github.com/random-dev/myconfig/blob/main/.env",
+                     "snippet": "DB_HOST=bitmovin.com"},
+                    {"link": "https://github.com/other-dev/deploy/blob/main/conf.yml",
+                     "snippet": "host: bitmovin.com"},
                 ]
             return []
         with patch("scanner.crawl._search_any", side_effect=fake_search):
@@ -386,22 +397,26 @@ class TestGithubDorkOwnOrgFilter:
         assert hits[0]["severity"] == "LOW", f"got {hits[0]['severity']}"
 
     def test_pure_third_party_hit_keeps_severity(self, monkeypatch):
-        """DATABASE_URL dork stays at HIGH when 2+ third-party hits remain."""
+        """DATABASE_URL dork keeps its base severity (MEDIUM) when 2+
+        third-party hits remain and no own-org filter triggers a demotion."""
         from scanner.advanced import scan_target_github_org
         monkeypatch.setenv("SERPER_API_KEY", "dummy")
 
         def fake_search(q, num=10):
             if "DATABASE_URL" in q:
                 return [
-                    {"link": "https://github.com/random/repo/blob/main/.env"},
-                    {"link": "https://github.com/another/service/blob/main/.env"},
+                    {"link": "https://github.com/random/repo/blob/main/.env",
+                     "snippet": "bitmovin.com DATABASE_URL=postgres://..."},
+                    {"link": "https://github.com/another/service/blob/main/.env",
+                     "snippet": "bitmovin.com prod config"},
                 ]
             return []
         with patch("scanner.crawl._search_any", side_effect=fake_search):
             findings = scan_target_github_org("r1", "bitmovin.com", "t")
         hits = [f for f in findings if "Database URL" in f["title"]]
         assert hits
-        assert hits[0]["severity"] == "HIGH"
+        # Dorks are now capped at MEDIUM (was HIGH) — too noisy at HIGH.
+        assert hits[0]["severity"] == "MEDIUM"
 
     def test_single_hit_below_min_threshold_is_dropped(self, monkeypatch):
         """Post-filter hit count < 2 → no finding emitted, regardless of dork.

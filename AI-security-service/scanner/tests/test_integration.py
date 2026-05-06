@@ -176,9 +176,11 @@ class TestGithubScan:
         import os, tempfile, time
         from unittest.mock import patch, MagicMock
 
-        # Pre-create fake repo dir with a file containing a real AWS-pattern secret
+        # Pre-create fake repo dir with a file containing a real AWS-pattern
+        # secret. Don't put "test"/"example"/"fixture" in the filename — those
+        # paths are intentionally skipped by the secret scanner.
         fake_dir = tempfile.mkdtemp()
-        with open(os.path.join(fake_dir, "test.env"), "w") as f:
+        with open(os.path.join(fake_dir, "prod.env"), "w") as f:
             f.write("AWS_KEY=" + "AKI" + "A" + ("Z" * 16))
 
         with patch("tempfile.mkdtemp", return_value=fake_dir), \

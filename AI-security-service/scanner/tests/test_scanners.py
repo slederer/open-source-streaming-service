@@ -40,17 +40,23 @@ class TestParseTargets:
 class TestNmapScanner:
     @patch("scanner.app.run_cmd")
     def test_parses_open_ports(self, mock_cmd):
+        # Standard web ports (80/443/8080/8443) are intentionally suppressed
+        # as findings — every web app has them, so they're noise. Only
+        # non-standard ports produce a finding.
         mock_cmd.return_value = """
 Nmap scan report for 10.0.0.1
 PORT     STATE SERVICE VERSION
 22/tcp   open  ssh     OpenSSH 8.9p1
 80/tcp   open  http    nginx 1.24.0
 443/tcp  open  ssl/http nginx 1.24.0
+3306/tcp open  mysql   MySQL 8.0
 """
         findings, raw = scan_target_nmap("r1", "10.0.0.1", "test")
-        assert len(findings) == 3
+        # Expect 22 + 3306 (80 and 443 suppressed as standard web ports)
+        assert len(findings) == 2
         assert all(f["severity"] == "INFO" for f in findings)
-        assert findings[0]["title"] == "Open port 22/tcp (ssh)"
+        titles = sorted(f["title"] for f in findings)
+        assert titles == ["Open port 22/tcp (ssh)", "Open port 3306/tcp (mysql)"]
 
     @patch("scanner.app.run_cmd")
     def test_flags_eol_nginx(self, mock_cmd):

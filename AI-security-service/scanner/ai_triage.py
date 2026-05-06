@@ -382,12 +382,20 @@ def scan_target_ai_triage(run_id: str, ip: str, name: str) -> list[dict]:
 
         new_sev = orig_sev
         new_title = f["title"]
-        if decision in ("false_positive", "likely_false_positive"):
-            # Demote: CRIT → LOW, HIGH → MEDIUM or LOW
-            demote_map_fp = {"CRITICAL": "LOW", "HIGH": "LOW"}
-            demote_map_lfp = {"CRITICAL": "MEDIUM", "HIGH": "MEDIUM"}
-            m = demote_map_fp if decision == "false_positive" else demote_map_lfp
-            new_sev = m.get(orig_sev, "LOW")
+        if decision == "false_positive":
+            # AI is confident this is a false positive. Delete entirely
+            # rather than demote — showing 500+ "[AI-FP]" findings in the
+            # MEDIUM/LOW dashboards just adds noise the user has to ignore.
+            try:
+                with _get_db() as db:
+                    db.execute("DELETE FROM findings WHERE id=?", (f["id"],))
+                triage_stats["demoted"] += 1
+            except Exception:
+                pass
+            continue
+        if decision == "likely_false_positive":
+            # Less confident; demote to LOW but flag with [AI-FP].
+            new_sev = "LOW"
             new_title = f"[AI-FP] {f['title']}"
             triage_stats["demoted"] += 1
         elif decision == "needs_verification":

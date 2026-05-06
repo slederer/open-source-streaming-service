@@ -1085,6 +1085,20 @@ def scan_target_waf_cdn(run_id: str, ip: str, name: str):
             "tool": "waf-cdn",
         })
     else:
+        # Skip platforms that have built-in edge protection (DDoS / WAF) even
+        # if their response headers don't include the standard CDN signatures.
+        # Flagging "no CDN" on Vercel, Replit, GAE, Render, Fly etc. is wrong.
+        platform_with_edge = (
+            ".appspot.com", ".replit.app", ".vercel.app", ".netlify.app",
+            ".fly.dev", ".pages.dev", ".firebaseapp.com", ".web.app",
+            ".deno.dev", ".workers.dev", ".bolt.host", ".lovable.app",
+            ".bubbleapps.io", ".webflow.io", ".framer.website", ".framer.app",
+            ".streamlit.app", ".base44.app", ".onrender.com",
+            ".up.railway.app", ".railway.app", ".herokuapp.com",
+        )
+        host_low = ip.lower()
+        if any(host_low.endswith(s) for s in platform_with_edge):
+            return findings
         findings.append({
             "target": ip, "severity": "LOW", "category": "edge-infra",
             "title": "No CDN or WAF in front of origin",

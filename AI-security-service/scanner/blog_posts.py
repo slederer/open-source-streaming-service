@@ -15,6 +15,102 @@ def _reading_time(html: str) -> int:
 
 POSTS = [
     {
+        "slug": "1630-vulnerable-apps-855-no-contact-path",
+        "title": "We scanned 5,850 web apps. 1,630 had critical issues. 855 of them have nowhere to receive a security report.",
+        "date": "2026-05-06",
+        "tag": "Findings",
+        "excerpt": (
+            "1,630 web apps have at least one critical or high-severity vulnerability. "
+            "We tried to disclose every one of them. After exhausting Apollo, HTML scraping, "
+            "WHOIS, DNS SOA, security.txt, and GitHub profile lookups, we can reach 775 owners. "
+            "The other 855 are deployed on platforms that route the public to the app but hide "
+            "the developer. There is no inbox to put a security report into."
+        ),
+        "body": """
+<p>This week we ran our biggest scan yet. 6,194 web apps queued, 5,850 successfully fingerprinted, 1,630 with at least one CRITICAL or HIGH finding. 159 had a CRITICAL. 1,471 had a HIGH but no CRITICAL. The rest had only MEDIUMs or were clean.</p>
+
+<p>The vulnerability mix was not surprising. Open admin panels, login endpoints with no rate limiting, Supabase tables with row-level security disabled, payment webhooks that accept unsigned events, hardcoded API keys baked into the JS bundle. The same playbook that has been broken for a decade.</p>
+
+<p>That is not the story. The story is what happened when we tried to email all 1,630.</p>
+
+<h2>The findings, briefly</h2>
+
+<p>Most of the HIGH severity total comes from auth issues. 3,162 of our 5,094 CRITICAL+HIGH findings live in the auth bucket. Some patterns from the batch:</p>
+
+<ul>
+<li><strong>1,646 login endpoints with no rate limiting.</strong> /login, /api/login, /auth/login, /api/auth/signin. We send 10 POSTs in 200ms. Status codes are all 401, no slow-down, no captcha, no lockout. Try a million passwords.</li>
+<li><strong>1,398 admin panels reachable without auth.</strong> /admin, /admin/dashboard, /panel, /internal, /wp-admin, /phpmyadmin, /_admin. Public to anyone who guesses the path.</li>
+<li><strong>252 Supabase databases with broken row-level security.</strong> Anonymous reads or writes on tables holding user data. We have written about this one before.</li>
+<li><strong>130 webhook endpoints that accept fake payment events.</strong> POST a checkout.session.completed without the signature header, get a 200 back. We blogged about that one yesterday.</li>
+<li><strong>55 API keys hardcoded in JS bundles.</strong> View source, grep for "key=" or "Bearer ". Use the key. Rate limit hits the company's bill, not yours.</li>
+<li><strong>184 endpoints leaking version, debug, or stack-trace info.</strong> /redoc, /swagger-ui.html, /api/debug/, verbose error pages.</li>
+</ul>
+
+<p>None of this is novel. Every line above is the same finding we file at every customer. The reason we keep filing it is that no one is fixing it at the population level.</p>
+
+<h2>Trying to tell anyone</h2>
+
+<p>Standard responsible disclosure: find a contact, email them with the finding, give them 90 days. We use a multi-stage pipeline because we have 1,630 apps to work through, not 1.</p>
+
+<p><strong>Stage 1: existing pool.</strong> We had emails on file for 185 of the 1,630 affected hosts from prior scans. 11.4%.</p>
+
+<p><strong>Stage 2: Apollo.</strong> For the 1,012 unenriched custom domains, we tried Apollo's people-search API. Apollo claims 100M+ professionals indexed. They returned exactly zero contacts for any of the 351 domains we queried (351 because the rest had findings but were on platform subdomains where org-domain enrichment does not apply). These apps are too small or too new to appear in any sales database.</p>
+
+<p><strong>Stage 3: scrape the app itself.</strong> We pulled the homepage, /about, /contact, /imprint, /privacy, /team, /humans.txt for each of the 661 platform-subdomain hosts. Looked for mailto: links, footer text, and email patterns inside the JS bundle. 124 hits, about 19% of platform-subdomain apps embed an author email somewhere on the page. The other 81% don't.</p>
+
+<p><strong>Stage 4: DNS and registrar lookups.</strong> For the 351 unenriched custom domains, we tried DNS SOA rname (the responsible-person email in the DNS authoritative record), WHOIS Registrant Email, /.well-known/security.txt, and /humans.txt. 33 total hits. Most WHOIS records are GDPR-redacted. Most DNS SOA rname fields point at the cloud provider (awsdns-hostmaster@amazon.com, msnhst@microsoft.com), not the developer. Most apps don't ship a security.txt.</p>
+
+<p><strong>Stage 5: GitHub profile.</strong> Some apps link to a github.com/&lt;user&gt; URL in the footer. We pulled the user's public profile and checked for a public email. 4 hits, of 50 GitHub API calls (we capped to stay under unauth rate limits).</p>
+
+<p>Final tally for this batch: 326 newly-found contacts plus the 185 we already had plus 264 we had emailed in earlier rounds equals 775 reachable affected hosts. <strong>The other 855 have no working channel.</strong> 695 are platform subdomains. 160 are custom domains where every channel returned nothing.</p>
+
+<h2>The platform-subdomain problem</h2>
+
+<p>Of the 855 we cannot contact, 695 are deployed on multi-tenant hosting platforms. The breakdown is illuminating:</p>
+
+<table style="width:100%;max-width:480px;border-collapse:collapse;margin:20px 0;font-size:0.9rem;">
+<tr><th style="text-align:left;padding:8px 12px;border-bottom:1px solid #1f2937;color:#9ca3af;font-weight:600;">Platform</th><th style="text-align:right;padding:8px 12px;border-bottom:1px solid #1f2937;color:#9ca3af;font-weight:600;">Affected hosts</th></tr>
+<tr><td style="padding:6px 12px;">lovable.app</td><td style="text-align:right;padding:6px 12px;">142</td></tr>
+<tr><td style="padding:6px 12px;">streamlit.app</td><td style="text-align:right;padding:6px 12px;">119</td></tr>
+<tr><td style="padding:6px 12px;">onrender.com</td><td style="text-align:right;padding:6px 12px;">93</td></tr>
+<tr><td style="padding:6px 12px;">replit.app</td><td style="text-align:right;padding:6px 12px;">74</td></tr>
+<tr><td style="padding:6px 12px;">herokuapp.com</td><td style="text-align:right;padding:6px 12px;">57</td></tr>
+<tr><td style="padding:6px 12px;">azurewebsites.net</td><td style="text-align:right;padding:6px 12px;">51</td></tr>
+<tr><td style="padding:6px 12px;">railway.app</td><td style="text-align:right;padding:6px 12px;">49</td></tr>
+<tr><td style="padding:6px 12px;">vercel.app</td><td style="text-align:right;padding:6px 12px;">43</td></tr>
+<tr><td style="padding:6px 12px;">netlify.app</td><td style="text-align:right;padding:6px 12px;">41</td></tr>
+<tr><td style="padding:6px 12px;">firebaseapp.com</td><td style="text-align:right;padding:6px 12px;">38</td></tr>
+<tr><td style="padding:6px 12px;">fly.dev</td><td style="text-align:right;padding:6px 12px;">34</td></tr>
+<tr><td style="padding:6px 12px;">appspot.com</td><td style="text-align:right;padding:6px 12px;">25</td></tr>
+<tr><td style="padding:6px 12px;">bolt.host</td><td style="text-align:right;padding:6px 12px;">19</td></tr>
+<tr><td style="padding:6px 12px;">deno.dev</td><td style="text-align:right;padding:6px 12px;">8</td></tr>
+<tr><td style="padding:6px 12px;">workers.dev</td><td style="text-align:right;padding:6px 12px;">5</td></tr>
+</table>
+
+<p>Each of these platforms gives developers a free or low-friction way to ship an app. That is great. None of them gives a security researcher a route to the app's owner. There is no <code>/.well-known/contact</code>, no per-app security email, no &quot;report a security issue&quot; link in the platform-supplied footer, no way to ask the platform to forward a message to the developer. The platforms have a security@ for issues with the platform itself, but not for issues with apps running on top of it.</p>
+
+<p>The result: a developer can ship an app on Lovable or Streamlit or Replit, expose 17 critical Supabase RLS misconfigurations to the public internet, and we have no way to tell them. Their users are at risk. The developer often does not know it. The platform sees the traffic but does not act because the platform's terms-of-service does not put them in the loop on individual app vulnerabilities.</p>
+
+<h2>What should change</h2>
+
+<p>Hosting platforms should add a per-app security contact channel. The bar is low.</p>
+
+<p><strong>Minimum:</strong> when a security researcher visits <code>https://&lt;app&gt;.lovable.app/.well-known/security-contact</code>, the platform returns a tokenized email address that forwards to whichever account deployed the app. The token can rotate. The address can rate-limit. The app owner can opt out. None of that requires the platform to expose the developer's identity. It just requires that messages to that address get to the right human.</p>
+
+<p><strong>Better:</strong> the platform's deploy UI prompts new users for a security contact email at sign-up, and the platform serves a generated <code>security.txt</code> at the app's apex with that email. Most platforms already prompt for billing email and notification email. One more field.</p>
+
+<p><strong>Best:</strong> the platform runs its own automated scan against new deploys and surfaces findings in the developer's dashboard before anyone else can find them. We would be out of a job for that segment, which is fine.</p>
+
+<p>Until something like this exists, half of the security issues we find on hosted-platform apps are going to stay shipped. We will keep scanning, we will keep enriching, we will keep emailing the ones we can. For the 855 we cannot reach this round, we are open to suggestions.</p>
+
+<h2>Notes on method</h2>
+
+<p>The 5,850 figure is targets that completed at least one full scan run. The other 344 in the input list either failed DNS, refused all requests, or 5xx'd through the entire scan window. Our affected count of 1,630 is unique hosts with at least one finding in CRITICAL or HIGH after a 16-module sweep that includes auth-bypass, supabase-audit, payment-bypass, openapi-audit, secret-scan, login-bruteforce, admin-panel, and the rest.</p>
+
+<p>If you are running an app on one of the platforms above and you are wondering whether your app is in the unreachable 855, run the scanner: <a href="https://securityscanner.dev/" style="color:#dc2626;">securityscanner.dev</a>. It is free for the first scan. If you want a contact channel set up for your platform, email <a href="mailto:stefan@securityscanner.dev" style="color:#dc2626;">stefan@securityscanner.dev</a>.</p>
+""",
+    },
+    {
         "slug": "stripe-webhook-signature-bypass-1500-apps",
         "title": "We probed 6,000 web apps for Stripe webhook signature checks. 1,542 don't bother.",
         "date": "2026-05-05",

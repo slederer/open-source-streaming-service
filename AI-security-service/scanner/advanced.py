@@ -3525,9 +3525,16 @@ def scan_target_admin_panel(run_id: str, ip: str, name: str, ctx=None) -> list[d
         # Require 2+ markers OR strong single marker. Single-marker matches against
         # generic words ("dashboard", "users") in a footer/header are too weak.
         matched_markers = [m for m in markers if m.lower() in body_lower]
+        # The strong-marker check has to be on matched_markers, not the raw
+        # body — otherwise a marketing site that happens to mention "user
+        # emails" anywhere passes via '"email"' even though the JSON-shaped
+        # marker isn't actually structurally present.
         strong_single_markers = ("admin panel", "phpmyadmin", "wp-admin", "backstage",
                                   '"email"', '"setting"')
-        has_strong_single = any(m.lower() in body_lower for m in strong_single_markers)
+        has_strong_single = any(
+            m.lower() in [mm.lower() for mm in matched_markers]
+            for m in strong_single_markers
+        )
         if not matched_markers:
             continue
         if len(matched_markers) < 2 and not has_strong_single:

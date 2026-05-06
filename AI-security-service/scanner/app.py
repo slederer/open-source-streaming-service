@@ -72,7 +72,12 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
     max_age=86400 * 7,
-    same_site="none",
+    # SameSite=Lax blocks cross-site POSTs from carrying the session cookie,
+    # which gives us CSRF protection without per-form tokens. Top-level GETs
+    # and the OAuth redirect-back flow still work (those are GET navigations).
+    # Was "none" + https_only — that allowed any site to send credentialed
+    # POSTs to /api/billing/checkout, /api/scan, /api/admin/*, etc.
+    same_site="lax",
     https_only=True,
 )
 
@@ -3889,12 +3894,15 @@ async def login_page(request: Request):
     user = get_user(request)
     if user:
         next_url = request.query_params.get("next", "/")
-        return RedirectResponse(next_url if next_url.startswith("/") else "/")
+        # Reject protocol-relative URLs ("//evil.com") as well — they pass the
+        # startswith("/") check but redirect to an external host.
+        safe = next_url.startswith("/") and not next_url.startswith("//")
+        return RedirectResponse(next_url if safe else "/")
     error = request.query_params.get("error", "")
     verified = request.query_params.get("verified", "")
     # Preserve ?next= through the Google OAuth round-trip
     login_next = request.query_params.get("next", "")
-    if login_next and login_next.startswith("/"):
+    if login_next and login_next.startswith("/") and not login_next.startswith("//"):
         request.session["login_next"] = login_next
     alert = ""
     if error:
@@ -4298,7 +4306,7 @@ async def auth_callback(request: Request):
         from urllib.parse import urlencode
         return RedirectResponse(f"/oauth/authorize?{urlencode(pending)}")
     login_next = request.session.pop("login_next", "")
-    if login_next and login_next.startswith("/"):
+    if login_next and login_next.startswith("/") and not login_next.startswith("//"):
         return RedirectResponse(login_next)
     return RedirectResponse("/")
 
@@ -4438,7 +4446,7 @@ async def login(request: Request):
         from urllib.parse import urlencode
         return {"ok": True, "redirect": f"/oauth/authorize?{urlencode(pending)}"}
     login_next = request.session.pop("login_next", "")
-    if login_next and login_next.startswith("/"):
+    if login_next and login_next.startswith("/") and not login_next.startswith("//"):
         return {"ok": True, "redirect": login_next}
     return {"ok": True}
 
@@ -4639,26 +4647,55 @@ async def stripe_webhook(request: Request):
     # empty dict, causing every paid checkout to land but never upgrade the
     # user. Switched to json.loads(json.dumps(...)) which is plan-version-
     # independent and handles both dict and StripeObject inputs.
+    def _stripe_default(o):
+        if hasattr(o, "to_dict"):
+            return o.to_dict()
+        if hasattr(o, "items"):
+            return dict(o)
+        return str(o)
+
     if isinstance(event, dict):
         event_type = event.get("type", "")
+        event_id = event.get("id", "")
         data = event.get("data", {}).get("object", {}) or {}
     else:
         event_type = getattr(event, "type", "") or ""
+        event_id = getattr(event, "id", "") or ""
         try:
-            # stripe-python: every StripeObject has a .to_dict() that returns a
-            # plain dict for the immediate level. For deep normalisation we
-            # round-trip via JSON.
             raw = event.to_dict() if hasattr(event, "to_dict") else event
             data = (raw.get("data", {}) if isinstance(raw, dict) else {}).get("object", {}) or {}
-            # If `data` is still a StripeObject, force-normalise via JSON.
             if not isinstance(data, dict):
-                data = json.loads(json.dumps(data, default=lambda o: dict(o) if hasattr(o, "items") else str(o)))
+                data = json.loads(json.dumps(data, default=_stripe_default))
         except Exception as e:
+            # Return 500 so Stripe retries — the prior code returned 200 with
+            # data={}, which silently dropped paid checkouts under any unusual
+            # StripeObject shape.
             print(f"[stripe-webhook] event normalize failed: {e}", flush=True)
-            data = {}
+            return JSONResponse({"error": "normalize failed"}, status_code=500)
 
-    print(f"[stripe-webhook] event={event_type} customer={data.get('customer')} "
-          f"metadata={data.get('metadata')}", flush=True)
+    # Idempotency: dedupe by Stripe event id so retries don't double-credit.
+    # Stripe retries failed webhooks for up to 3 days. Without this, a 5xx
+    # blip downstream (or our own normaliser bug as we just hit) replays
+    # scan_credit grants and plan_expires_at extensions every retry.
+    if event_id:
+        with get_db() as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS processed_stripe_events ("
+                "event_id TEXT PRIMARY KEY, event_type TEXT, "
+                "processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+            )
+            try:
+                db.execute(
+                    "INSERT INTO processed_stripe_events (event_id, event_type) VALUES (?, ?)",
+                    (event_id, event_type),
+                )
+            except Exception:
+                # Already processed — return 200 so Stripe doesn't retry.
+                print(f"[stripe-webhook] duplicate event {event_id} ignored", flush=True)
+                return {"received": True, "duplicate": True}
+
+    print(f"[stripe-webhook] event={event_type} id={event_id} "
+          f"customer={data.get('customer')}", flush=True)
 
     if event_type == "checkout.session.completed":
         metadata = data.get("metadata") or {}
@@ -4768,14 +4805,25 @@ async def resend_webhook(request: Request):
 
 
 def _verify_svix(secret: str, headers, body: bytes) -> bool:
-    """Verify Svix-style webhook signature shared by Resend send + inbound."""
+    """Verify Svix-style webhook signature shared by Resend send + inbound.
+
+    Includes a 5-minute timestamp tolerance check to prevent replay attacks
+    on captured signed requests.
+    """
     if not secret:
         return True
     try:
-        import hmac, hashlib, base64
+        import hmac, hashlib, base64, time as _time
         sig = headers.get("svix-signature", "")
         msg_id = headers.get("svix-id", "")
         ts = headers.get("svix-timestamp", "")
+        # Reject messages older than 5 minutes (replay protection)
+        try:
+            ts_int = int(ts)
+            if abs(int(_time.time()) - ts_int) > 300:
+                return False
+        except (ValueError, TypeError):
+            return False
         signed = f"{msg_id}.{ts}.{body.decode()}".encode()
         key = base64.b64decode(secret.split("_", 1)[-1])
         expected = "v1," + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
@@ -4798,7 +4846,12 @@ async def resend_inbound_webhook(request: Request):
     """
     body = await request.body()
     secret = os.getenv("RESEND_INBOUND_SECRET", os.getenv("RESEND_WEBHOOK_SECRET", "")).strip()
-    if secret and not _verify_svix(secret, request.headers, body):
+    # In production, refuse to process inbound mail if no secret is configured —
+    # otherwise anyone can POST email payloads and pollute /inbox.
+    if not secret:
+        if ENVIRONMENT == "production":
+            return JSONResponse({"error": "inbound not configured"}, status_code=503)
+    elif not _verify_svix(secret, request.headers, body):
         return JSONResponse({"error": "bad signature"}, status_code=401)
 
     try:
@@ -4909,7 +4962,14 @@ async def cf_inbound_webhook(request: Request):
     """
     raw = await request.body()
     secret_required = os.getenv("CF_EMAIL_WEBHOOK_SECRET", "").strip()
-    if secret_required:
+    # In production, refuse to accept inbound mail if the secret is unset.
+    # Otherwise anyone can POST raw MIME and pollute the inbox or trick the
+    # admin into replying-to-arbitrary-addresses via /api/inbox/{id}/reply.
+    if not secret_required:
+        if ENVIRONMENT == "production":
+            return JSONResponse({"error": "inbound not configured"}, status_code=503)
+        # Dev-only escape hatch — allow processing for local testing.
+    else:
         provided = request.headers.get("x-inbound-secret", "").strip()
         if not hmac_safe_eq(provided, secret_required):
             return JSONResponse({"error": "bad secret"}, status_code=401)
@@ -5067,6 +5127,13 @@ async def api_inbox_reply(request: Request, msg_id: int):
     user = _require_admin(request)
     if not user:
         return JSONResponse({"error": "Forbidden"}, status_code=403)
+    # Rate limit even admin replies. A compromised admin session would
+    # otherwise be unlimited send via the product's domain reputation.
+    ok, retry = rate_limit(f"inbox_reply:{user.get('email','')}",
+                            max_events=30, window_seconds=600)
+    if not ok:
+        return JSONResponse({"error": "Too many replies. Try again later.",
+                             "retry_after": retry}, status_code=429)
     try:
         payload = await request.json()
     except Exception:
@@ -5085,6 +5152,14 @@ async def api_inbox_reply(request: Request, msg_id: int):
         return JSONResponse({"error": "Not found"}, status_code=404)
     msg = dict(row)
 
+    # Validate the original sender's address parses as a single mailbox.
+    # The Resend "to" field gets this directly; a malformed value like
+    # "attacker@a.com>, victim@b.com" could be misinterpreted as multi-recipient
+    # depending on Resend's library handling.
+    raw_to = (msg.get("from_addr") or "").strip()
+    if not re.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", raw_to):
+        return JSONResponse({"error": "invalid sender address"}, status_code=400)
+
     # Reply From = the original "to" address. Falls back to noreply@ if it's
     # an external-looking address.
     our_domain = "@securityscanner.dev"
@@ -5092,11 +5167,16 @@ async def api_inbox_reply(request: Request, msg_id: int):
     if not reply_from_addr.lower().endswith(our_domain):
         reply_from_addr = "stefan@securityscanner.dev"
     sender_name = (user.get("name") or "Stefan Lederer").split("<")[0].strip()
+    # Strip CRLF from name to prevent header injection.
+    sender_name = sender_name.replace("\r", "").replace("\n", "")[:120]
     from_header = f"{sender_name} <{reply_from_addr}>"
 
     subject = msg["subject"] or ""
     if not subject.lower().startswith("re:"):
         subject = "Re: " + subject
+    # Strip CRLF from subject — prevents SMTP header injection if Resend's
+    # downstream library doesn't fully sanitise.
+    subject = subject.replace("\r", " ").replace("\n", " ")[:300]
 
     # References: original references + original message_id, joined with space
     refs_chain = []
@@ -5106,11 +5186,16 @@ async def api_inbox_reply(request: Request, msg_id: int):
         refs_chain.append(msg["message_id"])
     refs_chain = list(dict.fromkeys(refs_chain))  # de-dupe preserving order
 
+    # Reject CRLF in any chained header value — these come from arbitrary
+    # inbound mail and could carry injection payloads.
+    def _safe_hdr(v):
+        return (v or "").replace("\r", "").replace("\n", "")[:998]
+
     headers = {}
     if msg.get("message_id"):
-        headers["In-Reply-To"] = msg["message_id"]
+        headers["In-Reply-To"] = _safe_hdr(msg["message_id"])
     if refs_chain:
-        headers["References"] = " ".join(refs_chain)
+        headers["References"] = _safe_hdr(" ".join(refs_chain))
 
     # Build HTML body: user's plain text, with a quoted block of the original
     import html as _html_mod
@@ -5136,7 +5221,7 @@ async def api_inbox_reply(request: Request, msg_id: int):
 
     payload_to_resend = {
         "from": from_header,
-        "to": [msg["from_addr"]],
+        "to": [raw_to],  # validated above
         "subject": subject,
         "html": body_html,
         "text": body_text,
@@ -11583,6 +11668,14 @@ async def newsletter_signup(request: Request):
     """Double-opt-in newsletter signup. Stores email locally as pending,
     sends a confirmation email via Resend. Recipient must click the link
     to confirm — only then do we add them to the Resend audience."""
+    # Rate limit. The endpoint sends a Resend confirmation email per
+    # request; without this an attacker can mail-bomb arbitrary recipients
+    # AND burn through the Resend send quota.
+    ip = client_ip(request)
+    ok_ip, retry_ip = rate_limit(f"newsletter_ip:{ip}", max_events=5, window_seconds=600)
+    if not ok_ip:
+        return JSONResponse({"error": "Too many requests. Try again later.",
+                             "retry_after": retry_ip}, status_code=429)
     try:
         data = await request.json()
     except Exception:
@@ -11591,6 +11684,13 @@ async def newsletter_signup(request: Request):
     source = (data.get("source") or "landing")[:50]
     if "@" not in email or "." not in email.split("@")[-1] or len(email) < 5:
         return JSONResponse({"error": "Please enter a valid email address."}, status_code=400)
+    # Per-email rate limit — one confirmation email per address per hour
+    # so an attacker can't keep retriggering "confirm subscription" emails
+    # to the same victim.
+    ok_em, retry_em = rate_limit(f"newsletter_em:{email}", max_events=1, window_seconds=3600)
+    if not ok_em:
+        return JSONResponse({"error": "Already requested. Check your inbox.",
+                             "retry_after": retry_em}, status_code=429)
     try:
         with get_db() as db:
             db.execute(

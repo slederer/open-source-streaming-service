@@ -98,9 +98,12 @@ class TestHeadersScanner:
 
     @patch("scanner.app.run_cmd")
     def test_detects_missing_headers(self, mock_cmd):
+        # Module now skips port 80 missing-header findings (HTTP usually
+        # redirects to HTTPS so the headers there are noise). Test against
+        # port 443 instead, which is where the real findings live.
         def side_effect(cmd, timeout=300):
             url = cmd[4] if len(cmd) > 4 else ""
-            if "http://10.0.0.1:80/" in url:
+            if "https://10.0.0.1:443/" in url or "https://10.0.0.1/" in url:
                 return "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
             return ""
         mock_cmd.side_effect = side_effect

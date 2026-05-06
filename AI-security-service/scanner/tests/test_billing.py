@@ -123,6 +123,35 @@ class TestStripeWebhook:
         assert row["plan"] == "monthly"
         assert row["plan_expires_at"] is not None
 
+    def test_webhook_idempotent_on_replay(self, anon_client, db):
+        """Stripe retries failed webhooks for up to 3 days. The handler must
+        dedupe by event id so credits are not granted twice on replay."""
+        fake_stripe = MagicMock()
+
+        import json as j
+        payload = j.dumps({
+            "id": "evt_test_idempotency_001",
+            "type": "checkout.session.completed",
+            "data": {"object": {"metadata": {"user_id": "test-user-id-12345",
+                                              "plan": "payg"}}},
+        }).encode()
+
+        with patch("scanner.app._get_stripe", return_value=fake_stripe), \
+             patch("scanner.app.STRIPE_WEBHOOK_SECRET", ""):
+            r1 = anon_client.post("/api/stripe/webhook", content=payload,
+                                   headers={"stripe-signature": "t=0,v1=x"})
+            r2 = anon_client.post("/api/stripe/webhook", content=payload,
+                                   headers={"stripe-signature": "t=0,v1=x"})
+
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r2.json().get("duplicate") is True
+        # Credits granted exactly once across two deliveries of the same event
+        row = db.execute(
+            "SELECT scan_credits FROM users WHERE id='test-user-id-12345'"
+        ).fetchone()
+        assert row["scan_credits"] == 1
+
     def test_webhook_subscription_deleted_downgrades_to_free(self, anon_client, db):
         fake_stripe = MagicMock()
 

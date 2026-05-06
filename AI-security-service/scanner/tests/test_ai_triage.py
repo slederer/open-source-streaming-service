@@ -118,7 +118,7 @@ class TestTriageFinding:
 # ── scan_target_ai_triage (end-to-end mutation of findings) ────────────────
 
 class TestAiTriageMutatesFindings:
-    def test_false_positive_gets_demoted(self, tmp_db, monkeypatch):
+    def test_false_positive_gets_deleted(self, tmp_db, monkeypatch):
         from scanner.ai_triage import scan_target_ai_triage
         monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
         rid = _seed_run(tmp_db, findings=[
@@ -166,12 +166,12 @@ class TestAiTriageMutatesFindings:
         finally:
             conn.close()
         titles = {t: s for s, t in rows}
-        # Demoted admin finding
+        # Confident-FP finding should now be DELETED entirely (was previously
+        # demoted + tagged [AI-FP]; the dashboard noise was too high so we
+        # changed the contract).
         admin_titles = [k for k in titles if "admin subdomain" in k.lower()]
-        assert admin_titles, "admin finding should still exist"
-        assert titles[admin_titles[0]] in ("LOW", "MEDIUM")
-        assert admin_titles[0].startswith("[AI-FP"), \
-            f"demoted finding should have [AI-FP] prefix, got: {admin_titles[0]}"
+        assert not admin_titles, \
+            f"confident-FP finding should be deleted, got: {admin_titles}"
 
         # Kept CRITICAL finding
         db_titles = [k for k in titles if "database dump" in k.lower()]

@@ -389,10 +389,17 @@ def scan_target_ai_triage(run_id: str, ip: str, name: str) -> list[dict]:
             try:
                 with _get_db() as db:
                     db.execute("DELETE FROM findings WHERE id=?", (f["id"],))
+                triage_stats["deleted"] = triage_stats.get("deleted", 0) + 1
+            except Exception as e:
+                # Log so silent failures are visible. Fall through to the
+                # demote+tag path so the finding at least gets de-prioritised
+                # if DELETE failed (locked DB, transient I/O).
+                print(f"[ai-triage] DELETE failed for finding {f.get('id')}: {e}", flush=True)
+                new_sev = "LOW"
+                new_title = f"[AI-FP] {f['title']}"
                 triage_stats["demoted"] += 1
-            except Exception:
-                pass
-            continue
+            else:
+                continue
         if decision == "likely_false_positive":
             # Less confident; demote to LOW but flag with [AI-FP].
             new_sev = "LOW"

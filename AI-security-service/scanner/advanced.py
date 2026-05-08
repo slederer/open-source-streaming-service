@@ -15,7 +15,7 @@ import json
 import os
 import re
 import socket
-import subprocess
+import subprocess as _real_subprocess
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,16 +23,94 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 
-_UA = "SecurityScannerBot/1.0 (+https://securityscanner.dev)"
+# AUP guard: force every `curl` invocation in this module to identify as
+# our scanner and respect the per-target rate budget, regardless of which
+# call site is firing. Wraps subprocess.run so existing modules that build
+# bare ["curl", ...] argv lists pick this up automatically. The rate
+# limiter is defined just below; we reference it lazily via the module
+# globals to avoid the forward-reference order.
+class _SubprocessShim:
+    def __getattr__(self, name):
+        return getattr(_real_subprocess, name)
+    def run(self, args, *a, **kw):
+        try:
+            if isinstance(args, (list, tuple)) and args and args[0] == "curl":
+                # Identify as our scanner everywhere. If the call has its
+                # own -A we leave it (intentional override), but our policy
+                # is to NEVER set anything other than _UA going forward.
+                argv = list(args)
+                # Resolve URL from argv to enforce rate limit. Use last arg
+                # that starts with http/https as the heuristic; refine if
+                # multiple URLs are present.
+                for tok in reversed(argv):
+                    if isinstance(tok, str) and tok.startswith(("http://", "https://")):
+                        host = _host_of(tok)
+                        if host and not _rate_check_and_record(host):
+                            # Quietly drop — return a no-op CompletedProcess
+                            return _real_subprocess.CompletedProcess(args, 1, '', '')
+                        break
+                # Inject our UA if not already explicit
+                if "-A" not in argv:
+                    # Insert after the curl program name
+                    argv = [argv[0], "-A", _UA] + argv[1:]
+                args = argv
+        except Exception:
+            pass
+        return _real_subprocess.run(args, *a, **kw)
+
+subprocess = _SubprocessShim()
+
+
+_UA = "SecurityScannerBot/1.0 (+https://securityscanner.dev/scanner)"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Shared helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Per-target sliding-window rate limiter. Caps every probe routed through
+# _curl so no single host can be hit faster than the AUP-friendly budget,
+# regardless of which module is firing. Documented at /scanner.
+import threading as _th
+_RATE_LOCK = _th.Lock()
+_RATE_HITS: dict[str, list[float]] = {}  # host -> sorted list of monotonic timestamps
+_RATE_5MIN_CAP = 100   # max requests per 5-minute sliding window per host
+_RATE_24H_CAP  = 500   # max requests per 24h sliding window per host
+
+def _host_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+def _rate_check_and_record(host: str) -> bool:
+    """Return True if the request is within budget (and record it).
+    Return False if either the 5-min or 24h cap would be exceeded."""
+    if not host:
+        return True
+    import time as _time
+    now = _time.monotonic()
+    cutoff_5m = now - 300
+    cutoff_24h = now - 86400
+    with _RATE_LOCK:
+        hits = _RATE_HITS.get(host, [])
+        # Drop entries older than 24h
+        hits = [t for t in hits if t > cutoff_24h]
+        n_5m = sum(1 for t in hits if t > cutoff_5m)
+        if n_5m >= _RATE_5MIN_CAP or len(hits) >= _RATE_24H_CAP:
+            _RATE_HITS[host] = hits  # save trimmed list
+            return False
+        hits.append(now)
+        _RATE_HITS[host] = hits
+        return True
+
+
 def _curl(url: str, *, timeout: int = 6, head: bool = False,
           max_bytes: int = 500_000, extra_args: Optional[list] = None) -> tuple[str, str, str]:
-    """Fetch a URL. Returns (status_code, content_type, body)."""
+    """Fetch a URL. Returns (status_code, content_type, body).
+    The subprocess shim above enforces the per-target rate limit, so all
+    callers automatically respect the AUP-friendly budget."""
     cmd = ["curl", "-sk", "-L", "--max-time", str(timeout),
            "--max-filesize", str(max_bytes), "-A", _UA]
     if head:

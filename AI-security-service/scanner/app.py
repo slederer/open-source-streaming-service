@@ -13495,6 +13495,187 @@ async function submitContact(e) {{
 </body></html>"""
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# /scanner — public AUP-friendly page documenting source IPs, methodology,
+# rate caps, and opt-out routes. Linked from the User-Agent header.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SCANNER_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scanner — securityscanner.dev</title>
+<meta name="description" content="Source IPs, methodology, rate limits, and opt-out for the securityscanner.dev research scanner.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>""" + _BLOG_CSS + """
+  .kvbox { background:#111827; border:1px solid #1f2937; border-radius:10px; padding:18px 22px; margin:18px 0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.85rem; color:#e5e7eb; }
+  .kvbox b { color:#9ca3af; font-weight:600; }
+  .optout-card { background:#0a0e17; border:1px solid #dc262644; border-radius:12px; padding:22px; margin:24px 0; }
+  .optout-card h3 { color:#dc2626; margin:0 0 10px 0; }
+  form.optout { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  form.optout input[type=text] { flex:1; min-width:240px; background:#0a0e17; border:1px solid #1f2937; color:#e5e7eb; padding:11px 14px; border-radius:8px; font-size:0.95rem; font-family:inherit; }
+  form.optout button { background:#dc2626; color:white; border:none; padding:11px 22px; border-radius:8px; font-weight:600; cursor:pointer; font-family:inherit; }
+  form.optout button:disabled { background:#6b7280; cursor:not-allowed; }
+</style></head>
+<body>""" + _render_blog_nav() + """
+<div class="post-wrap">
+  <a href="/" class="back-link">← Home</a>
+  <header class="post-header">
+    <h1 class="post-title">Scanner: source, scope, opt-out</h1>
+    <p class="lead">If our scanner reached your host and you want to know what it does, who runs it, or how to make it stop, this page is the answer.</p>
+  </header>
+  <article>
+    <h2>Source IP and User-Agent</h2>
+    <div class="kvbox">
+      <b>Source IP:</b> 44.195.165.192 (AWS us-east-1, single fixed Elastic IP)<br>
+      <b>Reverse DNS:</b> ec2-44-195-165-192.compute-1.amazonaws.com<br>
+      <b>User-Agent:</b> SecurityScannerBot/1.0 (+https://securityscanner.dev/scanner)<br>
+      <b>Operator:</b> Stefan Lederer, Vienna, Austria<br>
+      <b>Contact:</b> stefan@securityscanner.dev / abuse@securityscanner.dev
+    </div>
+
+    <h2>Rate budget per host</h2>
+    <p>Hard caps enforced before any probe fires:</p>
+    <div class="kvbox">
+      <b>Per 5 min sliding window:</b> 100 requests<br>
+      <b>Per 24h sliding window:</b>   500 requests
+    </div>
+    <p>If a scan would exceed the cap, the remaining probes are dropped and the run is finalised with whatever modules completed cleanly. We never overrun.</p>
+
+    <h2>What the scanner does (and does not do)</h2>
+    <p>The scanner is an external HTTP probe with about 16 modules. It only inspects publicly-reachable surfaces:</p>
+    <ul>
+      <li>HTTP security headers, TLS certificate health, CORS, CSP</li>
+      <li>OpenAPI / Swagger / GraphQL endpoint discovery</li>
+      <li>Common admin paths and unauthenticated API endpoints</li>
+      <li>Webhook signature verification (Stripe, Paddle, LemonSqueezy)</li>
+      <li>Supabase row-level-security configuration check (anon-key reads)</li>
+      <li>JS bundle inspection for hardcoded credentials</li>
+      <li>Login rate-limit testing (a small burst against published login URLs)</li>
+      <li>Single low-token prompt-injection probe against LLM-shaped endpoints</li>
+    </ul>
+    <p>It does not authenticate, does not exploit, does not exfiltrate, does not pivot, does not persist, does not modify state, and does not run any module that costs the target money.</p>
+
+    <h2>Disclosure pipeline</h2>
+    <p>When we find HIGH or CRITICAL findings, we try to email the app owner before publishing anything. The methodology and the disclosure-coverage problem (53% of vulnerable apps have no contact path) is documented at <a href="/blog/1630-vulnerable-apps-855-no-contact-path" style="color:#dc2626;">/blog/1630-vulnerable-apps-855-no-contact-path</a>.</p>
+
+    <h2>Data retention</h2>
+    <ul>
+      <li>One-shot scans on our service: results retained 90 days, then auto-purged</li>
+      <li>Customer-paid scans: retained for the lifetime of the customer's account</li>
+      <li>Inbox / disclosure correspondence: retained 24 months for accountability</li>
+      <li>Hosts that opt out (any of the routes below) have all findings deleted within 24 hours</li>
+    </ul>
+
+    <h2 id="optout">How to opt out</h2>
+    <p>Three routes, any one of them works. All purge existing findings and prevent future scans within 24 hours.</p>
+    <ol>
+      <li>Email <a href="mailto:abuse@securityscanner.dev" style="color:#dc2626;">abuse@securityscanner.dev</a> with the host or domain you want excluded.</li>
+      <li>Reply &quot;stop&quot; (any case) to a disclosure email we sent you.</li>
+      <li>Publish a non-empty file at <code>/.well-known/scanner-optout</code> on the host.</li>
+      <li>Or use the form below.</li>
+    </ol>
+
+    <div class="optout-card" id="optout-form">
+      <h3>Opt out by hostname</h3>
+      <p>Enter the host (with or without a scheme). We add it to the permanent exclusion list, delete any prior findings, and block future scans.</p>
+      <form class="optout" id="optout-fm" onsubmit="return doOptout(event)">
+        <input type="text" name="host" required placeholder="example.com or app.example.com" id="optout-host">
+        <button type="submit" id="optout-btn">Opt out</button>
+      </form>
+      <div id="optout-result" style="margin-top:14px;font-size:0.9rem;"></div>
+    </div>
+    <script>
+    async function doOptout(e) {
+      e.preventDefault();
+      var host = document.getElementById('optout-host').value.trim();
+      if (!host) return false;
+      var btn = document.getElementById('optout-btn');
+      var out = document.getElementById('optout-result');
+      btn.disabled = true; btn.textContent = 'Submitting…';
+      try {
+        var r = await fetch('/api/scanner-optout', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({host: host})
+        });
+        var d = await r.json().catch(function(){return {error:'bad response'};});
+        if (r.ok) {
+          out.innerHTML = '<span style="color:#22c55e;">Got it. ' + (d.host || host) + ' is excluded. Existing findings will be deleted within 24 hours.</span>';
+          document.getElementById('optout-host').value = '';
+        } else {
+          out.innerHTML = '<span style="color:#dc2626;">Error: ' + (d.error || 'unknown') + '</span>';
+        }
+      } catch (err) {
+        out.innerHTML = '<span style="color:#dc2626;">Network error. Email abuse@securityscanner.dev instead.</span>';
+      }
+      btn.disabled = false; btn.textContent = 'Opt out';
+      return false;
+    }
+    </script>
+
+    <h2>If you saw the scanner do something unexpected</h2>
+    <p>Email <a href="mailto:abuse@securityscanner.dev" style="color:#dc2626;">abuse@securityscanner.dev</a> with as much detail as you can share (timestamp, source IP we hit you from, sample request log line). I respond within 24 hours.</p>
+  </article>
+</div>
+</body></html>"""
+
+
+@app.get("/scanner", response_class=HTMLResponse)
+async def scanner_info_page():
+    return HTMLResponse(_SCANNER_PAGE_HTML)
+
+
+@app.post("/api/scanner-optout")
+async def scanner_optout(request: Request):
+    """Add a host to the scanner exclusion list. Idempotent. No auth: anyone
+    can opt out any host they own. Findings on the host are queued for
+    deletion within 24h via the cron-side cleanup."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    host_raw = (body.get("host") or "").strip().lower()
+    # Strip scheme + path
+    host = re.sub(r"^https?://", "", host_raw).split("/")[0].split(":")[0]
+    if not host or len(host) > 253 or "@" in host or " " in host:
+        return JSONResponse({"error": "invalid hostname"}, status_code=400)
+    # Per-IP rate limit so the form is not a DoS vector
+    ok, _ = rate_limit(f"optout:{client_ip(request)}", max_events=20, window_seconds=3600)
+    if not ok:
+        return JSONResponse({"error": "too many requests"}, status_code=429)
+    # Record in scanner_optouts table (created lazily)
+    with get_db() as db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS scanner_optouts ("
+            "  host TEXT PRIMARY KEY, "
+            "  source TEXT, "
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO scanner_optouts (host, source) VALUES (?, 'web-form')",
+            (host,),
+        )
+    # Best-effort: notify via email so we have a paper trail
+    try:
+        resend_key = os.getenv("RESEND_API_KEY", "").strip()
+        if resend_key:
+            import httpx
+            httpx.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {resend_key}",
+                         "Content-Type": "application/json"},
+                json={
+                    "from": "Scanner Opt-Out <stefan@securityscanner.dev>",
+                    "to": ["stefan@securityscanner.dev"],
+                    "subject": f"Scanner opt-out: {host}",
+                    "text": f"New opt-out via /scanner form\n\nHost: {host}\nSource IP: {client_ip(request)}\n",
+                },
+                timeout=10,
+            )
+    except Exception:
+        pass
+    return {"ok": True, "host": host}
+
+
 @app.get("/contact", response_class=HTMLResponse)
 async def contact_page():
     return HTMLResponse(_CONTACT_HTML)

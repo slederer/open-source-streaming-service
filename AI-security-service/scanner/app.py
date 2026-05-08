@@ -3071,18 +3071,27 @@ def _post_scan_fp_filter(run_id: str, ctx: dict):
         with get_db() as db:
             for cond in suppressions:
                 db.execute(f"DELETE FROM findings WHERE run_id=? AND ({cond})", (run_id,))
-            # Cluster-FP heuristic: a single host with 4+ HIGH/CRIT findings
-            # from one of the API-discovery modules is almost always a SPA
-            # returning 200 to every probed path (debug/dev/internal/staging
-            # /test/private/etc all hit the same fallback). Real apps don't
-            # simultaneously ship 4 different internal API surfaces. Drop
-            # the cluster. Applies to api-enum (path-based), auth-bypass
-            # (PII-without-auth), and idor-probe (per-ID).
-            for tool in ("api-enum", "auth-bypass", "idor-probe"):
+            # Cluster-FP heuristic: a single host with N+ HIGH/CRIT findings
+            # from one of the path-enumeration modules is almost always a
+            # SPA/echo-fallback returning 200 to every probed path. Real
+            # apps don't simultaneously ship many parallel auth/admin/
+            # webhook surfaces. Threshold tuned per-tool for safety.
+            cluster_rules = (
+                # tool, threshold: tighter (4) for path-enum modules where
+                # any cluster is suspicious; looser (5) for payment-bypass
+                # and admin-panel where 3-4 endpoints might be legitimate.
+                ("api-enum",        4),
+                ("auth-bypass",     4),
+                ("idor-probe",      4),
+                ("payment-bypass",  5),
+                ("admin-panel",     5),
+            )
+            for tool, threshold in cluster_rules:
                 rows = db.execute(
                     "SELECT target FROM findings WHERE run_id=? AND tool=? "
-                    "AND severity IN ('CRITICAL','HIGH') GROUP BY target HAVING COUNT(*) >= 4",
-                    (run_id, tool),
+                    "AND severity IN ('CRITICAL','HIGH') "
+                    "GROUP BY target HAVING COUNT(*) >= ?",
+                    (run_id, tool, threshold),
                 ).fetchall()
                 for row in rows:
                     db.execute(
@@ -3090,6 +3099,22 @@ def _post_scan_fp_filter(run_id: str, ctx: dict):
                         "AND tool=? AND severity IN ('CRITICAL','HIGH')",
                         (run_id, row[0], tool),
                     )
+
+            # ai-js: Supabase anon-key misclassification. The Supabase anon
+            # JWT (role:"anon") is intentionally public — security comes
+            # from row-level security, not key secrecy. Treating it as a
+            # leaked bearer token misleads the user. The marker is the
+            # base64-encoded "role":"anon" fragment ('cm9sZSI6ImFub24i')
+            # OR the supabase issuer marker ('c3VwYWJhc2U' = 'supabase')
+            # which appears in every Supabase-issued JWT.
+            db.execute(
+                "DELETE FROM findings WHERE run_id=? AND tool='ai-js' "
+                "AND title LIKE '%bearer_token%' "
+                "AND (evidence LIKE '%cm9sZSI6ImFub24i%' "
+                "  OR evidence LIKE '%cm9sZSI6ImFub24%' "
+                "  OR evidence LIKE '%c3VwYWJhc2U%')",
+                (run_id,),
+            )
     except Exception:
         pass
 

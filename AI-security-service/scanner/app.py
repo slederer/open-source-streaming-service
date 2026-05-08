@@ -2984,6 +2984,90 @@ _PLACEHOLDER_CREDS = {
 }
 
 
+def _check_scan_optout(host: str) -> Optional[str]:
+    """Return a reason string if the host has opted out of scanning, else None.
+    Three routes (any one wins):
+      1. Web-form opt-out recorded in scanner_optouts table
+      2. Non-empty file at /.well-known/scanner-optout
+      3. /robots.txt with Disallow: / for our UA or for *
+    Result is intentionally fail-open: network/parse errors do NOT suppress."""
+    if not host or "." not in host:
+        return None
+    h = host.lower().strip()
+
+    # 1. Web-form / email opt-out (already recorded by /api/scanner-optout)
+    try:
+        with get_db() as db:
+            row = db.execute(
+                "SELECT 1 FROM scanner_optouts WHERE LOWER(host)=? LIMIT 1", (h,)
+            ).fetchone()
+            if row:
+                return "Host listed in scanner_optouts (operator opt-out via web form / email)."
+    except Exception:
+        pass  # Table may not yet exist; treat as no opt-out
+
+    # 2. /.well-known/scanner-optout file
+    try:
+        r = subprocess.run(
+            ["curl", "-sk", "-m", "5", "--max-filesize", "10000",
+             "-o", "-", "-w", "%{http_code}",
+             f"https://{h}/.well-known/scanner-optout"],
+            capture_output=True, text=True, timeout=8,
+        )
+        out = r.stdout or ""
+        # Last 3 chars are the status code from -w
+        if len(out) >= 3:
+            status = out[-3:]
+            body = out[:-3].strip()
+            if status == "200" and body:
+                return "Host publishes /.well-known/scanner-optout (file-based opt-out)."
+    except Exception:
+        pass
+
+    # 3. /robots.txt: Disallow: / for our UA or for *
+    try:
+        r = subprocess.run(
+            ["curl", "-sk", "-m", "5", "--max-filesize", "100000",
+             f"https://{h}/robots.txt"],
+            capture_output=True, text=True, timeout=8,
+        )
+        body = (r.stdout or "")
+        # Cheap parse: scan for our UA-block, then any User-agent: * block.
+        # If either has Disallow: / (with no path beyond), treat as full block.
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        in_us = False
+        in_star = False
+        # State machine: track which group's directives we are reading
+        groups = []  # list of (ua_match, [directives])
+        cur_uas: list[str] = []
+        cur_dirs: list[tuple[str, str]] = []
+        def _flush():
+            if cur_uas:
+                groups.append((list(cur_uas), list(cur_dirs)))
+        for ln in lines:
+            low = ln.lower()
+            if low.startswith("user-agent:"):
+                if cur_dirs:
+                    _flush()
+                    cur_uas.clear(); cur_dirs.clear()
+                cur_uas.append(low.split(":", 1)[1].strip())
+            elif ":" in ln and cur_uas:
+                k, v = ln.split(":", 1)
+                cur_dirs.append((k.strip().lower(), v.strip()))
+        _flush()
+        for uas, dirs in groups:
+            applies = any(u == "*" or "securityscannerbot" in u for u in uas)
+            if not applies:
+                continue
+            for k, v in dirs:
+                if k == "disallow" and v == "/":
+                    return f"Host /robots.txt disallows User-agent: {uas[0]} from /."
+    except Exception:
+        pass
+
+    return None
+
+
 def _build_scan_context(ip: str, run_id: str) -> dict:
     """Build shared context for a scan target. Called once per target."""
     import hashlib as _hl
@@ -3159,6 +3243,17 @@ def run_full_scan(run_id: str, targets: list[dict], user_id: Optional[str] = Non
                 "title": "Target rejected by SSRF guard",
                 "description": _reason,
                 "evidence": "Private, loopback, link-local and metadata addresses are blocked.",
+                "tool": "policy",
+            }], seen, user_id=user_id)
+            continue
+        # AUP guard: respect three opt-out routes before any module fires.
+        _opt = _check_scan_optout(ip)
+        if _opt:
+            _store_findings(run_id, [{
+                "target": ip, "severity": "INFO", "category": "policy",
+                "title": "Scan suppressed by opt-out",
+                "description": _opt,
+                "evidence": _opt,
                 "tool": "policy",
             }], seen, user_id=user_id)
             continue
@@ -12328,7 +12423,7 @@ async def privacy_policy():
 <nav><a href="/" class="logo"><span>&#9632;</span> Security Scanner</a><a href="/">Back</a></nav>
 <div class="container">
 <h1>Privacy Policy</h1>
-<div class="meta">Last updated: 2026-04-12</div>
+<div class="meta">Last updated: 2026-05-08</div>
 
 <h2>What we collect</h2>
 <p>When you sign up, we collect your email address, name, and (for email accounts) a bcrypt-hashed password. If you sign in with Google, we additionally store your Google profile picture URL.</p>
@@ -12351,11 +12446,15 @@ async def privacy_policy():
 </ul>
 
 <h2>Data retention</h2>
+<p>Per-data-class retention rules:</p>
 <ul>
-<li>Scan data is retained for 1 year after the last scan. Older scan runs and findings are automatically purged.</li>
-<li>User accounts can be deleted at any time via the <a href="/settings">dashboard settings</a> or the <code>/api/me/delete-account</code> endpoint. All associated data is removed immediately.</li>
-<li>Outreach email records are retained for 6 months, then automatically deleted.</li>
-<li>Newsletter subscriptions can be cancelled at any time via the unsubscribe link in each email.</li>
+<li><strong>One-shot / free-tier scans</strong> on our service: retained 90 days, then auto-purged.</li>
+<li><strong>Customer-paid scans</strong>: retained for the lifetime of the customer's account, deletable on request via the dashboard.</li>
+<li><strong>Inbox replies and disclosure correspondence</strong>: retained 24 months for accountability.</li>
+<li><strong>Outreach send records</strong>: retained 6 months, then automatically deleted.</li>
+<li><strong>Hosts that opt out</strong> of research scanning (via the <a href="/scanner#optout-form">/scanner</a> form, email to <a href="mailto:abuse@securityscanner.dev">abuse@securityscanner.dev</a>, /.well-known/scanner-optout, or "stop" reply): all findings deleted within 24 hours.</li>
+<li><strong>User accounts</strong> can be deleted at any time via the <a href="/settings">dashboard settings</a> or the <code>/api/me/delete-account</code> endpoint. All associated data is removed immediately.</li>
+<li><strong>Newsletter subscriptions</strong> can be cancelled at any time via the unsubscribe link in each email.</li>
 </ul>
 
 <h2>Third parties</h2>
@@ -12396,7 +12495,7 @@ async def terms_of_service():
 <nav><a href="/" class="logo"><span>&#9632;</span> Security Scanner</a><a href="/">Back</a></nav>
 <div class="container">
 <h1>Terms of Service</h1>
-<div class="meta">Last updated: 2026-04-12</div>
+<div class="meta">Last updated: 2026-05-08</div>
 
 <h2>Acceptable use</h2>
 <p>You may only scan targets you own, operate, or have explicit written authorization to test. Running unauthorized security scans against systems you don't control is illegal in most jurisdictions and violates these terms.</p>
@@ -12404,6 +12503,18 @@ async def terms_of_service():
 
 <h2>Scan scope</h2>
 <p>Our scanner performs non-destructive tests: port scanning, HTTP probing, TLS analysis, exposed endpoint checks, rate limit testing, and nuclei template matching. We do not exploit vulnerabilities. We do not attempt to bypass authentication. We do not attempt denial of service.</p>
+
+<h2>Batch research scans</h2>
+<p>In addition to customer-initiated scans, we periodically run batch research scans against publicly-reachable web applications discovered via Certificate Transparency logs and similar public sources. The methodology, source IP, User-Agent, per-target rate caps, and full module list are documented at <a href="/scanner">/scanner</a>.</p>
+<p>If your host appears in one of our batch scans and you do not want it scanned, any of these routes will permanently exclude you within 24 hours:</p>
+<ul>
+<li>Use the opt-out form at <a href="/scanner#optout-form">/scanner#optout-form</a></li>
+<li>Email <a href="mailto:abuse@securityscanner.dev">abuse@securityscanner.dev</a> with the host(s)</li>
+<li>Publish a non-empty file at <code>/.well-known/scanner-optout</code></li>
+<li>Reply "stop" to any disclosure email we send you</li>
+<li>Add a <code>User-agent: SecurityScannerBot</code> + <code>Disallow: /</code> entry to your robots.txt</li>
+</ul>
+<p>Our lawful basis for batch research scanning under GDPR is Article 6(1)(f) (legitimate interest in researching the security posture of publicly-reachable web applications), balanced against the right of the controller of those applications to be informed and to act. We notify every affected app owner where we can find a contact, document the methodology publicly, and honor opt-out requests promptly.</p>
 
 <h2>Service availability</h2>
 <p>We provide the service on an "as is" basis. We make no guarantees of uptime or scan accuracy. Scans may occasionally fail due to network issues, target firewalls, or our own infrastructure.</p>

@@ -356,6 +356,35 @@ class TestPostScanFpFilter:
         assert rows[0] == 0, "429 rate-limit FP not removed"
 
 
+class TestScannerOptout:
+    """AUP guard: hosts on scanner_optouts table get suppressed before any
+    module fires. Web-form/email/robots.txt routes wired separately."""
+
+    def test_db_optout_suppresses(self, db):
+        from scanner.app import _check_scan_optout
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS scanner_optouts ("
+            "  host TEXT PRIMARY KEY, source TEXT, "
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO scanner_optouts (host, source) VALUES (?, 'test')",
+            ("opted-out.example",),
+        )
+        db.commit()
+        reason = _check_scan_optout("opted-out.example")
+        assert reason and "opt-out" in reason.lower()
+
+    def test_no_optout_returns_none(self, db):
+        from scanner.app import _check_scan_optout
+        # Use an unresolvable host so DNS/network checks fail-closed without
+        # hitting the public internet.
+        result = _check_scan_optout("nonexistent-test-domain-xyz.example")
+        # The DB check should miss; the network checks should also miss
+        # (curl will fail to resolve) — returning None means scan proceeds.
+        assert result is None
+
+
 class TestCookieAuditInfraPrefix:
     def test_incapsula_dynamic_suffix_skipped(self):
         """Incapsula sets cookies with dynamic numeric suffixes

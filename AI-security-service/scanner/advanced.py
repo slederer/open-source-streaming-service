@@ -912,6 +912,14 @@ def scan_target_idor(run_id: str, ip: str, name: str) -> list[dict]:
         if len(samples) < 3:
             continue
 
+        # If all 3 responses are byte-identical, this is a fallback handler
+        # (e.g. a SPA index.html or a generic "not found" JSON), not an IDOR.
+        # The CRIT path used to skip this check; PII keywords like "address"
+        # in a static landing page tripped CRIT on placeholder hosts.
+        uniq_hashes = {s[1] for s in samples}
+        if len(uniq_hashes) < 2:
+            continue
+
         # Confirmed CRITICAL data leak
         if pii_hit:
             findings.append({
@@ -934,8 +942,7 @@ def scan_target_idor(run_id: str, ip: str, name: str) -> list[dict]:
             })
             continue
 
-        # BOLA without confirmed PII = HIGH
-        uniq_hashes = {s[1] for s in samples}
+        # BOLA without confirmed PII = HIGH (requires all 3 distinct)
         if len(uniq_hashes) >= 3:
             findings.append({
                 "target": ip, "severity": "HIGH", "category": "auth",
@@ -4239,6 +4246,20 @@ def scan_target_api_enum(run_id: str, ip: str, name: str, ctx=None) -> list[dict
     ctx = ctx or {}
     spa_hash = ctx.get("spa_fallback_hash")
 
+    # Local SPA-fallback probe. _build_scan_context's hash misses when the
+    # SPA includes per-request randomness (CSRF nonces, build-hash chunks).
+    # Probe a random path; record its (length, first-512-bytes) signature.
+    # Any subsequent probe whose body is within ±5% length AND shares the
+    # first 256 bytes is treated as the same fallback.
+    spa_sig = None
+    try:
+        rand_path = f"/__probe_apie_{hashlib.md5(run_id.encode()).hexdigest()[:8]}"
+        st, ct, rb = _curl(f"https://{ip}{rand_path}", timeout=5, max_bytes=20_000)
+        if st == "200" and rb and len(rb) > 100:
+            spa_sig = (len(rb), rb[:256])
+    except Exception:
+        pass
+
     version_paths = [
         ("/api/v1/", "version"),
         ("/api/v2/", "version"),
@@ -4263,9 +4284,19 @@ def scan_target_api_enum(run_id: str, ip: str, name: str, ctx=None) -> list[dict
 
         if status != "200" or not body.strip():
             continue
+        # Strict-hash check (when _build_scan_context found a stable SPA hash)
         if spa_hash:
             bh = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
             if bh == spa_hash:
+                continue
+        # Loose-fingerprint check (resilient to per-request CSRF/nonce/chunk
+        # randomness that breaks strict hashing). If the body length is
+        # within ±5% of the random-path probe AND the first 256 bytes match,
+        # this path is just returning the SPA fallback.
+        if spa_sig is not None:
+            sl, sb = spa_sig
+            blen = len(body)
+            if sl > 0 and abs(blen - sl) / sl <= 0.05 and body[:256] == sb:
                 continue
 
         # Must return JSON (API, not HTML page)

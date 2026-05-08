@@ -3071,6 +3071,25 @@ def _post_scan_fp_filter(run_id: str, ctx: dict):
         with get_db() as db:
             for cond in suppressions:
                 db.execute(f"DELETE FROM findings WHERE run_id=? AND ({cond})", (run_id,))
+            # Cluster-FP heuristic: a single host with 4+ HIGH/CRIT findings
+            # from one of the API-discovery modules is almost always a SPA
+            # returning 200 to every probed path (debug/dev/internal/staging
+            # /test/private/etc all hit the same fallback). Real apps don't
+            # simultaneously ship 4 different internal API surfaces. Drop
+            # the cluster. Applies to api-enum (path-based), auth-bypass
+            # (PII-without-auth), and idor-probe (per-ID).
+            for tool in ("api-enum", "auth-bypass", "idor-probe"):
+                rows = db.execute(
+                    "SELECT target FROM findings WHERE run_id=? AND tool=? "
+                    "AND severity IN ('CRITICAL','HIGH') GROUP BY target HAVING COUNT(*) >= 4",
+                    (run_id, tool),
+                ).fetchall()
+                for row in rows:
+                    db.execute(
+                        "DELETE FROM findings WHERE run_id=? AND target=? "
+                        "AND tool=? AND severity IN ('CRITICAL','HIGH')",
+                        (run_id, row[0], tool),
+                    )
     except Exception:
         pass
 
@@ -9869,6 +9888,7 @@ function renderTopbarPlan() {
 const [initView, initParam] = (location.hash || "#overview").slice(1).split("/");
 go(initView || "overview", initParam);
 </script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "54146b7c6cd94edfa198eb0000612762"}'></script>
 </body>
 </html>"""
 
@@ -10428,6 +10448,7 @@ async function nlSubmit(e) {
   </div>
 </div>
 <script>if(!localStorage.getItem('cookie_consent'))document.getElementById('cookie-banner').style.display='block';</script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "54146b7c6cd94edfa198eb0000612762"}'></script>
 </body></html>"""
 
 
@@ -13193,7 +13214,8 @@ def _render_blog_nav(user: Optional[dict] = None):
     })
     .catch(function(){});
 })();
-</script>"""
+</script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "54146b7c6cd94edfa198eb0000612762"}'></script>"""
 
 
 def _fmt_date(iso_date: str) -> str:
